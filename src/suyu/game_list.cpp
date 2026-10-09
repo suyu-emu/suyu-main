@@ -436,6 +436,7 @@ void GameList::UnloadController() {
 }
 
 GameList::~GameList() {
+    ShutdownPopulate();
     UnloadController();
 }
 
@@ -1077,6 +1078,9 @@ QStandardItemModel* GameList::GetModel() const {
 }
 
 void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
+    if (population_shutdown) {
+        return;
+    }
     tree_view->setEnabled(false);
 
     // Update the columns in case UISettings has changed
@@ -1114,6 +1118,11 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
             Qt::QueuedConnection);
 
     QThreadPool::globalInstance()->start(current_worker.get());
+}
+
+void GameList::ShutdownPopulate() {
+    population_shutdown = true;
+    CancelPopulate();
 }
 
 void GameList::CancelPopulate() {

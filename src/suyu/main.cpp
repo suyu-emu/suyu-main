@@ -785,6 +785,10 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
 }
 
 GMainWindow::~GMainWindow() {
+    // QObject children die after C++ members; join while their owners still live.
+    if (game_list) {
+        game_list->ShutdownPopulate();
+    }
     // will get automatically deleted otherwise
     if (render_window->parent() == nullptr) {
         delete render_window;
@@ -8759,6 +8763,9 @@ void GMainWindow::closeEvent(QCloseEvent* event) {
         event->ignore();
         return;
     }
+
+    // Modal callbacks and queued reloads may still unwind after accepted closure.
+    game_list->ShutdownPopulate();
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
