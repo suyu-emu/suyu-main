@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "reviewed_at": "2026-10-09",
+  "tools": [
+    {
+      "repo": "linuxdeploy/linuxdeploy",
+      "tag": "1-alpha-20251107-1",
+      "commit": "cc7b86472c3caa3fd729b9dc502fd2aa78394257",
+      "asset_id": 313839329,
+      "name": "linuxdeploy-x86_64.AppImage",
+      "url": "https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage",
+      "sha256": "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d",
+      "size": 19421688,
+      "source_url": "https://github.com/linuxdeploy/linuxdeploy/archive/cc7b86472c3caa3fd729b9dc502fd2aa78394257.tar.gz",
+      "source_sha256": "adb33f7dcbd75566706fb713ad17c53a335f0a9108c1e9dd2ed6479b81d6b7d0",
+      "license_url": "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy/cc7b86472c3caa3fd729b9dc502fd2aa78394257/LICENSE.txt",
+      "license_sha256": "1edb41ae7601854ae15d113c3700beebd0ea3ed05b85e3786a94a72bb9916091"
+    },
+    {
+      "repo": "linuxdeploy/linuxdeploy-plugin-qt",
+      "tag": "1-alpha-20250213-1",
+      "commit": "ce5291e25979d7d6417551d787f308b88c1b8d76",
+      "asset_id": 228957072,
+      "name": "linuxdeploy-plugin-qt-x86_64.AppImage",
+      "url": "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-qt-x86_64.AppImage",
+      "sha256": "15106be885c1c48a021198e7e1e9a48ce9d02a86dd0a1848f00bdbf3c1c92724",
+      "size": 12317424,
+      "source_url": "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/archive/ce5291e25979d7d6417551d787f308b88c1b8d76.tar.gz",
+      "source_sha256": "34d32f818655daa549a95890294cb1093355d318db674e99ccd76a8defa69934",
+      "license_url": "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-qt/ce5291e25979d7d6417551d787f308b88c1b8d76/LICENSE.txt",
+      "license_sha256": "1edb41ae7601854ae15d113c3700beebd0ea3ed05b85e3786a94a72bb9916091"
+    },
+    {
+      "repo": "AppImage/appimagetool",
+      "tag": "continuous",
+      "commit": "854e19e951900cf141245b384d45735942521abe",
+      "asset_id": 610035789,
+      "name": "appimagetool-x86_64.AppImage",
+      "url": "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage",
+      "sha256": "95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6",
+      "size": 15092216,
+      "source_url": "https://github.com/AppImage/appimagetool/archive/854e19e951900cf141245b384d45735942521abe.tar.gz",
+      "source_sha256": "7200596649df2834154de6a8c9581632fa41ba0debbe53b9776472635c7704e8",
+      "license_url": "https://raw.githubusercontent.com/AppImage/appimagetool/854e19e951900cf141245b384d45735942521abe/LICENSE",
+      "license_sha256": "d726eb47bb96b7e7f8971a1431575ab4fd8780b5d2efde3552c70ef71469015f"
+    },
+    {
+      "repo": "AppImage/type2-runtime",
+      "tag": "continuous",
+      "commit": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+      "asset_id": 596078161,
+      "name": "runtime-x86_64",
+      "url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
+      "sha256": "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074",
+      "size": 944632,
+      "source_url": "https://github.com/AppImage/type2-runtime/archive/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa.tar.gz",
+      "source_sha256": "c449eb42c2190820872631f5e22f8e15b1e985a36dc4a9e2de3585bb7536c785",
+      "license_url": "https://raw.githubusercontent.com/AppImage/type2-runtime/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa/LICENSE",
+      "license_sha256": "aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1"
+    }
+  ]
+}
