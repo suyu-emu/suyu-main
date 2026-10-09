@@ -41,6 +41,8 @@ jobs:
         run: python3 -m unittest discover -s tests/package_policy -v
       - name: Export build kit packaging tests
         run: python3 tests/export_build_kit/test_package.py
+      - name: AppImage packaging tests
+        run: python3 -m unittest discover -s tests/appimage -v
 
   build-linux:
     if: github.event.deleted != true
@@ -78,7 +80,24 @@ jobs:
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
             libxfixes-dev libxkbcommon-dev libxss-dev libxtst-dev \
             libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
-            libegl-dev libdrm-dev libgbm-dev libvulkan-dev
+            libegl-dev libdrm-dev libgbm-dev libvulkan-dev \
+            squashfs-tools patchelf desktop-file-utils
+      - name: Enable corresponding-source repositories
+        run: |
+          sudo tee /etc/apt/sources.list.d/suyu-appimage-sources.sources > /dev/null <<'EOF'
+          Types: deb-src
+          URIs: http://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb-src
+          URIs: http://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get update
       - name: Install CMake 3.31
         # CMakeModules/CPMUtil.cmake requires 3.31; ubuntu-24.04 ships 3.28.
         run: |
@@ -105,21 +124,52 @@ jobs:
             -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
             -DSUYU_NO_JIT=${{ matrix.no_jit }} \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON \
             -Dfmt_FORCE_BUNDLED=ON
       - name: Build
-        run: cmake --build build --target suyu suyu-cmd
+        run: cmake --build build --target suyu suyu-cmd --parallel 2
       - name: Package
         run: |
+          ldd build/bin/suyu build/bin/suyu-cmd > linux-linked-libraries.txt
+          if grep -E 'libSDL3[^ ]*\.so|not found' linux-linked-libraries.txt; then
+            echo 'Unexpected untracked shared SDL3 dependency' >&2
+            exit 1
+          fi
           mkdir -p _pkg
           cp build/bin/suyu build/bin/suyu-cmd _pkg/
           python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           tar -czf '${{ matrix.archive }}' -C _pkg .
       - name: Validate package policy
         run: python3 tools/package_policy/scan_release.py --kind linux '${{ matrix.archive }}'
+      - name: Build pinned AppImage runtime and portable package
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python3 tools/appimage/runtime.py --work-dir _appimage-runtime
+          python3 tools/appimage/build.py \
+            --package-dir _pkg --work-dir _appimage \
+            --runtime-dir _appimage-runtime \
+            --source-revision "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-name "$GITHUB_REF_NAME" --qmake qmake6
+      - name: Validate final AppImage and corresponding sources
+        run: |
+          read -r runtime_sha runtime_size < <(python3 -c 'import json; p=json.load(open("tools/appimage/runtime.lock.json")); print(p["sha256"], p["size"])')
+          python3 tools/package_policy/scan_release.py --kind linux-appimage \
+            --appimage-runtime-sha256 "$runtime_sha" --appimage-runtime-size "$runtime_size" \
+            --appimage-source-revision "$GITHUB_SHA" --appimage-repository "$GITHUB_REPOSITORY" \
+            _appimage/suyu-linux-x86_64.AppImage
+          sources=(_appimage/suyu-*-appimage-sources.tar.gz)
+          test "${#sources[@]}" -eq 1
+          python3 tools/package_policy/scan_release.py --kind dependency-sources "${sources[0]}"
+      - name: Test AppImage without FUSE
+        run: python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke-report.json
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.variant }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            _appimage/suyu-linux-x86_64.AppImage
+            _appimage/suyu-*-appimage-sources.tar.gz
           if-no-files-found: error
 
   build-windows:
@@ -644,9 +694,10 @@ jobs:
       - name: Collect
         run: |
           mkdir -p out
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar' -o -name '*.zip' -o -name '*.apk' -o -name '*.AppImage' \) -exec mv {} out/ \;
           for asset in \
             suyu-linux-x86_64.tar.gz \
+            suyu-linux-x86_64.AppImage \
             suyu-windows-x86_64.zip \
             suyu-macos-arm64.zip \
             suyu-android-arm64.apk \
@@ -655,7 +706,8 @@ jobs:
             suyu-libretro-macos-arm64.zip \
             suyu-libretro-android-arm64.zip \
             "suyu-${GITHUB_REF_NAME}-source.tar.gz" \
-            "suyu-${GITHUB_REF_NAME}-dependency-sources.tar"; do
+            "suyu-${GITHUB_REF_NAME}-dependency-sources.tar" \
+            "suyu-${GITHUB_REF_NAME}-appimage-sources.tar.gz"; do
             test -s "out/$asset"
           done
           test -s "docs/releases/${GITHUB_REF_NAME}.md"
@@ -664,11 +716,15 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools
           shopt -s nullglob
+          read -r runtime_sha runtime_size < <(python3 -c 'import json; p=json.load(open("tools/appimage/runtime.lock.json")); print(p["sha256"], p["size"])')
           count=0
           for asset in out/*; do
             case "${asset##*/}" in
               suyu-linux-x86_64.tar.gz) kind=linux ;;
+              suyu-linux-x86_64.AppImage) kind=linux-appimage ;;
               suyu-windows-x86_64.zip) kind=windows ;;
               suyu-macos-arm64.zip) kind=macos ;;
               suyu-android-arm64.apk) kind=android-apk ;;
@@ -678,12 +734,19 @@ jobs:
               suyu-libretro-android-arm64.zip) kind=libretro-android ;;
               "suyu-${GITHUB_REF_NAME}-source.tar.gz") kind=source ;;
               "suyu-${GITHUB_REF_NAME}-dependency-sources.tar") kind=dependency-sources ;;
+              "suyu-${GITHUB_REF_NAME}-appimage-sources.tar.gz") kind=dependency-sources ;;
               *) echo "Unexpected release asset: $asset" >&2; exit 1 ;;
             esac
-            python3 tools/package_policy/scan_release.py --kind "$kind" "$asset"
+            if [ "$kind" = linux-appimage ]; then
+              python3 tools/package_policy/scan_release.py --kind "$kind" \
+                --appimage-runtime-sha256 "$runtime_sha" --appimage-runtime-size "$runtime_size" \
+                --appimage-source-revision "$GITHUB_SHA" --appimage-repository "$GITHUB_REPOSITORY" "$asset"
+            else
+              python3 tools/package_policy/scan_release.py --kind "$kind" "$asset"
+            fi
             count=$((count + 1))
           done
-          test "$count" -eq 10
+          test "$count" -eq 12
       - name: Publish release
         if: steps.gate.outputs.publish == 'true'
         env:

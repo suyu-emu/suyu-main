@@ -54,6 +54,10 @@ Current version: **v0.0.13**. See the [v0.0.13 release notes](docs/releases/v0.0
 for Vulkan pipeline libraries, portable exports, key and installed-content fixes,
 automatic largest-L3 core placement, and Static/Hybrid and mod improvements.
 
+The [v0.0.14 candidate](docs/releases/v0.0.14.md) adds startup/export shutdown
+repairs and an Ubuntu 24.04 x86-64 AppImage. Publication awaits gameplay and
+release verification.
+
 Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs:
 games boot under Vulkan/MoltenVK with the bundled MoltenVK library, and MK8D
 races at 59–60 fps on the JIT; see [macOS](#macos). A RetroArch (libretro) core
