@@ -13,19 +13,25 @@ identify and protect packaged inputs; they do not grant permission.
 Exit status: 0 clean, 1 findings, 2 usage error.
 """
 import argparse
+import contextlib
+import gzip
+import io
 import hashlib
 import json
 from pathlib import Path
 import posixpath
 import re
+import shutil
 import stat
+import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
 import zipfile
 
 POLICY_PATH = Path(__file__).with_name('policy.json')
-KINDS = ('windows', 'linux', 'macos', 'android-apk', 'libretro-linux', 'libretro-windows',
+KINDS = ('windows', 'linux', 'linux-appimage', 'macos', 'android-apk', 'libretro-linux', 'libretro-windows',
          'libretro-macos', 'libretro-android', 'source', 'dependency-sources')
 HEAD_BYTES = 16384 + 8
 WHOLE_FILE_LIMIT = 1 << 20
@@ -34,7 +40,7 @@ NESTED_MAX_DEPTH = 2
 MANIFEST_MAX_BYTES = 8 << 20
 SPOOL_BYTES = 32 << 20
 ZIP_EXTENSIONS = ('.zip', '.apk', '.jar')
-TAR_EXTENSIONS = ('.tar.gz', '.tgz', '.tar.xz', '.txz', '.tar')
+TAR_EXTENSIONS = ('.tar.gz', '.tgz', '.tar.xz', '.txz', '.tar.bz2', '.tbz2', '.tar')
 OPAQUE_EXTENSIONS = ('.7z', '.rar', '.xz', '.zst', '.cab', '.msi', '.lz4', '.bz2', '.gz', '.iso')
 KIT_PREFIX = 'export-build-kit/'
 SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
@@ -169,6 +175,8 @@ class Scanner:
         self.kit = {}
         self.kit_manifest = None
         self.source_top = None
+        self.source_hashes = {}
+        self.source_manifest = None
 
     def add(self, rule, member, reason):
         self.findings.append({'rule': rule, 'member': clean_label(member), 'reason': reason})
@@ -234,6 +242,18 @@ class Scanner:
                 self.add('link', label, reason)
 
     def link_problem(self, path, entry, link_map, names, dirs, top):
+        if top and self.kind == 'linux-appimage':
+            if entry.link != 'symlink':
+                return entry.link + ' entries are not allowed'
+            if not any(p.fullmatch(path) for p in self.rules.layouts[self.kind]):
+                return 'symlink outside the approved AppDir layout'
+            target = entry.link_target
+            if not target or '\\' in target or '\x00' in target or target.startswith('/') or re.match(r'^[A-Za-z]:', target):
+                return 'symlink target is not a relative AppDir path'
+            resolved = self.resolve(posixpath.dirname(path), target, link_map)
+            if resolved is None or resolved not in names | dirs:
+                return 'symlink target escapes or is absent from AppDir'
+            return None
         if not (top and self.kind == 'macos'):
             return entry.link + ' entries are not allowed'
         if entry.link != 'symlink':
@@ -298,6 +318,8 @@ class Scanner:
         if any(p.search(base) for p in rules.firmware_names):
             self.add('firmware', label, 'firmware/NAND file name')
         lower = path.lower()
+        if self.kind == 'linux-appimage' and 'user' in lower.split('/'):
+            self.add('user-data', label, 'user directory is not part of AppDir')
         if any(p.search(lower) for p in rules.firmware_paths):
             self.add('firmware', label, 'firmware/NAND path')
         if base.endswith(rules.containers):
@@ -306,7 +328,8 @@ class Scanner:
             self.add('export-marker', label, 'game export marker file name')
         if any(p.search(lower) for p in rules.user_data):
             self.add('user-data', label, 'user data path')
-        if base.endswith(OPAQUE_EXTENSIONS) and not archive_format(base):
+        debian_patch = self.kind == 'dependency-sources' and bool(re.fullmatch(r'suyu-[^/]+-dependency-sources/[A-Za-z0-9._+-]+\.diff\.gz', path))
+        if base.endswith(OPAQUE_EXTENSIONS) and not archive_format(base) and not debian_patch:
             self.add('nested-archive', label, 'opaque archive format cannot be inspected')
 
     def scan_file(self, path, label, entry, prefix, depth):
@@ -316,6 +339,8 @@ class Scanner:
         kit_rel = None
         if depth == 0 and self.kind == 'windows' and path.startswith(KIT_PREFIX):
             kit_rel = path[len(KIT_PREFIX):]
+        source_rel = path.split('/', 1)[1] if depth == 0 and self.kind == 'dependency-sources' and '/' in path else None
+        debian_patch = source_rel is not None and source_rel.endswith('.diff.gz')
         size = entry.size
         text_limit = size if size <= WHOLE_FILE_LIMIT else rules.text_limit
         first = max(text_limit, HEAD_BYTES)
@@ -328,18 +353,24 @@ class Scanner:
                 raise OSError('no data')
             with handle:
                 data = handle.read(first)
+                if source_rel is not None and source_rel.endswith('.dsc'):
+                    if size > WHOLE_FILE_LIMIT:
+                        raise ValueError('Debian source control file exceeds text limit')
+                    control = data.decode('utf-8')
+                    if not re.search(r'^Format: .+$', control, re.M) or any(ord(c) < 32 and c not in '\r\n\t' for c in control):
+                        raise ValueError('invalid Debian source control text')
                 for name, offset, magic in rules.signatures:
                     if data[offset:offset + len(magic)] == magic and not (offset and is_plain_text(data[:offset])):
                         self.add('signature', label, 'content signature: ' + name)
                 text = data[:text_limit].decode('latin-1')
                 if any(p.search(text) for p in rules.key_text):
                     self.add('key-text', label, 'content matches a key text pattern')
-                digest = hashlib.sha256(data) if kit_rel is not None else None
+                digest = hashlib.sha256(data) if kit_rel is not None or source_rel is not None else None
                 spool = None
-                if nested_ok:
+                if nested_ok or debian_patch:
                     spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_BYTES)
                     spool.write(data)
-                manifest = bytearray(data) if kit_rel == 'manifest.json' else None
+                manifest = bytearray(data) if kit_rel == 'manifest.json' or source_rel == 'MANIFEST.json' else None
                 total = len(data)
                 if digest is not None or spool is not None:
                     while True:
@@ -364,13 +395,33 @@ class Scanner:
             self.add('unreadable', label, 'member could not be read: ' + type(error).__name__)
             return
         if digest is not None:
-            self.kit[kit_rel] = digest.hexdigest()
-            if manifest is not None:
+            if kit_rel is not None:
+                self.kit[kit_rel] = digest.hexdigest()
+            if source_rel is not None and digest is not None:
+                self.source_hashes[source_rel] = digest.hexdigest()
+            if source_rel == 'MANIFEST.json' and manifest is not None:
+                self.source_manifest = bytes(manifest)
+            if kit_rel == 'manifest.json' and manifest is not None:
                 self.kit_manifest = bytes(manifest)
         if spool is not None:
             try:
                 spool.seek(0)
-                self.scan(spool, fmt, label + '!', depth + 1)
+                if debian_patch:
+                    # Rolled-over spools have mode w+b; never let gzip inherit it.
+                    with gzip.GzipFile(fileobj=spool, mode='rb') as patch:
+                        expanded = patch.read(NESTED_MAX_BYTES + 1)
+                    if len(expanded) > NESTED_MAX_BYTES:
+                        raise ValueError('Debian patch expands beyond limit')
+                    text = expanded.decode('utf-8')
+                    if any(ord(c) < 32 and c not in '\r\n\t' for c in text):
+                        raise ValueError('Debian patch is not text')
+                    if any(p.search(text) for p in rules.key_text):
+                        self.add('key-text', label + '!patch', 'patch matches a key text pattern')
+                    self.scan_file(path[:-3], label + '!patch', Entry(path[:-3], False, None, None, len(expanded), lambda: io.BytesIO(expanded)), '', depth + 1)
+                else:
+                    self.scan(spool, fmt, label + '!', depth + 1)
+            except (OSError, ValueError, UnicodeError) as error:
+                self.add('unreadable', label, 'nested source could not be read: ' + type(error).__name__)
             finally:
                 spool.close()
 
@@ -409,17 +460,278 @@ class Scanner:
                 self.add('kit', KIT_PREFIX + rel, 'file listed in the kit manifest is missing')
 
 
-def scan_archive(path, kind, rules):
+# Type-2 format: https://github.com/AppImage/AppImageSpec/blob/master/draft.md
+# Use the host's SquashFS reader only. Never execute/mount/extract the AppImage.
+APPIMAGE_LIST_LIMIT = 16 << 20
+APPIMAGE_FILE_LIMIT = 256 << 20
+APPIMAGE_TOTAL_LIMIT = 2 << 30
+APPIMAGE_ENTRY_LIMIT = 20000
+
+
+def appimage_offset(path, rules, runtime_hash, runtime_size):
+    approved = rules.policy['appimage']
+    if runtime_hash != approved['runtime_sha256'] or runtime_size != approved['runtime_size']:
+        raise ValueError('runtime pin does not match approved AppImage runtime')
+    with open(path, 'rb') as handle:
+        prefix = handle.read(runtime_size)
+        if (len(prefix) != runtime_size or prefix[:6] != b'\x7fELF\x02\x01' or
+                prefix[8:11] != b'AI\x02' or prefix[18:20] != b'\x3e\x00' or
+                hashlib.sha256(prefix).hexdigest() != runtime_hash):
+            raise ValueError('invalid or unapproved type-2 x86_64 runtime prefix')
+        header = handle.read(96)
+        if len(header) != 96 or header[:4] != b'hsqs' or struct.unpack_from('<HH', header, 28) != (4, 0):
+            raise ValueError('missing SquashFS v4 payload')
+        used = struct.unpack_from('<Q', header, 40)[0]
+        remaining = path.stat().st_size - runtime_size
+        if used < 96 or used > remaining or remaining - used > 4095:
+            raise ValueError('truncated or oversized SquashFS payload')
+        handle.seek(runtime_size + used)
+        if any(handle.read()):
+            raise ValueError('unexpected data after SquashFS payload')
+    return runtime_size
+
+
+@contextlib.contextmanager
+def squashfs_output(tool, image, offset, args, limit):
+    # POSIX rlimits bound reader output/memory/CPU, including malicious payloads.
+    import resource
+    def bounded_child():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+        resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+        resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
+    with tempfile.TemporaryFile() as output:
+        env = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'TZ': 'UTC'}
+        reader_args = [*args[:-1], str(image), args[-1]] if '-cat' in args else [*args, str(image)]
+        result = subprocess.run([str(tool), '-processors', '1', '-o', str(offset), *reader_args],
+                                stdout=output, stderr=subprocess.DEVNULL, timeout=90,
+                                env=env, preexec_fn=bounded_child)
+        if result.returncode or output.tell() > limit:
+            raise ValueError('SquashFS reader rejected payload or exceeded limits')
+        output.seek(0)
+        yield output
+
+
+def squashfs_listing(data):
+    entries = []
+    for line in data.decode('utf-8', errors='strict').splitlines():
+        if not line.strip():
+            continue
+        match = re.fullmatch(r'([dl-][rwxstST-]{9})\s+\d+/\d+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(squashfs-root(?:/.*)?)', line)
+        if not match:
+            raise ValueError('unrecognized or special SquashFS listing member')
+        mode, size, name = match.groups()
+        target = None
+        if mode[0] == 'l':
+            if name.count(' -> ') != 1:
+                raise ValueError('ambiguous SquashFS symlink listing')
+            name, target = name.split(' -> ')
+        elif ' -> ' in name:
+            raise ValueError('ambiguous SquashFS member name')
+        name = name.removeprefix('squashfs-root').removeprefix('/')
+        if not name and mode[0] == 'd':
+            continue
+        if not name or any(c in name for c in '\r\n\x00'):
+            raise ValueError('invalid SquashFS member path')
+        entries.append((name, mode, int(size), target))
+    if len(entries) > APPIMAGE_ENTRY_LIMIT:
+        raise ValueError('too many AppDir members')
+    if sum(size for _, mode, size, _ in entries if mode[0] == '-') > APPIMAGE_TOTAL_LIMIT:
+        raise ValueError('AppDir expanded size exceeds limit')
+    return entries
+
+
+def scan_appimage(scanner, path, runtime_hash, runtime_size, source_revision):
+    try:
+        if path.stat().st_size > APPIMAGE_TOTAL_LIMIT:
+            raise ValueError('compressed AppImage exceeds size limit')
+        # Scan a private immutable-by-path snapshot; never follow a replaced input.
+        with tempfile.TemporaryDirectory(prefix='suyu-appimage-scan-') as folder:
+            snapshot = Path(folder) / 'payload.AppImage'
+            with open(path, 'rb') as original, open(snapshot, 'wb') as copied:
+                total = 0
+                while chunk := original.read(1 << 20):
+                    total += len(chunk)
+                    if total > APPIMAGE_TOTAL_LIMIT:
+                        raise ValueError('compressed AppImage exceeds size limit')
+                    copied.write(chunk)
+            offset = appimage_offset(snapshot, scanner.rules, runtime_hash, runtime_size)
+            repository = scanner.appimage_pins.get('repository', '')
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', repository):
+                raise ValueError('expected repository slug is required')
+            if not source_revision or not re.fullmatch(r'[0-9a-f]{40}', source_revision):
+                raise ValueError('expected source revision is required')
+            if not sys.platform.startswith('linux'):
+                raise ValueError('AppImage inspection requires Linux SquashFS tooling')
+            # Trust a root-owned system executable; no PATH-supplied/embedded reader.
+            tool = next((Path(p) for p in ('/usr/bin/unsquashfs', '/bin/unsquashfs') if Path(p).is_file()), None)
+            if tool is None or tool.resolve().stat().st_uid != 0 or tool.resolve().stat().st_mode & 0o022:
+                raise ValueError('trusted system unsquashfs is unavailable')
+            with squashfs_output(tool, snapshot, offset, ['-lln'], APPIMAGE_LIST_LIMIT) as listing:
+                members = squashfs_listing(listing.read())
+            return scan_appdir(scanner, members, lambda name, size: squashfs_output(
+                tool, snapshot, offset, ['-cat', '-no-wildcards', name], min(size + 1, APPIMAGE_FILE_LIMIT)))
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired) as error:
+        scanner.add('appimage', path.name, 'AppImage inspection failed: ' + type(error).__name__)
+
+
+def appimage_runtime_lock(rules):
+    folder = POLICY_PATH.parent.parent / 'appimage'
+    raw = (folder / 'runtime.lock.json').read_bytes()
+    lock = json.loads(raw)
+    approved = rules.policy['appimage']
+    canonical = hashlib.sha256(json.dumps(lock, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if (canonical != approved['runtime_lock_canonical_sha256'] or
+            lock.get('schema') != 'suyu-appimage-runtime-v1' or
+            lock.get('sha256') != approved['runtime_sha256'] or lock.get('size') != approved['runtime_size'] or
+            lock.get('recipe_sha256') != approved['runtime_recipe_sha256'] or
+            hashlib.sha256((folder / 'runtime-build.sh').read_bytes()).hexdigest() != lock['recipe_sha256']):
+        raise ValueError('runtime lock or source recipe differs from approved policy')
+    return lock, hashlib.sha256(raw).hexdigest()
+
+
+def check_appimage_sources(scanner, document, lock, lock_hash, files):
+    member = 'usr/share/suyu/distribution-sources.json'
+    if not isinstance(document, dict) or document.get('schema') != 'suyu-appimage-sources-v1':
+        scanner.add('source-provenance', member, 'source manifest missing or invalid')
+        return
+    receipt = document.get('runtime_build_receipt')
+    if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in lock.items()):
+        scanner.add('source-provenance', member, 'runtime receipt does not match reviewed source closure')
+        return
+    if (receipt.get('lock_sha256') != lock_hash or receipt.get('recipe_sha256') != lock['recipe_sha256'] or
+            any(not SHA256_RE.fullmatch(str(receipt.get(k, ''))) for k in ('linker_map_sha256', 'installed_package_db_sha256'))):
+        scanner.add('source-provenance', member, 'runtime recipe/build evidence is not hash-linked')
+    archives = ['/usr/lib/libc.a', '/usr/lib/libfuse3.a', '/usr/lib/libmimalloc.a', '/usr/lib/libz.a',
+                '/usr/lib/libzstd.a', '/usr/local/lib/libsquashfuse.a', '/usr/local/lib/libsquashfuse_ll.a']
+    if receipt.get('contributed_archives') != archives or document.get('runtime_components') != lock['components']:
+        scanner.add('source-provenance', member, 'static archive/source closure mismatch')
+    sources = document.get('sources')
+    if not isinstance(sources, list) or any(not isinstance(s, dict) for s in sources):
+        scanner.add('source-provenance', member, 'source records missing')
+        return
+    by_name = {s.get('name'): s for s in sources}
+    if len(by_name) != len(sources) or any(by_name.get(s['name']) != s for s in lock['sources']):
+        scanner.add('source-provenance', member, 'exact runtime sources missing or changed')
+    libraries = document.get('libraries', {})
+    if not isinstance(libraries, dict):
+        scanner.add('source-provenance', member, 'library source mappings missing')
+        return
+    for name, digest in files.items():
+        if name.startswith(('usr/lib/', 'usr/plugins/')) and '.so' in name:
+            record = libraries.get(name)
+            if (not isinstance(record, dict) or record.get('sha256') != digest or
+                    not record.get('source_version') or not record.get('copyright') or
+                    not isinstance(record.get('sources'), list) or not record['sources'] or
+                    any(s not in by_name for s in record['sources'])):
+                scanner.add('source-provenance', name, 'bundled library has no exact corresponding-source mapping')
+
+
+def scan_appdir(scanner, members, read_member):
+    approved = scanner.rules.policy['appimage']
+    provenance_path = approved['provenance_path']
+    files, links, provenance, source_document = {}, {}, None, None
+    def inspected_entries():
+        nonlocal provenance, source_document
+        for name, mode, size, target in members:
+            if name in ('AppRun', 'usr/bin/suyu', 'usr/bin/suyu-cmd') and (mode[0] != '-' or 'x' not in mode[1:]):
+                scanner.add('appimage', name, 'required executable is not an executable regular file')
+            normal, _, problems = normalize(name, False)
+            if problems or normal != name:
+                scanner.add('path-unsafe', name, 'unsafe AppDir member path')
+                continue # never pass hostile paths to a filesystem reader
+            if mode[0] == 'd':
+                scanner.scan_name(name, name)
+                if not any(re.fullmatch(pattern, name) for pattern in approved['approved_directories']):
+                    scanner.add('unexpected', name, 'unexpected AppDir directory')
+            elif mode[0] == 'l':
+                scanner.check_layout(name, name)
+                scanner.scan_name(name, name)
+                links[name] = target
+            else:
+                if size > APPIMAGE_FILE_LIMIT:
+                    scanner.add('appimage', name, 'expanded member exceeds limit')
+                    continue
+                with read_member(name, size) as handle:
+                    # Content scanning uses the exact same entries/nested-archive rules.
+                    data = handle.read(size + 1)
+                if len(data) != size:
+                    raise ValueError('SquashFS member size mismatch')
+                import io
+                disguised = ('zip' if data.startswith(b'PK\x03\x04') else
+                             'tar' if data.startswith((b'\x1f\x8b', b'\xfd7zXZ\x00')) else None)
+                if disguised and archive_format(name) is None:
+                    scanner.add('nested-archive', name, 'archive payload disguised as an AppDir file')
+                    scanner.scan(io.BytesIO(data), disguised, name + '!', 1)
+                elif data.startswith((b'7z\xbc\xaf\x27\x1c', b'Rar!')):
+                    scanner.add('nested-archive', name, 'opaque archive payload cannot be inspected')
+                if name == 'usr/share/suyu/distribution-sources.json':
+                    if size > MANIFEST_MAX_BYTES:
+                        raise ValueError('source provenance too large')
+                    source_document = json.loads(data)
+                if name == provenance_path:
+                    if size > MANIFEST_MAX_BYTES:
+                        raise ValueError('AppImage provenance too large')
+                    provenance = json.loads(data)
+                else:
+                    files[name] = hashlib.sha256(data).hexdigest()
+                import io
+                yield Entry(name, False, None, None, size, lambda data=data: io.BytesIO(data))
+                continue
+            yield Entry(name, mode[0] == 'd', 'symlink' if mode[0] == 'l' else None, target, size, None)
+    scanner.scan_entries(inspected_entries(), False, '', 0)
+    if not isinstance(provenance, dict):
+        scanner.add('appimage', provenance_path, 'embedded provenance is missing or invalid')
+        return
+    lock, lock_hash = appimage_runtime_lock(scanner.rules)
+    check_appimage_sources(scanner, source_document, lock, lock_hash, files)
+    pins = getattr(scanner, 'appimage_pins', {})
+    for key, expected in {'schema': approved['schema'], 'policy_version': scanner.rules.version, 'runtime_recipe_sha256': lock['recipe_sha256'], 'runtime_lock_sha256': lock_hash, **{k:v for k,v in pins.items() if k != 'repository'}}.items():
+        if provenance.get(key) != expected:
+            scanner.add('appimage', provenance_path, 'provenance mismatch: ' + key)
+    if provenance.get('files') != files or provenance.get('links') != links:
+        scanner.add('appimage', provenance_path, 'embedded inventory does not match inspected final payload')
+    for required in approved['required_files']:
+        if required not in files:
+            scanner.add('appimage', required, 'required regular AppDir file missing')
+    for required in ('.DirIcon', 'suyu.desktop', 'suyu.svg'):
+        if required not in files and required not in links:
+            scanner.add('appimage', required, 'AppImage desktop integration member missing')
+    if not any(name.startswith('usr/share/doc/suyu/LICENSES/') for name in files):
+        scanner.add('appimage', 'usr/share/doc/suyu/LICENSES', 'license texts missing')
+    if not any(name.startswith('usr/share/doc/suyu/packaging-tool-licenses/') for name in files):
+        scanner.add('appimage', 'usr/share/doc/suyu/packaging-tool-licenses', 'packaging tool licenses missing')
+    source_url = provenance.get('source_url', '')
+    expected_url = 'https://github.com/' + pins.get('repository', '') + '/tree/' + pins.get('source_revision', '')
+    if source_url != expected_url:
+        scanner.add('appimage', provenance_path, 'source URL does not identify expected source revision')
+    if provenance.get('runtime_source_url') != lock['source_url']:
+        scanner.add('appimage', provenance_path, 'official runtime source provenance missing')
+
+
+def scan_archive(path, kind, rules, appimage_pins=None):
     scanner = Scanner(rules, kind)
     path = Path(path)
     fmt = archive_format(path.name)
-    if fmt is None:
+    if kind == 'linux-appimage':
+        scanner.appimage_pins = appimage_pins or {}
+        scan_appimage(scanner, path, scanner.appimage_pins.get('runtime_sha256'),
+                      scanner.appimage_pins.get('runtime_size'), scanner.appimage_pins.get('source_revision'))
+    elif fmt is None:
         scanner.add('unreadable', path.name, 'unsupported archive type')
     else:
         with open(path, 'rb') as handle:
             scanner.scan(handle, fmt, '', 0)
         if kind == 'windows':
             scanner.check_kit()
+    if kind == 'dependency-sources' and any(n.endswith(('.dsc', '.diff.gz')) for n in scanner.source_hashes):
+        try:
+            manifest = json.loads(scanner.source_manifest)
+            claimed = {item['name']: item['sha256'] for item in manifest['sources']}
+            for name, digest in scanner.source_hashes.items():
+                if name.endswith(('.dsc', '.diff.gz')) and claimed.get(name) != digest:
+                    scanner.add('source-provenance', name, 'Debian source is not hash-linked to MANIFEST.json')
+        except (TypeError, ValueError, KeyError):
+            scanner.add('source-provenance', 'MANIFEST.json', 'Debian source manifest missing or invalid')
     findings = [f for f in scanner.findings if not rules.excused(kind, f['rule'], f['member'])]
     findings.sort(key=lambda f: (f['member'], f['rule'], f['reason']))
     return {'path': path.name, 'kind': kind, 'members_scanned': scanner.members, 'findings': findings}
@@ -428,6 +740,10 @@ def scan_archive(path, kind, rules):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--kind', required=True, choices=KINDS)
+    parser.add_argument('--appimage-runtime-sha256')
+    parser.add_argument('--appimage-runtime-size', type=int)
+    parser.add_argument('--appimage-source-revision')
+    parser.add_argument('--appimage-repository')
     parser.add_argument('--report', help='write a JSON report (archive base names only)')
     parser.add_argument('--policy', default=str(POLICY_PATH), help=argparse.SUPPRESS)
     parser.add_argument('archives', nargs='+', metavar='ARCHIVE')
@@ -437,7 +753,9 @@ def main(argv=None):
         if not Path(archive).is_file():
             parser.error('not a file: ' + archive)
     rules = Rules(load_policy(args.policy))
-    results = [scan_archive(a, args.kind, rules) for a in args.archives]
+    pins = {'runtime_sha256': args.appimage_runtime_sha256, 'runtime_size': args.appimage_runtime_size,
+            'source_revision': args.appimage_source_revision, 'repository': args.appimage_repository}
+    results = [scan_archive(a, args.kind, rules, pins) for a in args.archives]
     if args.report:
         Path(args.report).write_text(json.dumps(
             {'policy_version': rules.version, 'archives': results}, indent=2) + '\n', encoding='utf-8')

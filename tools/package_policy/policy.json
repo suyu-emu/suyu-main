@@ -182,7 +182,23 @@
       "suyu-[^/]+-source/.+"
     ],
     "dependency-sources": [
-      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz))"
+      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz))"
+    ],
+    "linux-appimage": [
+      "AppRun",
+      "\\.DirIcon",
+      "suyu\\.(desktop|svg)",
+      "usr/bin/(suyu|suyu-cmd|qt\\.conf)",
+      "usr/lib/(?:x86_64-linux-gnu/)?lib[A-Za-z0-9_+.-]+\\.so(?:\\.[0-9]+)*",
+      "usr/plugins/(platforms|platforminputcontexts|imageformats|iconengines|platformthemes|tls|networkinformation|xcbglintegrations|wayland-shell-integration|wayland-decoration-client|wayland-graphics-integration-client)/lib[A-Za-z0-9_+.-]+\\.so(?:\\.[0-9]+)*",
+      "usr/apprun-hooks/[A-Za-z0-9_.-]+\\.sh",
+      "usr/share/applications/suyu\\.desktop",
+      "usr/share/icons/hicolor/scalable/apps/suyu\\.svg",
+      "usr/share/suyu/(appimage-provenance|distribution-sources)\\.json",
+      "usr/share/doc/suyu/(LICENSE\\.txt|THIRD-PARTY-NOTICES\\.txt)",
+      "usr/share/doc/suyu/LICENSES/[A-Za-z0-9_.+-]+\\.txt",
+      "usr/share/doc/suyu/packaging-tool-licenses/[A-Za-z0-9_.+-]+(?:\\.txt|\\.md)?",
+      "apprun-hooks/[A-Za-z0-9_.-]+\\.sh"
     ]
   },
   "approved_exceptions": [
@@ -357,5 +373,34 @@
     "schema": "suyu-shared-coverage",
     "schema_version": 1,
     "description": "Execution metadata; no raw instruction bytes included."
+  },
+  "appimage": {
+    "runtime_sha256": "430be11c9de8e95aebf55232f432fba189735bf17e018e4654e64808c373b561",
+    "runtime_size": 944448,
+    "provenance_path": "usr/share/suyu/appimage-provenance.json",
+    "schema": "suyu-appimage-v1",
+    "required_files": [
+      "AppRun",
+      "usr/bin/suyu",
+      "usr/bin/suyu-cmd",
+      "usr/share/applications/suyu.desktop",
+      "usr/share/icons/hicolor/scalable/apps/suyu.svg",
+      "usr/share/doc/suyu/LICENSE.txt",
+      "usr/share/doc/suyu/THIRD-PARTY-NOTICES.txt",
+      "usr/share/suyu/distribution-sources.json"
+    ],
+    "approved_directories": [
+      "usr",
+      "usr/(bin|lib|plugins|apprun-hooks|share)",
+      "usr/lib/x86_64-linux-gnu",
+      "usr/plugins/(platforms|platforminputcontexts|imageformats|iconengines|platformthemes|tls|networkinformation|xcbglintegrations|wayland-shell-integration|wayland-decoration-client|wayland-graphics-integration-client)",
+      "usr/share/(applications|icons|suyu|doc)",
+      "usr/share/icons/hicolor(?:/scalable(?:/apps)?)?",
+      "usr/share/doc/suyu(?:/(LICENSES|packaging-tool-licenses))?",
+      "apprun-hooks"
+    ],
+    "runtime_recipe_sha256": "b7d40189c675205c5ccfa5860cd71a113799cb6d8b7d4fb27f1a5dba2cfeeddc",
+    "runtime_lock_canonical_sha256": "f9d07b0c80bac3ce8f535f015393050d8bcf13643a86b53674fb141c37b85d0f",
+    "runtime_source_url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa"
   }
 }
