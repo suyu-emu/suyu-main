@@ -40,6 +40,9 @@ class Packaging(unittest.TestCase):
                     (extracted / 'AppRun').write_text('fixture extracted entry point')
                     return
                 self.assertEqual(command[-2:], ['--plugin', 'qt'])
+                # Pinned PlatformPluginsDeployer.cpp reads this exact key and
+                # treats its value as a filename relative to platforms/.
+                self.assertEqual(kwargs['env']['EXTRA_PLATFORM_PLUGINS'], 'libqoffscreen.so')
                 wrapper = work / 'tools/linuxdeploy-plugin-qt'
                 self.assertTrue(wrapper.is_file())
                 plugin = next(p for p in extractions if p.name == 'linuxdeploy-plugin-qt')
@@ -126,7 +129,8 @@ class Packaging(unittest.TestCase):
 
     def test_offscreen_plugin_explicitly_deployed(self):
         env = deployment_env('private-qmake')
-        self.assertEqual(env['EXTRAPLATFORM_PLUGINS'], 'libqoffscreen.so')
+        self.assertEqual(env['EXTRA_PLATFORM_PLUGINS'], 'libqoffscreen.so')
+        self.assertNotIn('EXTRAPLATFORM_PLUGINS', env)
         self.assertEqual(env['QMAKE'], 'private-qmake')
         self.assertEqual(env['DISABLE_COPYRIGHT_FILES_DEPLOYMENT'], '1')
 

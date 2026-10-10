@@ -30,7 +30,7 @@ exec "$APPDIR/usr/bin/$command" "$@"
 
 def deployment_env(qmake):
     return dict(os.environ, QMAKE=qmake, ARCH='x86_64', QT_QPA_PLATFORM='offscreen',
-                EXTRAPLATFORM_PLUGINS='libqoffscreen.so', DISABLE_COPYRIGHT_FILES_DEPLOYMENT='1')
+                EXTRA_PLATFORM_PLUGINS='libqoffscreen.so', DISABLE_COPYRIGHT_FILES_DEPLOYMENT='1')
 
 
 def retain_optional_translations(app, work):
