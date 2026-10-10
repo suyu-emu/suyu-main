@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from build import HERE, fetch, sha
 
@@ -33,7 +34,12 @@ def main():
     binary = work / 'result/runtime-x86_64'
     if sha(binary) != lock['sha256'] or binary.stat().st_size != lock['size']:
         raise ValueError('runtime reproducibility pin mismatch; preserve build receipt')
-    binary.rename(work / 'runtime-x86_64')
+    # Docker owns result/, so an unprivileged host cannot unlink from it.
+    # Preserve the container receipt and create a host-owned executable instead.
+    staged = work / 'runtime-x86_64'
+    shutil.copy2(binary, staged)
+    if sha(staged) != lock['sha256'] or staged.stat().st_size != lock['size']:
+        raise ValueError('staged runtime differs from reproducibility pin')
     mapping = (work / 'result/runtime.map').read_text()
     records = {}
     for block in (work / 'result/apk-installed-db.txt').read_text().split('\n\n'):

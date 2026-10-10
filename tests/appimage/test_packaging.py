@@ -6,14 +6,79 @@ import unittest
 import json
 import os
 import subprocess
+import hashlib
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[2] / 'tools/appimage'
 sys.path.insert(0, str(TOOLS))
+import runtime
 from build import inventory, fetch, sha, apprun_script, deployment_env, retain_optional_translations
 from collect_sources import validate
 
 
 class Packaging(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt' or not hasattr(os, 'geteuid') or os.geteuid() == 0,
+                     'requires a non-root POSIX user for directory permission enforcement')
+    def test_runtime_handoff_reads_without_mutating_source_parent(self):
+        payload = b'verified tiny runtime fixture\n'
+        recipe_bytes = b'fixture recipe; Docker execution is mocked\n'
+        download = b'verified download fixture\n'
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        lock = json.loads((TOOLS / 'runtime.lock.json').read_text())
+        lock.update(sha256=digest(payload), size=len(payload),
+                    recipe_sha256=digest(recipe_bytes))
+        for entry in lock['sources'] + lock['apks']:
+            entry['sha256'] = digest(download)
+        archives = ['/usr/lib/libc.a', '/usr/lib/libfuse3.a', '/usr/lib/libmimalloc.a',
+                    '/usr/lib/libz.a', '/usr/lib/libzstd.a',
+                    '/usr/local/lib/libsquashfuse.a', '/usr/local/lib/libsquashfuse_ll.a']
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); fixture_tools = root / 'tools'; fixture_tools.mkdir()
+            (fixture_tools / 'runtime-build.sh').write_bytes(recipe_bytes)
+            (fixture_tools / 'runtime.lock.json').write_text(json.dumps(lock))
+            work = root / 'work'; result_dir = work / 'result'
+
+            def fetch_fixture(url, target, expected):
+                target.write_bytes(download)
+                self.assertEqual(sha(target), expected)
+
+            def docker_fixture(command, **kwargs):
+                self.assertEqual(command[:4], ['fixture-docker', 'run', '--rm', '--cpus'])
+                self.assertTrue(kwargs['check'])
+                result_dir.mkdir()
+                binary = result_dir / 'runtime-x86_64'; binary.write_bytes(payload)
+                binary.chmod(0o755)
+                (result_dir / 'runtime.map').write_text('\n'.join(a + '(fixture.o)' for a in archives))
+                records = ['P:' + item['package'] + '\nV:' + item['version'] + '\nc:' + item['commit']
+                           for item in lock['aports_build_commits'].values()]
+                (result_dir / 'apk-installed-db.txt').write_text('\n\n'.join(records))
+                # Model a Docker-owned0755 parent: the host user can read its
+                # files but cannot remove entries. chmod0555 enforces the same
+                # handoff constraint without requiring privileged chown.
+                result_dir.chmod(0o555)
+                self.assertFalse(os.access(result_dir, os.W_OK))
+                with self.assertRaises(PermissionError):
+                    binary.rename(work / 'forbidden-rename')
+
+            try:
+                with mock.patch.object(runtime, 'HERE', fixture_tools), \
+                     mock.patch.object(runtime, 'fetch', side_effect=fetch_fixture), \
+                     mock.patch.object(runtime.subprocess, 'run', side_effect=docker_fixture), \
+                     mock.patch.object(sys, 'argv', ['runtime.py', '--work-dir', str(work),
+                                                    '--docker', 'fixture-docker']):
+                    runtime.main()
+                self.assertEqual((work / 'runtime-x86_64').read_bytes(), payload)
+                self.assertEqual(sha(work / 'runtime-x86_64'), lock['sha256'])
+                self.assertEqual((work / 'runtime-x86_64').stat().st_size, lock['size'])
+                self.assertEqual((result_dir / 'runtime-x86_64').read_bytes(), payload)
+                self.assertEqual(result_dir.stat().st_mode & 0o777, 0o555)
+                receipt = json.loads((work / 'runtime-receipt.json').read_text())
+                self.assertTrue(receipt['reproducibility_pin_verified'])
+                self.assertEqual(receipt['contributed_archives'], archives)
+            finally:
+                if result_dir.exists():
+                    result_dir.chmod(0o755)
+
     def test_offscreen_plugin_explicitly_deployed(self):
         env = deployment_env('private-qmake')
         self.assertEqual(env['EXTRAPLATFORM_PLUGINS'], 'libqoffscreen.so')
