@@ -117,7 +117,8 @@ def main():
         binary = fetch(entry['url'], downloads / entry['name'], entry['sha256'])
         binary.chmod(0o755)
         if entry['name'].endswith('.AppImage'):
-            extract = tool_dir / entry['repo'].split('/')[-1]; extract.mkdir()
+            extract = tool_dir / 'extracted' / entry['repo'].split('/')[-1]
+            extract.mkdir(parents=True)
             subprocess.run([str(binary), '--appimage-extract'], cwd=extract, check=True)
             tools[entry['repo']] = extract / 'squashfs-root/AppRun'
         else:

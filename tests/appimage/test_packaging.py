@@ -12,11 +12,56 @@ from unittest import mock
 TOOLS = Path(__file__).resolve().parents[2] / 'tools/appimage'
 sys.path.insert(0, str(TOOLS))
 import runtime
+import build
 from build import inventory, fetch, sha, apprun_script, deployment_env, retain_optional_translations
 from collect_sources import validate
 
 
 class Packaging(unittest.TestCase):
+    def test_extracted_qt_plugin_does_not_collide_with_discovery_wrapper(self):
+        class DeploymentReached(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); package = root / 'package'; package.mkdir()
+            for name in ('suyu', 'suyu-cmd', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt'):
+                (package / name).write_bytes(b'fixture')
+            (package / 'LICENSES').mkdir()
+            work = root / 'work'
+            extractions = []
+
+            def fetch_fixture(url, target, expected):
+                target.write_bytes(b'mocked pinned tool or license')
+                return target
+
+            def tool_fixture(command, **kwargs):
+                if command[-1] == '--appimage-extract':
+                    directory = kwargs['cwd']; extractions.append(directory)
+                    extracted = directory / 'squashfs-root'; extracted.mkdir()
+                    (extracted / 'AppRun').write_text('fixture extracted entry point')
+                    return
+                self.assertEqual(command[-2:], ['--plugin', 'qt'])
+                wrapper = work / 'tools/linuxdeploy-plugin-qt'
+                self.assertTrue(wrapper.is_file())
+                plugin = next(p for p in extractions if p.name == 'linuxdeploy-plugin-qt')
+                self.assertTrue(plugin.is_dir())
+                self.assertNotEqual(wrapper, plugin)
+                self.assertIn(str(plugin / 'squashfs-root/AppRun'), wrapper.read_text())
+                self.assertEqual(kwargs['env']['PATH'].split(os.pathsep)[0], str(work / 'tools'))
+                raise DeploymentReached
+
+            with mock.patch.object(build, 'fetch', side_effect=fetch_fixture), \
+                 mock.patch.object(build.subprocess, 'run', side_effect=tool_fixture), \
+                 mock.patch.object(build.platform, 'freedesktop_os_release',
+                                   return_value={'ID': 'ubuntu', 'VERSION_ID': '24.04'}), \
+                 mock.patch.object(build.platform, 'machine', return_value='x86_64'), \
+                 mock.patch.dict(os.environ, {'SOURCE_DATE_EPOCH': '1'}), \
+                 mock.patch.object(sys, 'argv', ['build.py', '--package-dir', str(package),
+                       '--work-dir', str(work), '--runtime-dir', str(root / 'runtime'),
+                       '--source-revision', 'a' * 40, '--repository', 'fixture/repository',
+                       '--release-name', 'v0.0.14']):
+                with self.assertRaises(DeploymentReached):
+                    build.main()
+
     @unittest.skipIf(os.name == 'nt' or not hasattr(os, 'geteuid') or os.geteuid() == 0,
                      'requires a non-root POSIX user for directory permission enforcement')
     def test_runtime_handoff_reads_without_mutating_source_parent(self):
