@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import subprocess
+import struct
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
@@ -56,6 +57,41 @@ def sha(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+def restore_runtime_digest(artifact, runtime_file, expected_size, expected_sha256):
+    """Undo only the pinned tool's16-byte MD5 metadata write, preserving full pin."""
+    original = runtime_file.read_bytes()
+    if len(original) != expected_size or hashlib.sha256(original).hexdigest() != expected_sha256:
+        raise ValueError('runtime artifact receipt mismatch')
+    if original[:6] != b'\x7fELF\x02\x01' or len(original) < 64:
+        raise ValueError('expected pinned ELF64 little endian runtime')
+    table = struct.unpack_from('<Q', original, 40)[0]
+    stride, count, string_index = struct.unpack_from('<HHH', original, 58)
+    if stride < 64 or not count or string_index >= count or table + stride * count > len(original):
+        raise ValueError('invalid pinned runtime section table')
+    sections = [struct.unpack_from('<IIQQQQIIQQ', original, table + stride * n) for n in range(count)]
+    names_section = sections[string_index]
+    if names_section[4] + names_section[5] > len(original):
+        raise ValueError('invalid pinned runtime section names')
+    names = original[names_section[4]:names_section[4] + names_section[5]]
+    matching = [s for s in sections if s[0] < len(names) and
+                names[s[0]:].split(b'\0', 1)[0] == b'.digest_md5']
+    if len(matching) != 1:
+        raise ValueError('unique pinned runtime MD5 section required')
+    section = matching[0]; offset = section[4]
+    if section[1] != 1 or section[5] < 16 or not 0 < offset <= len(original) - 16:
+        raise ValueError('invalid pinned runtime MD5 section')
+    with artifact.open('rb') as stream:
+        built = stream.read(expected_size)
+        if len(built) != expected_size or stream.read(4) != b'hsqs':
+            raise ValueError('runtime prefix or SquashFS offset mismatch')
+    if built[:offset] != original[:offset] or built[offset + 16:] != original[offset + 16:]:
+        raise ValueError('runtime changed outside pinned MD5 metadata')
+    with artifact.open('r+b') as stream:
+        stream.seek(offset); stream.write(original[offset:offset + 16])
+    return dict(section='.digest_md5', offset=offset, restored_bytes=16,
+                tool_prefix_sha256=hashlib.sha256(built).hexdigest())
 
 
 def fetch(url, path, digest):
@@ -187,6 +223,8 @@ def main():
     artifact = work / 'suyu-linux-x86_64.AppImage'
     subprocess.run([str(tools['AppImage/appimagetool']), '--runtime-file', str(tools['AppImage/type2-runtime']),
                     str(app), str(artifact)], env=env, check=True)
+    proof['runtime_checksum_restoration'] = restore_runtime_digest(
+        artifact, tools['AppImage/type2-runtime'], runtime['size'], runtime['sha256'])
     with artifact.open('rb') as stream:
         if hashlib.sha256(stream.read(runtime['size'])).hexdigest() != runtime['sha256'] or stream.read(4) != b'hsqs':
             raise ValueError('runtime prefix or SquashFS offset mismatch')

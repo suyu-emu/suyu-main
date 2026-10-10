@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import hashlib
+import struct
 from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[2] / 'tools/appimage'
@@ -19,6 +20,40 @@ from collect_sources import validate
 
 
 class Packaging(unittest.TestCase):
+    def test_only_pinned_runtime_md5_bytes_restored(self):
+        original = bytearray(512); original[:6] = b'\x7fELF\x02\x01'
+        struct.pack_into('<Q', original, 40, 128)
+        struct.pack_into('<HHH', original, 58, 64, 3, 2)
+        names = b'\0.digest_md5\0.shstrtab\0'; original[416:416 + len(names)] = names
+        struct.pack_into('<IIQQQQIIQQ', original, 192, 1, 1, 0, 80, 80, 16, 0, 0, 1, 0)
+        struct.pack_into('<IIQQQQIIQQ', original, 256, names.index(b'.shstrtab'), 3,
+                         0, 0, 416, len(names), 0, 0, 1, 0)
+        original = bytes(original); digest = hashlib.sha256(original).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            runtime_file = Path(d) / 'runtime'; runtime_file.write_bytes(original)
+            artifact = Path(d) / 'image'
+            changed = bytearray(original); changed[80:96] = b'0123456789abcdef'
+            payload = b'hsqsfixture payload'
+            artifact.write_bytes(changed + payload)
+            receipt = build.restore_runtime_digest(artifact, runtime_file, len(original), digest)
+            self.assertEqual(artifact.read_bytes(), original + payload)
+            self.assertEqual(runtime_file.read_bytes(), original)
+            self.assertEqual(receipt['restored_bytes'], 16)
+            # Arbitrary changes outside the exact pinned section remain fatal,
+            # and a rejected image is preserved byte-for-byte.
+            changed[32] = 1; bad = bytes(changed) + payload
+            artifact.write_bytes(bad)
+            with self.assertRaisesRegex(ValueError, 'outside pinned MD5'):
+                build.restore_runtime_digest(artifact, runtime_file, len(original), digest)
+            self.assertEqual(artifact.read_bytes(), bad)
+            for expected, body in (('0' * 64, original + payload),
+                                   (digest, original + b'wrong offset'),
+                                   (digest, original[:-1])):
+                artifact.write_bytes(body)
+                with self.assertRaises(ValueError):
+                    build.restore_runtime_digest(artifact, runtime_file, len(original), expected)
+                self.assertEqual(artifact.read_bytes(), body)
+
     def test_apt_signature_collector_preserves_verified_receipt(self):
         fixture = Path(__file__).resolve().parents[1] / 'package_policy/fixtures/libxau_1.0.9.orig.tar.gz.asc'
         valid = fixture.read_bytes()
