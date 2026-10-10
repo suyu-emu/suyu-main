@@ -8,7 +8,7 @@ Run from the repository on Ubuntu24.04 with Docker, Python3, binutils, patchelf,
     python3 tools/appimage/runtime.py --work-dir _runtime
     python3 tools/appimage/build.py --package-dir _pkg --work-dir _appimage --runtime-dir _runtime --source-revision "$GITHUB_SHA" --release-name "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY" --qmake qmake6
     python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke.json
-    python3 tests/appimage/test_packaging.py
+    python3 -m unittest discover -s tests/appimage -v
 
 Destinations must be new. Release refs sanitize slashes to hyphens. Tagv0.0.14 emits _appimage/suyu-linux-x86_64.AppImage and _appimage/suyu-v0.0.14-appimage-sources.tar.gz. AppDir and sidecar appimage-provenance.json remain for audit. Source tar topdir is suyu-v0.0.14-dependency-sources; it is separate from existingCPMsourcebundle. No hand-authored source manifest is an input.
 
@@ -21,6 +21,30 @@ After deployment payload_sources.py finds every regular.so, requires matchingdpk
 Embedded usr/share/suyu/appimage-provenance.json schema suyu-appimage-v1 includes runtimeSHA/size/sourceURL/recipeSHA/lockSHA, sourcecommit and exhaustivefiles/symlinkinventory excludingitself. Embedded distribution-sources.json includes runtimebuildreceipt and exactpayloadsource mappings. Scanner must use independentcommittedruntime/source lock, not trust embeddedselfassertions. AppRun is a regularshellscript; defaultGUI or --suyu-cmd CLI; rootapprun-hooks/linuxdeploy-plugin-qt-hook.sh establishespluginpaths; XDG_CURRENT_DESKTOP defaults empty and libqoffscreen.so is explicitly deployed alongside platforminputcontexts. NonFUSEsmoke extractsimage, runs CLIhelp and checks8secondoffscreenGUIstartup; ownedSIGTERM is explicitlynotcleanGUIshutdown proof.
 
 FocusedPythonchecks pass locally. Linuxnativeproductpackaging, fullQtdeploymentlayout, extractedproductsmoke and finalpolicy scans remain CIchecks; no nativegame is part of packaging. Runtimebuild/replayproofs are retained externally in G:/sxdb/appimage-verification, not shipped.
+
+Corresponding-source delivery preserves complete upstream source archives and the
+immutable runtime input/build receipt. `source-delivery.lock.json` separately
+records exact aports recipe projections: every package-local APKBUILD, patch and
+auxiliary file at the installed package's recorded build commit, plus upstream
+context documents. Unrelated repository trees are omitted from these explicitly
+declared derived archives; the generic snapshot is context-only, not a libfuse
+recipe. Original input URLs, snapshot commits and SHA256 remain in `sources`;
+physical derived archive hashes and exact members appear in `source_distributions`.
+The collector and scanner verify these against the independent delivery lock.
+
+Full upstream archives can contain deliberately malformed decoder fixtures,
+source aliases and static test snapshots whose names resemble release userdata.
+`source-fixtures.lock.json` admits only independently reviewed exact archive and
+ancestor hashes, raw member occurrences, types, targets, sizes and content hashes.
+Malformed archive parsing stops only at specifically recorded fixture boundaries;
+ordinary raw-content scans still run. Key text, game containers and content
+signatures are never excused. The sole key-name admission is the hash-bound
+OpenSSL explanatory prose document, not a key payload. Changed bytes, targets,
+paths, occurrences, ancestor archives or source manifests fail the gate.
+
+CI diagnostic FUSE-free startup may run after a corresponding-source scan fails
+if construction succeeded. That failure still blocks uploads and publication;
+diagnostic startup is not a release qualification waiver.
 
 
 Pinned deployment layout controls: DISABLE_COPYRIGHT_FILES_DEPLOYMENT=1 is supported in linuxdeploy cc7b86472 src/main.cpp114–117 and Qtplugin ce5291e src/main.cpp139–142. This suppresses duplicate tool copyright trees; automatic collector still supplies complete canonical Ubuntu copyright/full common-license texts. Qtplugin src/deployment.h119–151 has no translation-disable flag. The builder validates its optional usr/translations subtree contains only flat regular.qm files, records their hashes, and moves that newlyowned output to _appimage/omitted-qt-translations before releaseinventory. No originalQt/source/license file is deleted or modified; unexpectedfiles/symlinks fail without moving. Omitted optional Qt translations are not releasepayload; product translations embedded in suyu are unaffected. Eight focusedLinux tests pass, including actuallauncherhook and safeoptionaltranslationretention.

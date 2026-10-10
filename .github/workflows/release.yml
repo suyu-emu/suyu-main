@@ -149,6 +149,7 @@ jobs:
       - name: Validate package policy
         run: python3 tools/package_policy/scan_release.py --kind linux '${{ matrix.archive }}'
       - name: Build pinned AppImage runtime and portable package
+        id: appimage_build
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           python3 tools/appimage/runtime.py --work-dir _appimage-runtime
@@ -169,6 +170,9 @@ jobs:
           test "${#sources[@]}" -eq 1
           python3 tools/package_policy/scan_release.py --kind dependency-sources "${sources[0]}"
       - name: Test AppImage without FUSE
+        # Diagnostic startup still runs after a failed source scan; that failure
+        # continues to block artifact upload and the publish gate.
+        if: ${{ always() && !cancelled() && steps.appimage_build.outcome == 'success' }}
         run: python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke-report.json
       - uses: actions/upload-artifact@v4
         with:
@@ -231,6 +235,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Build version tests failed' }
           python tests/export_build_kit/test_package.py
           if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
+          python tests/appimage/test_source_delivery.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source delivery projection tests failed' }
           python tests/appdata_path/run.py
           if ($LASTEXITCODE -ne 0) { throw 'APPDATA path tests failed' }
           python tests/recompiler_partition/run.py --build build-partition-test

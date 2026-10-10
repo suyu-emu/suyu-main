@@ -11,6 +11,7 @@ import sys
 from build import HERE, fetch, sha
 sys.path.insert(0, str(HERE.parent / 'package_policy'))
 from apt_signature import MAX_SIGNATURE_BYTES, validate_detached_signature
+from source_delivery import load_delivery_lock, recipe_projection
 
 
 def validate(manifest, libraries):
@@ -62,13 +63,27 @@ def main():
         if path.is_file() and not path.is_symlink() and '.so' in path.name:
             libs[path.relative_to(a.appdir).as_posix()] = sha(path)
     m = json.loads(a.manifest.read_text()); sources = validate(m, libs)
+    runtime_lock = json.loads((HERE / 'runtime.lock.json').read_text())
+    policy = json.loads((HERE.parent / 'package_policy/policy.json').read_text())
+    delivery = load_delivery_lock(HERE, runtime_lock, policy)
     a.output.mkdir(parents=True, exist_ok=False)
+    distributions = {}
     for name, source in sources.items():
         if Path(name).name != name or not name.endswith(('.tar.gz', '.tar.xz', '.tar.bz2', '.dsc', '.diff.gz', '.tar.zst', '.asc')):
             raise ValueError('unsafe source filename: ' + repr(name))
         if name.endswith('.asc') and source.get('authentication') != 'apt signed Sources index':
             raise ValueError('detached signature lacks authenticated APT source linkage')
-        fetch(source['url'], a.output / name, source['sha256'])
+        projection = delivery['projections'].get(name)
+        if projection:
+            inputs = a.output.parent / 'original-source-inputs'; inputs.mkdir(exist_ok=True)
+            original = fetch(source['url'], inputs / name, source['sha256'])
+            data, record = recipe_projection(original, source, projection['recipe_root'], projection['metadata_only'])
+            if record != projection:
+                raise ValueError('complete recipe projection differs from reviewed source delivery lock')
+            (a.output / name).write_bytes(data)
+            distributions[name] = record
+        else:
+            fetch(source['url'], a.output / name, source['sha256'])
         if name.endswith('.asc'):
             if (a.output / name).stat().st_size > MAX_SIGNATURE_BYTES:
                 raise ValueError('detached signature exceeds bounded size')
@@ -90,9 +105,16 @@ def main():
             raise ValueError('conflicting package copyright')
         dest.write_text(text)
     receipt = dict(m, input_manifest_sha256=sha(a.manifest), bundled_libraries=libs,
-                   collected_files={name: sha(a.output / name) for name in sources})
+                   collected_files={name: sha(a.output / name) for name in sources},
+                   source_distributions=distributions,
+                   source_delivery_lock_sha256=sha(HERE / 'source-delivery.lock.json'))
     (a.output / 'MANIFEST.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    (a.output / 'README.txt').write_text('Audited AppImage corresponding sources. See MANIFEST.json for exact binary/source mappings.\n')
+    (a.output / 'README.txt').write_text(
+        'Audited AppImage corresponding sources. See MANIFEST.json for exact binary/source mappings.\n'
+        'sources records retain immutable upstream input URLs and hashes. source_distributions records\n'
+        'explicitly identify delivery-only aports recipe projections and their physical output hashes.\n'
+        'Every package-local recipe/patch is retained; unrelated repository trees are not required to rebuild.\n'
+        'The generic aports snapshot is context-only and is not a runtime fuse recipe.\n')
     version = m['release_name']
     if not version or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-' for c in version):
         raise ValueError('invalid release name')

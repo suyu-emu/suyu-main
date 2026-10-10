@@ -30,8 +30,11 @@ import tarfile
 import tempfile
 import zipfile
 from apt_signature import MAX_SIGNATURE_BYTES, validate_detached_signature
+from source_fixtures import load_review
 
 POLICY_PATH = Path(__file__).with_name('policy.json')
+sys.path.insert(0, str(POLICY_PATH.parent.parent / 'appimage'))
+from source_delivery import load_delivery_lock, verify_distribution_records
 KINDS = ('windows', 'linux', 'linux-appimage', 'macos', 'android-apk', 'libretro-linux', 'libretro-windows',
          'libretro-macos', 'libretro-android', 'source', 'dependency-sources')
 HEAD_BYTES = 16384 + 8
@@ -124,11 +127,12 @@ def normalize(raw, strip_dot_slash):
 
 
 class Entry:
-    __slots__ = ('raw', 'is_dir', 'link', 'link_target', 'size', 'opener')
+    __slots__ = ('raw', 'is_dir', 'link', 'link_target', 'size', 'opener', 'source_occurrence', 'source_fact')
 
     def __init__(self, raw, is_dir, link, link_target, size, opener):
         self.raw, self.is_dir, self.link, self.link_target = raw, is_dir, link, link_target
         self.size, self.opener = size, opener
+        self.source_occurrence, self.source_fact = 0, None
 
 
 def zip_entries(archive):
@@ -178,12 +182,20 @@ class Scanner:
         self.source_top = None
         self.source_hashes = {}
         self.source_manifest = None
+        self.source_context = None
+        self.source_fact = None
+        self.source_review = load_review(POLICY_PATH.parent, rules.policy) if kind == 'dependency-sources' else None
 
     def add(self, rule, member, reason):
+        if self.source_review and self.source_review.excuses(self.source_fact, rule, member):
+            return
         self.findings.append({'rule': rule, 'member': clean_label(member), 'reason': reason})
 
     # ---- archive level -------------------------------------------------
-    def scan(self, fileobj, fmt, prefix, depth):
+    def scan(self, fileobj, fmt, prefix, depth, source_context=None):
+        previous_context, previous_fact = self.source_context, self.source_fact
+        if source_context is not None:
+            self.source_context = source_context
         try:
             if fmt == 'zip':
                 with zipfile.ZipFile(fileobj) as archive:
@@ -193,13 +205,23 @@ class Scanner:
                     self.scan_entries(tar_entries(archive), True, prefix, depth)
         except (zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, RuntimeError, ValueError) as error:
             self.add('unreadable', prefix.rstrip('!') or '(archive)', 'archive could not be read: ' + type(error).__name__)
+        finally:
+            self.source_context, self.source_fact = previous_context, previous_fact
 
     def scan_entries(self, entries, is_tar, prefix, depth):
         top = depth == 0
         seen = {}
         names, dirs, links = set(), set(), []
+        occurrences = {}
         for entry in entries:
             path, is_dir, problems = normalize(entry.raw, is_tar)
+            occurrences[entry.raw] = occurrences.get(entry.raw, 0) + 1
+            entry.source_occurrence = occurrences[entry.raw]
+            entry.source_fact = None
+            if self.source_review:
+                entry.source_fact = self.source_review.observe(self.source_context, entry,
+                    entry.source_occurrence, prefix + (path or entry.raw), prefix + entry.raw)
+            self.source_fact = entry.source_fact
             if is_tar and not path and not problems and entry.is_dir:
                 continue  # "./" root entry of "tar -C dir ."
             is_dir = is_dir or entry.is_dir
@@ -238,6 +260,7 @@ class Scanner:
     def check_links(self, links, names, dirs, top):
         link_map = {path: entry.link_target for path, _, entry in links if entry.link == 'symlink'}
         for path, label, entry in links:
+            self.source_fact = getattr(entry, 'source_fact', None)
             reason = self.link_problem(path, entry, link_map, names, dirs, top)
             if reason:
                 self.add('link', label, reason)
@@ -370,7 +393,7 @@ class Scanner:
                     if size > MAX_SIGNATURE_BYTES:
                         raise ValueError('detached signature exceeds bounded size')
                     validate_detached_signature(data)
-                digest = hashlib.sha256(data) if kit_rel is not None or source_rel is not None else None
+                digest = hashlib.sha256(data) if kit_rel is not None or source_rel is not None or (self.source_context and fmt) else None
                 spool = None
                 if nested_ok or debian_patch:
                     spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_BYTES)
@@ -411,6 +434,8 @@ class Scanner:
         if spool is not None:
             try:
                 spool.seek(0)
+                if self.source_review and self.source_review.opaque(entry.source_fact):
+                    return  # Exact reviewed fixture; raw content scans above still applied.
                 if debian_patch:
                     # Rolled-over spools have mode w+b; never let gzip inherit it.
                     with gzip.GzipFile(fileobj=spool, mode='rb') as patch:
@@ -424,7 +449,14 @@ class Scanner:
                         self.add('key-text', label + '!patch', 'patch matches a key text pattern')
                     self.scan_file(path[:-3], label + '!patch', Entry(path[:-3], False, None, None, len(expanded), lambda: io.BytesIO(expanded)), '', depth + 1)
                 else:
-                    self.scan(spool, fmt, label + '!', depth + 1)
+                    context = None
+                    if self.kind == 'dependency-sources' and digest is not None:
+                        if depth == 0:
+                            context = dict(archive_name=source_rel, archive_sha256=digest.hexdigest(), ancestors=[])
+                        elif self.source_context is not None:
+                            context = dict(self.source_context, ancestors=self.source_context['ancestors'] +
+                                [dict(name=entry.raw, occurrence=entry.source_occurrence, sha256=digest.hexdigest())])
+                    self.scan(spool, fmt, label + '!', depth + 1, context)
             except (OSError, ValueError, UnicodeError) as error:
                 self.add('unreadable', label, 'nested source could not be read: ' + type(error).__name__)
             finally:
@@ -599,6 +631,15 @@ def check_appimage_sources(scanner, document, lock, lock_hash, files):
     if not isinstance(document, dict) or document.get('schema') != 'suyu-appimage-sources-v1':
         scanner.add('source-provenance', member, 'source manifest missing or invalid')
         return
+    if document.get('runtime_complete') is not True or document.get('runtime_sha256') != lock['sha256']:
+        scanner.add('source-provenance', member, 'complete pinned runtime source identity missing')
+        return
+    try:
+        delivery = load_delivery_lock(POLICY_PATH.parent.parent / 'appimage', lock, scanner.rules.policy)
+        verify_distribution_records(document, delivery)
+    except (KeyError, ValueError):
+        scanner.add('source-provenance', member, 'source recipe distribution differs from reviewed delivery lock')
+        return
     receipt = document.get('runtime_build_receipt')
     if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in lock.items()):
         scanner.add('source-provenance', member, 'runtime receipt does not match reviewed source closure')
@@ -629,6 +670,40 @@ def check_appimage_sources(scanner, document, lock, lock_hash, files):
                     not isinstance(record.get('sources'), list) or not record['sources'] or
                     any(s not in by_name for s in record['sources'])):
                 scanner.add('source-provenance', name, 'bundled library has no exact corresponding-source mapping')
+
+
+def check_source_distribution_archive(scanner):
+    try:
+        lock, lock_hash = appimage_runtime_lock(scanner.rules)
+        expected_appimage = (getattr(scanner, 'appimage_source_bundle', False) or
+                             bool(set(scanner.source_hashes) & {row['name'] for row in lock['sources']}))
+        if scanner.source_manifest is None and not expected_appimage:
+            return
+        document = json.loads(scanner.source_manifest)
+        if not isinstance(document, dict):
+            raise ValueError('source manifest must be an object')
+        if document.get('schema') != 'suyu-appimage-sources-v1':
+            if expected_appimage:
+                raise ValueError('AppImage source schema cannot be downgraded')
+            return  # Clearly unrelated project collectors have different schemas.
+        folder = POLICY_PATH.parent.parent / 'appimage'
+        delivery = load_delivery_lock(folder, lock, scanner.rules.policy)
+        verify_distribution_records(document, delivery)
+        check_appimage_sources(scanner, document, lock, lock_hash, {})
+        records = {row['name']: row for row in document['sources']}
+        if len(records) != len(document['sources']):
+            raise ValueError('duplicate source input identity')
+        if any(records.get(row['name']) != row for row in lock['sources']):
+            raise ValueError('immutable runtime upstream inputs differ')
+        if set(scanner.source_hashes) != set(records) | {'MANIFEST.json', 'README.txt'}:
+            raise ValueError('physical source distribution inventory differs')
+        for name, record in records.items():
+            projection = delivery['projections'].get(name)
+            expected = projection['output_sha256'] if projection else record['sha256']
+            if scanner.source_hashes.get(name) != expected:
+                raise ValueError('source distribution body does not match declared exact hash')
+    except (TypeError, ValueError, KeyError):
+        scanner.add('source-provenance', 'MANIFEST.json', 'exact source distribution/recipe linkage invalid')
 
 
 def scan_appdir(scanner, members, read_member):
@@ -716,6 +791,7 @@ def scan_appdir(scanner, members, read_member):
 def scan_archive(path, kind, rules, appimage_pins=None):
     scanner = Scanner(rules, kind)
     path = Path(path)
+    scanner.appimage_source_bundle = path.name.endswith('-appimage-sources.tar.gz')
     fmt = archive_format(path.name)
     if kind == 'linux-appimage':
         scanner.appimage_pins = appimage_pins or {}
@@ -741,6 +817,8 @@ def scan_archive(path, kind, rules, appimage_pins=None):
                         scanner.add('source-provenance', name, 'signature lacks authenticated APT source linkage')
         except (TypeError, ValueError, KeyError):
             scanner.add('source-provenance', 'MANIFEST.json', 'Debian source manifest missing or invalid')
+    if kind == 'dependency-sources':
+        check_source_distribution_archive(scanner)
     findings = [f for f in scanner.findings if not rules.excused(kind, f['rule'], f['member'])]
     findings.sort(key=lambda f: (f['member'], f['rule'], f['reason']))
     return {'path': path.name, 'kind': kind, 'members_scanned': scanner.members, 'findings': findings}

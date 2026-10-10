@@ -21,6 +21,7 @@ PINS = {'runtime_sha256': POLICY['appimage']['runtime_sha256'],
         'runtime_size': POLICY['appimage']['runtime_size'], 'source_revision': REV, 'repository':'suyu-emu/suyu-main'}
 PROVENANCE = POLICY['appimage']['provenance_path']
 RUNTIME_LOCK, RUNTIME_LOCK_HASH = scan.appimage_runtime_lock(scan.Rules(POLICY))
+DELIVERY_LOCK = scan.load_delivery_lock(ROOT / 'tools/appimage', RUNTIME_LOCK, POLICY)
 
 
 def layout(extra=None, links=None):
@@ -40,6 +41,8 @@ def layout(extra=None, links=None):
                    contributed_archives=['/usr/lib/libc.a','/usr/lib/libfuse3.a','/usr/lib/libmimalloc.a',
                      '/usr/lib/libz.a','/usr/lib/libzstd.a','/usr/local/lib/libsquashfuse.a','/usr/local/lib/libsquashfuse_ll.a'])
     source_doc = {'schema':'suyu-appimage-sources-v1','runtime_build_receipt':receipt,
+                  'runtime_complete':True,'runtime_sha256':RUNTIME_LOCK['sha256'],
+                  'source_distributions':DELIVERY_LOCK['projections'],
                   'runtime_components':RUNTIME_LOCK['components'],'sources':RUNTIME_LOCK['sources'],
                   'libraries':{n:{'sha256':hashlib.sha256(v).hexdigest(),'source_version':'fixture-1',
                      'copyright':'fixture-license','sources':['type2-runtime.tar.gz']}
@@ -205,6 +208,7 @@ class RealSquashFS(unittest.TestCase):
                 pin=hashlib.sha256(runtime).hexdigest();policy=copy.deepcopy(POLICY);policy['appimage'].update(runtime_sha256=pin,runtime_size=128)
                 test_lock=copy.deepcopy(RUNTIME_LOCK);test_lock.update(sha256=pin,size=128)
                 doc=json.loads(files['usr/share/suyu/distribution-sources.json']);doc['runtime_build_receipt'].update(sha256=pin,size=128)
+                doc['runtime_sha256']=pin
                 (app/'usr/share/suyu/distribution-sources.json').write_text(json.dumps(doc))
                 prov=json.loads(files[PROVENANCE]);prov.update(runtime_sha256=pin,runtime_size=128)
                 prov['files']['usr/share/suyu/distribution-sources.json']=hashlib.sha256((app/'usr/share/suyu/distribution-sources.json').read_bytes()).hexdigest()

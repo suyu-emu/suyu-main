@@ -182,7 +182,7 @@
       "suyu-[^/]+-source/.+"
     ],
     "dependency-sources": [
-      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz|asc))"
+      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+~-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz|asc))"
     ],
     "linux-appimage": [
       "AppRun",
@@ -401,6 +401,11 @@
     ],
     "runtime_recipe_sha256": "b7d40189c675205c5ccfa5860cd71a113799cb6d8b7d4fb27f1a5dba2cfeeddc",
     "runtime_lock_canonical_sha256": "f9d07b0c80bac3ce8f535f015393050d8bcf13643a86b53674fb141c37b85d0f",
-    "runtime_source_url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa"
+    "runtime_source_url": "https://codeload.github.com/AppImage/type2-runtime/tar.gz/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+    "source_delivery_lock_canonical_sha256": "ac5d5aba16fb560bbc75dec23cfcf2807737efe60e183b9acefa553b786d5e06"
+  },
+  "source_fixture_review": {
+    "file": "source-fixtures.lock.json",
+    "canonical_sha256": "837ab6670cf4507427c8dda2e1491b4ddadf863d6654e6085608f55f77c4677d"
   }
 }
