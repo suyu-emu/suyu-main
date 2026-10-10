@@ -51,6 +51,44 @@ def retain_optional_translations(app, work):
     return hashes
 
 
+def finalize_deployment_layout(app, work):
+    """Retain the superseded launcher backup and remove only empty scaffolding."""
+    backup = app / 'AppRun.wrapped'
+    result = {'empty_directories_removed': []}
+    if backup.exists() or backup.is_symlink():
+        if not backup.is_symlink() or backup.resolve() != (app / 'usr/bin/suyu').resolve():
+            raise ValueError('unexpected deployed launcher backup')
+        if any('AppRun.wrapped' in path.read_text() for path in (app / 'apprun-hooks').glob('*.sh')):
+            raise ValueError('deployment hook still requires launcher backup')
+        destination = work / 'omitted-AppRun-wrapped.json'
+        if destination.exists():
+            raise ValueError('launcher backup receipt already exists')
+        result['launcher_backup'] = os.readlink(backup)
+        destination.write_text(json.dumps({'target': result['launcher_backup']}, indent=2))
+        backup.unlink()
+    directories = [app / 'usr/share/icons/hicolor' / size / leaf
+                   for size in ('16x16', '32x32', '64x64', '128x128', '256x256')
+                   for leaf in ('apps', '')] + [app / 'usr/share/pixmaps']
+    for path in directories:
+        current = app
+        for component in path.relative_to(app).parts:
+            current = current / component
+            if current.is_symlink():
+                raise ValueError('unexpected symlink in icon scaffolding')
+        if path.exists():
+            if not path.is_dir() or any(path.iterdir()):
+                raise ValueError('unexpected payload in icon scaffolding')
+            path.rmdir()
+            result['empty_directories_removed'].append(path.relative_to(app).as_posix())
+    icon = app / '.DirIcon'
+    if icon.exists() or icon.is_symlink():
+        if not icon.is_symlink() or os.readlink(icon) != 'suyu.svg':
+            raise ValueError('unexpected AppDir icon link')
+    else:
+        icon.symlink_to('suyu.svg')
+    return result
+
+
 def sha(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -188,6 +226,7 @@ def main():
     if apprun.is_symlink(): apprun.unlink()
     apprun.write_text(apprun_script())
     apprun.chmod(0o755)
+    deployment_layout = finalize_deployment_layout(app, work)
     if not (app / 'apprun-hooks/linuxdeploy-plugin-qt-hook.sh').is_file():
         raise ValueError('pinned Qt deployment hook missing')
     if not (app / 'usr/plugins/platforms/libqoffscreen.so').is_file():
@@ -215,6 +254,7 @@ def main():
                  runtime_source_url=runtime['source_url'], files=files, links=links,
                  runtime_recipe_sha256=runtime['recipe_sha256'], runtime_lock_sha256=runtime['lock_sha256'],
                  omitted_optional_qt_translations=omitted_translations,
+                 deployment_layout=deployment_layout,
                  tools_lock_sha256=sha(HERE / 'tools.lock.json'), compatibility='Ubuntu 24.04 x86_64')
     (meta / 'appimage-provenance.json').write_text(json.dumps(proof, indent=2) + '\n')
     epoch = int(os.environ['SOURCE_DATE_EPOCH'])

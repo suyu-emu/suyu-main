@@ -20,6 +20,52 @@ from collect_sources import validate
 
 
 class Packaging(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_final_layout_preserves_payload_and_records_tool_scaffolding(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); app = root / 'AppDir'; (app / 'usr/bin').mkdir(parents=True)
+            (app / 'usr/bin/suyu').write_bytes(b'fixture')
+            (app / 'suyu.svg').write_bytes(b'fixture icon')
+            (app / 'AppRun.wrapped').symlink_to('usr/bin/suyu')
+            for size in ('16x16', '32x32', '64x64', '128x128', '256x256'):
+                (app / 'usr/share/icons/hicolor' / size / 'apps').mkdir(parents=True)
+            (app / 'usr/share/pixmaps').mkdir()
+            receipt = build.finalize_deployment_layout(app, root)
+            self.assertFalse((app / 'AppRun.wrapped').is_symlink())
+            self.assertEqual(receipt['launcher_backup'], 'usr/bin/suyu')
+            self.assertEqual(len(receipt['empty_directories_removed']), 11)
+            self.assertEqual(os.readlink(app / '.DirIcon'), 'suyu.svg')
+            self.assertEqual((app / 'usr/bin/suyu').read_bytes(), b'fixture')
+            _, links = inventory(app)
+            self.assertEqual(links['.DirIcon'], 'suyu.svg')
+            unexpected = app / 'usr/share/pixmaps'; unexpected.mkdir()
+            payload = unexpected / 'preserve.txt'; payload.write_text('preserve')
+            with self.assertRaisesRegex(ValueError, 'unexpected payload'):
+                build.finalize_deployment_layout(app, root)
+            self.assertEqual(payload.read_text(), 'preserve')
+
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_launcher_backup_requires_exact_target_and_unused_hook(self):
+        for target, hook in (('../../foreign', ''), ('usr/bin/suyu', 'exec "$APPDIR/AppRun.wrapped"')):
+            with self.subTest(target=target, hook=hook), tempfile.TemporaryDirectory() as d:
+                root = Path(d); app = root / 'AppDir'; (app / 'usr/bin').mkdir(parents=True)
+                (app / 'usr/bin/suyu').write_text('fixture')
+                (app / 'apprun-hooks').mkdir()
+                (app / 'apprun-hooks/fixture.sh').write_text(hook)
+                backup = app / 'AppRun.wrapped'; backup.symlink_to(target)
+                with self.assertRaises(ValueError):
+                    build.finalize_deployment_layout(app, root)
+                self.assertTrue(backup.is_symlink())
+
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_icon_scaffolding_cannot_follow_foreign_parent_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); app = root / 'AppDir'; (app / 'usr/share/icons/hicolor').mkdir(parents=True)
+            outside = root / 'foreign'; (outside / 'apps').mkdir(parents=True)
+            (app / 'usr/share/icons/hicolor/16x16').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                build.finalize_deployment_layout(app, root)
+            self.assertTrue((outside / 'apps').is_dir())
     def test_only_pinned_runtime_md5_bytes_restored(self):
         original = bytearray(512); original[:6] = b'\x7fELF\x02\x01'
         struct.pack_into('<Q', original, 40, 128)
