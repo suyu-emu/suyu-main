@@ -3639,7 +3639,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
-                QStringLiteral("\"correctness_revision\": \"20261009-static-hid-startup-v14\","));
+                QStringLiteral("\"correctness_revision\": \"20261009-static-export-repair-v14-r2\","));
             const auto cached_manifest = QJsonDocument::fromJson(manifest_bytes).object();
             const bool same_patches = cached_manifest.value(QStringLiteral("baked_patches"))
                                           .toObject().value(QStringLiteral("fingerprint")).toString() ==
@@ -4069,7 +4069,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (top_cmake.open(QIODevice::WriteOnly | QIODevice::Text)) {
             QTextStream o(&top_cmake);
             o << "cmake_minimum_required(VERSION 3.13)\n"
-                 "project(" << game_name << "_recompiled C)\n\n"
+                 "project(suyu_recompiled LANGUAGES C)\n\n"
                  "# Add each recompiled module as a subdirectory.\n"
                  "# Each module builds its own 'recompiled' exe and 'recompiled_image' shared lib.\n";
             for (const auto& m : recomp_module_dirs) {
@@ -5086,7 +5086,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (suyu::recomp::g_emit_fastmem) {
             out << "  \"image_features\": " << image_features << ",\n";
         }
-        out << "  \"correctness_revision\": \"20261009-static-hid-startup-v14\",\n";
+        out << "  \"correctness_revision\": \"20261009-static-export-repair-v14-r2\",\n";
         if (!patch_fingerprint.isEmpty()) {
             out << "  \"baked_patches\": " << QString::fromUtf8(
                 QJsonDocument(*baked_patches).toJson(QJsonDocument::Compact)) << ",\n";
