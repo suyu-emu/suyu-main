@@ -29,6 +29,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+from apt_signature import MAX_SIGNATURE_BYTES, validate_detached_signature
 
 POLICY_PATH = Path(__file__).with_name('policy.json')
 KINDS = ('windows', 'linux', 'linux-appimage', 'macos', 'android-apk', 'libretro-linux', 'libretro-windows',
@@ -365,6 +366,10 @@ class Scanner:
                 text = data[:text_limit].decode('latin-1')
                 if any(p.search(text) for p in rules.key_text):
                     self.add('key-text', label, 'content matches a key text pattern')
+                if source_rel is not None and source_rel.endswith('.asc'):
+                    if size > MAX_SIGNATURE_BYTES:
+                        raise ValueError('detached signature exceeds bounded size')
+                    validate_detached_signature(data)
                 digest = hashlib.sha256(data) if kit_rel is not None or source_rel is not None else None
                 spool = None
                 if nested_ok or debian_patch:
@@ -723,13 +728,17 @@ def scan_archive(path, kind, rules, appimage_pins=None):
             scanner.scan(handle, fmt, '', 0)
         if kind == 'windows':
             scanner.check_kit()
-    if kind == 'dependency-sources' and any(n.endswith(('.dsc', '.diff.gz')) for n in scanner.source_hashes):
+    if kind == 'dependency-sources' and any(n.endswith(('.dsc', '.diff.gz', '.asc')) for n in scanner.source_hashes):
         try:
             manifest = json.loads(scanner.source_manifest)
             claimed = {item['name']: item['sha256'] for item in manifest['sources']}
             for name, digest in scanner.source_hashes.items():
-                if name.endswith(('.dsc', '.diff.gz')) and claimed.get(name) != digest:
+                if name.endswith(('.dsc', '.diff.gz', '.asc')) and claimed.get(name) != digest:
                     scanner.add('source-provenance', name, 'Debian source is not hash-linked to MANIFEST.json')
+                if name.endswith('.asc'):
+                    item = next((item for item in manifest['sources'] if item['name'] == name), {})
+                    if item.get('authentication') != 'apt signed Sources index':
+                        scanner.add('source-provenance', name, 'signature lacks authenticated APT source linkage')
         except (TypeError, ValueError, KeyError):
             scanner.add('source-provenance', 'MANIFEST.json', 'Debian source manifest missing or invalid')
     findings = [f for f in scanner.findings if not rules.excused(kind, f['rule'], f['member'])]

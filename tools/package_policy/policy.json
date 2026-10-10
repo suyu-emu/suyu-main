@@ -182,7 +182,7 @@
       "suyu-[^/]+-source/.+"
     ],
     "dependency-sources": [
-      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz))"
+      "suyu-[^/]+-dependency-sources/(MANIFEST\\.json|README\\.txt|[A-Za-z0-9._+-]+\\.(tar\\.gz|tar\\.xz|tar\\.bz2|dsc|diff\\.gz|asc))"
     ],
     "linux-appimage": [
       "AppRun",

@@ -13,11 +13,40 @@ TOOLS = Path(__file__).resolve().parents[2] / 'tools/appimage'
 sys.path.insert(0, str(TOOLS))
 import runtime
 import build
+import collect_sources
 from build import inventory, fetch, sha, apprun_script, deployment_env, retain_optional_translations
 from collect_sources import validate
 
 
 class Packaging(unittest.TestCase):
+    def test_apt_signature_collector_preserves_verified_receipt(self):
+        fixture = Path(__file__).resolve().parents[1] / 'package_policy/fixtures/libxau_1.0.9.orig.tar.gz.asc'
+        valid = fixture.read_bytes()
+        secret = b'-----BEGIN PGP PRIVATE KEY BLOCK-----\nnot a source signature\n'
+        for authentication, digest, succeeds, payload in (
+                ('apt signed Sources index', sha(fixture), True, valid),
+                ('untrusted download', sha(fixture), False, valid),
+                ('apt signed Sources index', '0' * 64, False, valid),
+                ('apt signed Sources index', hashlib.sha256(secret).hexdigest(), False, secret)):
+            with self.subTest(authentication=authentication, digest=digest), tempfile.TemporaryDirectory() as d:
+                root = Path(d); app = root / 'AppDir'; app.mkdir()
+                output = root / 'sources'; manifest = root / 'input.json'
+                incoming = root / fixture.name; incoming.write_bytes(payload)
+                source = dict(name=fixture.name, url=incoming.as_uri(), sha256=digest,
+                              authentication=authentication)
+                manifest.write_text(json.dumps({'libraries': {}, 'release_name': 'v0.0.14'}))
+                with mock.patch.object(collect_sources, 'validate', return_value={fixture.name: source}), \
+                     mock.patch.dict(os.environ, {'SOURCE_DATE_EPOCH': '1'}), \
+                     mock.patch.object(sys, 'argv', ['collect_sources.py', '--appdir', str(app),
+                                                    '--manifest', str(manifest), '--output', str(output)]):
+                    if succeeds:
+                        collect_sources.main()
+                        self.assertEqual((output / fixture.name).read_bytes(), fixture.read_bytes())
+                        receipt = json.loads((output / 'MANIFEST.json').read_text())
+                        self.assertEqual(receipt['collected_files'][fixture.name], digest)
+                    else:
+                        with self.assertRaises(ValueError):
+                            collect_sources.main()
     def test_extracted_qt_plugin_does_not_collide_with_discovery_wrapper(self):
         class DeploymentReached(Exception):
             pass

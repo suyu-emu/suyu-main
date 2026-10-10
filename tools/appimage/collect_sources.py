@@ -7,7 +7,10 @@ import os
 from pathlib import Path
 import subprocess
 import tarfile
+import sys
 from build import HERE, fetch, sha
+sys.path.insert(0, str(HERE.parent / 'package_policy'))
+from apt_signature import MAX_SIGNATURE_BYTES, validate_detached_signature
 
 
 def validate(manifest, libraries):
@@ -61,9 +64,15 @@ def main():
     m = json.loads(a.manifest.read_text()); sources = validate(m, libs)
     a.output.mkdir(parents=True, exist_ok=False)
     for name, source in sources.items():
-        if Path(name).name != name or not name.endswith(('.tar.gz', '.tar.xz', '.tar.bz2', '.dsc', '.diff.gz', '.tar.zst')):
-            raise ValueError('unsafe source filename')
+        if Path(name).name != name or not name.endswith(('.tar.gz', '.tar.xz', '.tar.bz2', '.dsc', '.diff.gz', '.tar.zst', '.asc')):
+            raise ValueError('unsafe source filename: ' + repr(name))
+        if name.endswith('.asc') and source.get('authentication') != 'apt signed Sources index':
+            raise ValueError('detached signature lacks authenticated APT source linkage')
         fetch(source['url'], a.output / name, source['sha256'])
+        if name.endswith('.asc'):
+            if (a.output / name).stat().st_size > MAX_SIGNATURE_BYTES:
+                raise ValueError('detached signature exceeds bounded size')
+            validate_detached_signature((a.output / name).read_bytes())
     licenses = a.appdir / 'usr/share/doc/suyu/LICENSES'
     licenses.mkdir(parents=True, exist_ok=True)
     for path, record in m['libraries'].items():
