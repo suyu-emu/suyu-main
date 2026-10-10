@@ -113,6 +113,7 @@ jobs:
         run: |
           python tests/export_regression/test_module_selection.py
           python tests/export_regression/test_aggregate_project.py
+          python tests/build_version/test_version.py
       - name: Test bounded source partitioning
         run: python tests/recompiler_partition/run.py --build build-partition-test
       - name: Configure
@@ -222,6 +223,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Module selection tests failed' }
           python tests/export_regression/test_aggregate_project.py
           if ($LASTEXITCODE -ne 0) { throw 'Source project tests failed' }
+          python tests/build_version/test_version.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build version tests failed' }
           python tests/export_build_kit/test_package.py
           if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
           python tests/appdata_path/run.py

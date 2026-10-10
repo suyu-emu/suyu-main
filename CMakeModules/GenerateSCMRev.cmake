@@ -7,6 +7,17 @@
 # generate git/build information
 include(GetSCMRev)
 
+# A tagged checkout has no GIT-RELEASE sidecar (unlike a source archive).
+# Only an exact version tag identifies a release; an ancestor tag must not
+# label later development commits as that release.
+if(NOT DEFINED GIT_RELEASE AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    run_git_command(EXACT_RELEASE_TAG describe --tags --exact-match HEAD)
+    if(EXACT_RELEASE_TAG MATCHES "^v[0-9]+\\.[0-9]+\\.[0-9]+$")
+        set(GIT_TAG "${EXACT_RELEASE_TAG}")
+        set(GIT_RELEASE "${EXACT_RELEASE_TAG}")
+    endif()
+endif()
+
 function(get_timestamp _var)
     string(TIMESTAMP timestamp UTC)
     set(${_var} "${timestamp}" PARENT_SCOPE)
@@ -53,7 +64,7 @@ else()
 endif()
 
 set(BUILD_ID ${GIT_REFSPEC})
-set(BUILD_FULLNAME "${REPO_NAME} v0.0.11 (mk8-recomp)")
+set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION}")
 set(CXX_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
 configure_file(scm_rev.cpp.in scm_rev.cpp @ONLY)

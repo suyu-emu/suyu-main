@@ -15,7 +15,7 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="docs/releases/v0.0.13.md">Changes in v0.0.13</a> |
+  <a href="docs/releases/v0.0.14.md">Changes in v0.0.14</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
@@ -26,12 +26,11 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This repository picks it up
-> from commit `d1d09321d7` and continues development, now at **v0.0.13**.
+> from commit `d1d09321d7` and continues development, now at **v0.0.14**.
 >
-> The name and version line are kept deliberately, so the lineage stays legible.
-> The build version identifies `suyu v0.0.13` — the branch suffix says *which*
-> 0.0.13 a binary is, since the archived repository could in principle be picked
-> up by others too. See [PROVENANCE.md](PROVENANCE.md).
+> Tagged builds identify their exact release, such as `suyu v0.0.14`.
+> Development snapshots identify their commit and branch. See
+> [PROVENANCE.md](PROVENANCE.md) for the repository lineage.
 >
 > Work happens on the `mk8-recomp` branch (soon to be renamed Main), driven by
 > [mk8-recomp](https://github.com/dougchansan/mk8-recomp) — a project statically
@@ -50,13 +49,13 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.13**. See the [v0.0.13 release notes](docs/releases/v0.0.13.md)
-for Vulkan pipeline libraries, portable exports, key and installed-content fixes,
-automatic largest-L3 core placement, and Static/Hybrid and mod improvements.
+Current version: **v0.0.14**. See the [v0.0.14 release notes](docs/releases/v0.0.14.md)
+for HID startup and export shutdown repairs, Source CMake title handling, correct
+release labels, and the Ubuntu 24.04 x86-64 AppImage.
 
-The [v0.0.14 candidate](docs/releases/v0.0.14.md) adds startup/export shutdown
-repairs and an Ubuntu 24.04 x86-64 AppImage. Publication awaits gameplay and
-release verification.
+Bounded Windows Static playtests verified MK8D, Odyssey, TOTK and Xenoblade
+Chronicles 3 gameplay with zero JIT transitions and clean exits. The release notes
+record the tested versions, scenes, FPS observations and limits.
 
 Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs:
 games boot under Vulkan/MoltenVK with the bundled MoltenVK library, and MK8D
@@ -110,7 +109,8 @@ about 60 on macOS and Linux, against 60 for the JIT; see the
 
 Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Re-export Static and Hybrid games for v0.0.13.** Generated images use ABI 6 by
+**Re-export Static and Hybrid games for v0.0.14.** Existing exports embed their own
+CPU/HLE host; updating the GUI alone does not apply the startup fix. Generated images use ABI 6 by
 default, with page-table memory access, guard-generation checks and floating-point
 fast paths. Compatibility output can use ABI 5. Automatic title bundles validate
 manifests, image hashes, ABI and instruction bytes. Hosted library launches use the
@@ -120,9 +120,9 @@ A strict-static MK8D v4.0.0 TAS replay reaches a rendered, controllable race seg
 
 Recording and playback are armed at boot. Use separate functional fixtures when loading times differ, record screenshots at milestones, and retain a bounded idle observation after EOF. Keep exact EOF and later milestone verdicts separate. Compare performance only with identical work, interleaved arms and an idle machine.
 
-Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe current gameplay performance; the race figures above do (MK8D v4.0.0, measured 2026-09-22, full table in the release notes).
+Historical speedup measurements are documented in the [v0.0.13 notes](docs/releases/v0.0.13.md). The v0.0.14 table reports bounded functional playtests and does not claim a performance gain or replace the paired campaign safeguards.
 
-See [current release notes](docs/releases/v0.0.13.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [current release notes](docs/releases/v0.0.14.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Changes in recent updates
 
