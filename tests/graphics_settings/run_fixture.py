@@ -39,9 +39,13 @@ def main():
     libraries = re.search(r"^  LINK_LIBRARIES = (.*)$", executable, re.M)[1]
     with tempfile.TemporaryDirectory(prefix="suyu-graphics-fixture-") as temporary:
         directory = Path(temporary)
+        fixture_flags = flags.replace(" /nologo", f' /nologo /I"{directory}"', 1)
         moc = directory / "moc_shared_widget.cpp"
         subprocess.run([str(qt / "bin/moc.exe"), str(ROOT / "src/suyu/configuration/shared_widget.h"),
                         "-o", str(moc)], env=env, check=True)
+        subprocess.run([str(qt / "bin/uic.exe"),
+                        str(ROOT / "src/suyu/configuration/configure_graphics_advanced.ui"),
+                        "-o", str(directory / "ui_configure_graphics_advanced.h")], env=env, check=True)
         sources = [ROOT / "tests/graphics_settings/widget_ini_unit.cpp", moc,
                    ROOT / "src/suyu/configuration/shared_widget.cpp",
                    ROOT / "src/suyu/configuration/shared_translation.cpp",
@@ -50,7 +54,7 @@ def main():
         for index, source in enumerate(sources):
             obj = directory / f"fixture_{index}.obj"
             objects.append(obj)
-            command = flags + f' /Fo"{obj}" /Fd"{directory}/fixture.pdb" /c "{source}"'
+            command = fixture_flags + f' /Fo"{obj}" /Fd"{directory}/fixture.pdb" /c "{source}"'
             result = subprocess.run(command, cwd=build, env=env, text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS)

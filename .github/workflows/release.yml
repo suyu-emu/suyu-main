@@ -267,6 +267,8 @@ jobs:
         run: |
           python tests/graphics_settings/run_fixture.py --build build
           if ($LASTEXITCODE -ne 0) { throw 'Graphics settings GUI/INI tests failed' }
+          python tests/graphics_settings/run_gpu_ticks.py --build build
+          if ($LASTEXITCODE -ne 0) { throw 'Fast GPU Time off-switch test failed' }
       - name: Package
         shell: pwsh
         run: |

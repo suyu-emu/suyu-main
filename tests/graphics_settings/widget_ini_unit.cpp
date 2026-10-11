@@ -6,20 +6,85 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QLabel>
+#include <QLayout>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
+#include <QStringList>
 #include <QSlider>
 #include <QTemporaryDir>
 #include "common/fs/path_util.h"
 #include "common/settings.h"
+#include "suyu/configuration/configure_graphics_advanced.h"
 #include "suyu/configuration/qt_config.h"
 #include "suyu/configuration/shared_widget.h"
+#include "ui_configure_graphics_advanced.h"
 
 static void Check(bool condition, const char* message) {
     if (!condition) {
         std::cerr << message << '\n';
         std::exit(1);
     }
+}
+
+static void CheckAdvancedCategories() {
+    QWidget page;
+    Ui::ConfigureGraphicsAdvanced ui;
+    ui.setupUi(&page);
+    ConfigurationShared::Builder builder(&page, true);
+    bool hacks_present = false;
+    bool extensions_present = false;
+    const auto translations = ConfigurationShared::InitializeTranslations(&page);
+    std::vector<std::function<void(bool)>> ignored_apply;
+    for (const auto category : ConfigureGraphicsAdvanced::SettingsCategories) {
+        hacks_present |= category == Settings::Category::RendererHacks;
+        extensions_present |= category == Settings::Category::RendererExtensions;
+        for (auto* setting : Settings::values.linkage.by_category[category]) {
+            auto* widget = builder.BuildWidget(setting, ignored_apply);
+            Check(widget && widget->Valid(), setting->GetLabel().c_str());
+            ui.populate_target->layout()->addWidget(widget);
+            if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
+                widget->hide();
+            }
+            Check(translations->contains(setting->Id()) &&
+                      !translations->at(setting->Id()).first.isEmpty(), "descriptive advanced label");
+            if (setting->IsEnum()) {
+                Check(widget->combobox && widget->combobox->currentIndex() >= 0,
+                      "advanced enum choices include configured value");
+            }
+        }
+    }
+    Check(hacks_present && extensions_present, "active advanced category coverage");
+    page.resize(720, 420);
+    page.show();
+    QApplication::processEvents();
+    Check(page.minimumSizeHint().height() <= 420, "advanced page permits compact dialog height");
+    Check(ui.advanced_scroll_area->verticalScrollBar()->maximum() > 0,
+          "advanced settings scroll at compact height");
+    ui.advanced_scroll_area->verticalScrollBar()->setValue(
+        ui.advanced_scroll_area->verticalScrollBar()->maximum());
+    const auto check_choices = [&](Settings::BasicSetting* setting, const QStringList& labels) {
+        auto* widget = builder.BuildWidget(setting, ignored_apply);
+        Check(widget && widget->combobox && widget->combobox->count() == labels.size(),
+              "all graphics hack enum choices");
+        for (int index = 0; index < labels.size(); ++index) {
+            Check(widget->combobox->itemText(index) == labels[index], "graphics hack enum units");
+        }
+    };
+    check_choices(&Settings::values.fast_gpu_time,
+                  {QStringLiteral("Normal (no divisor)"), QStringLiteral("Medium (256)"),
+                   QStringLiteral("High (512)")});
+    check_choices(&Settings::values.gpu_unswizzle_texture_size,
+                  {QStringLiteral("16 MiB"), QStringLiteral("32 MiB"), QStringLiteral("128 MiB"),
+                   QStringLiteral("256 MiB"), QStringLiteral("512 MiB")});
+    check_choices(&Settings::values.gpu_unswizzle_stream_size,
+                  {QStringLiteral("4 MiB"), QStringLiteral("8 MiB"), QStringLiteral("16 MiB"),
+                   QStringLiteral("32 MiB"), QStringLiteral("64 MiB")});
+    check_choices(&Settings::values.gpu_unswizzle_chunk_size,
+                  {QStringLiteral("32 slices"), QStringLiteral("64 slices"),
+                   QStringLiteral("128 slices"), QStringLiteral("256 slices"),
+                   QStringLiteral("512 slices")});
 }
 
 int main(int argc, char** argv) {
@@ -63,6 +128,7 @@ int main(int argc, char** argv) {
           "legacy dynamic default resets");
     QWidget parent;
     ConfigurationShared::Builder builder(&parent, true);
+    CheckAdvancedCategories();
     std::vector<std::function<void(bool)>> apply;
     auto* pipeline = builder.BuildWidget(&Settings::values.use_graphics_pipeline_library, apply);
     auto* fast_gpu = builder.BuildWidget(&Settings::values.use_fast_gpu_time, apply);
@@ -118,6 +184,7 @@ int main(int argc, char** argv) {
 
     Settings::SetConfiguringGlobal(false);
     QtConfig game("0100000000001234", Config::ConfigType::PerGameConfig);
+    CheckAdvancedCategories();
     std::vector<std::function<void(bool)>> game_apply;
     auto* override_pipeline = builder.BuildWidget(&Settings::values.use_graphics_pipeline_library,
                                                   game_apply);

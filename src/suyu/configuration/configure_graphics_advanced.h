@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <vector>
 #include <QWidget>
+#include "common/settings_common.h"
 #include "suyu/configuration/configuration_shared.h"
 
 namespace Core {
@@ -24,6 +26,10 @@ class ConfigureGraphicsAdvanced : public ConfigurationShared::Tab {
     Q_OBJECT
 
 public:
+    static constexpr std::array SettingsCategories{
+        Settings::Category::RendererAdvanced, Settings::Category::RendererHacks,
+        Settings::Category::RendererExtensions};
+
     explicit ConfigureGraphicsAdvanced(
         const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group,
         const ConfigurationShared::Builder& builder, QWidget* parent = nullptr);
