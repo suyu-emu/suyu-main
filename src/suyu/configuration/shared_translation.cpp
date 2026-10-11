@@ -247,9 +247,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
-    INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries"),
+    INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries (Experimental)"),
            tr("Builds Vulkan graphics pipelines from reusable parts when supported by the driver. "
-              "Disable this if a driver shows rendering issues. Requires a restart."));
+              "Keeping this disabled is recommended for compatibility. Requires a restart."));
+    INSERT(Settings, dyna_state, tr("Extended dynamic state"),
+           tr("Selects the Vulkan extended dynamic state level when supported by the driver. "
+              "Select Disabled to turn off these extensions. Requires a restart."));
+    INSERT(Settings, sample_shading, tr("Sample shading (%)"),
+           tr("Sets the minimum percentage of samples shaded individually for multisampled "
+              "rendering. Higher values may reduce performance. Requires a restart."));
+    INSERT(Settings, vertex_input_dynamic_state, tr("Use dynamic vertex input state"),
+           tr("Uses Vulkan dynamic vertex input state when supported by the driver. "
+              "Disable this to use fixed vertex input state. Requires a restart."));
     INSERT(
         Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
         tr("Enable compute pipelines, required by some games.\nThis setting only exists for Intel "
@@ -353,6 +362,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
 #define PAIR(ENUM, VALUE, TRANSLATION) {static_cast<u32>(Settings::ENUM::VALUE), (TRANSLATION)}
 
     // Intentionally skipping VSyncMode to let the UI fill that one out
+    translations->insert({Settings::EnumMetadata<Settings::ExtendedDynamicState>::Index(),
+                          {
+                              PAIR(ExtendedDynamicState, Disabled, tr("Disabled")),
+                              PAIR(ExtendedDynamicState, EDS1, tr("EDS1")),
+                              PAIR(ExtendedDynamicState, EDS2, tr("EDS2")),
+                              PAIR(ExtendedDynamicState, EDS3, tr("EDS3")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::AppletMode>::Index(),
                           {
                               PAIR(AppletMode, HLE, tr("Custom frontend")),

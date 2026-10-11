@@ -34,23 +34,30 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
     auto& layout = *ui->populate_target->layout();
     std::map<u32, QWidget*> hold{}; // A map will sort the data for us
 
-    for (auto setting :
-         Settings::values.linkage.by_category[Settings::Category::RendererAdvanced]) {
-        ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
+    for (const auto category : {Settings::Category::RendererAdvanced,
+                               Settings::Category::RendererExtensions}) {
+        for (auto setting : Settings::values.linkage.by_category[category]) {
+            const QString suffix = setting->Id() == Settings::values.sample_shading.Id()
+                                       ? QStringLiteral("%")
+                                       : ConfigurationShared::default_suffix;
+            ConfigurationShared::Widget* widget = builder.BuildWidget(
+                setting, apply_funcs, ConfigurationShared::RequestType::Default, true,
+                ConfigurationShared::default_multiplier, nullptr, suffix);
 
-        if (widget == nullptr) {
-            continue;
-        }
-        if (!widget->Valid()) {
-            widget->deleteLater();
-            continue;
-        }
+            if (widget == nullptr) {
+                continue;
+            }
+            if (!widget->Valid()) {
+                widget->deleteLater();
+                continue;
+            }
 
-        hold.emplace(setting->Id(), widget);
+            hold.emplace(setting->Id(), widget);
 
-        // Keep track of enable_compute_pipelines so we can display it when needed
-        if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
-            checkbox_enable_compute_pipelines = widget;
+            // Keep track of enable_compute_pipelines so we can display it when needed
+            if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
+                checkbox_enable_compute_pipelines = widget;
+            }
         }
     }
     for (const auto& [_, widget] : hold) {

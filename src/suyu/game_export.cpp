@@ -3639,7 +3639,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                 !suyu::recomp::g_emit_fastmem ||
                 contents.contains(QStringLiteral("\"image_features\": %1,").arg(image_features));
             const bool same_correctness_revision = contents.contains(
-                QStringLiteral("\"correctness_revision\": \"20261009-static-export-repair-v14-r2\","));
+                QStringLiteral("\"correctness_revision\": \"20261010-graphics-safe-defaults-r3\","));
             const auto cached_manifest = QJsonDocument::fromJson(manifest_bytes).object();
             const bool same_patches = cached_manifest.value(QStringLiteral("baked_patches"))
                                           .toObject().value(QStringLiteral("fingerprint")).toString() ==
@@ -5086,7 +5086,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         if (suyu::recomp::g_emit_fastmem) {
             out << "  \"image_features\": " << image_features << ",\n";
         }
-        out << "  \"correctness_revision\": \"20261009-static-export-repair-v14-r2\",\n";
+        out << "  \"correctness_revision\": \"20261010-graphics-safe-defaults-r3\",\n";
         if (!patch_fingerprint.isEmpty()) {
             out << "  \"baked_patches\": " << QString::fromUtf8(
                 QJsonDocument(*baked_patches).toJson(QJsonDocument::Compact)) << ",\n";

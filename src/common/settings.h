@@ -543,7 +543,7 @@ struct Values {
 
     // Renderer Hacks //
     SwitchableSetting<bool> use_fast_gpu_time{linkage,
-                                              true,
+                                              false,
                                               "use_fast_gpu_time",
                                               Category::RendererHacks,
                                               Specialization::Default,
@@ -597,12 +597,7 @@ struct Values {
     SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
     SwitchableSetting<bool> use_graphics_pipeline_library{
-        linkage,
-#ifdef __ANDROID__
-        false,
-#else
-        true,
-#endif
+        linkage, false,
         "use_graphics_pipeline_library", Category::RendererExtensions};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
