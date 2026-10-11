@@ -15,7 +15,7 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="docs/releases/v0.0.14.md">Changes in v0.0.14</a> |
+  <a href="docs/releases/v14.0.1.md">Changes in v14.0.1</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
@@ -26,9 +26,9 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This repository picks it up
-> from commit `d1d09321d7` and continues development, now at **v0.0.14**.
+> from commit `d1d09321d7` and continues development, now at **v14.0.1**.
 >
-> Tagged builds identify their exact release, such as `suyu v0.0.14`.
+> Tagged builds identify their exact release, such as `suyu v14.0.1`.
 > Development snapshots identify their commit and branch. See
 > [PROVENANCE.md](PROVENANCE.md) for the repository lineage.
 >
@@ -49,9 +49,10 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Current version: **v0.0.14**. See the [v0.0.14 release notes](docs/releases/v0.0.14.md)
-for HID startup and export shutdown repairs, Source CMake title handling, correct
-release labels, and the Ubuntu 24.04 x86-64 AppImage.
+Current version: **v14.0.1**. Releases now use major.minor.patch numbering.
+See the [v14.0.1 release notes](docs/releases/v14.0.1.md) for safer graphics defaults,
+complete advanced graphics controls, and an effective Fast GPU Time off switch.
+The Ubuntu 24.04 x86-64 AppImage remains available.
 
 Bounded Windows Static playtests verified MK8D, Odyssey, TOTK and Xenoblade
 Chronicles 3 gameplay with zero JIT transitions and clean exits. The release notes
@@ -109,8 +110,8 @@ about 60 on macOS and Linux, against 60 for the JIT; see the
 
 Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Re-export Static and Hybrid games for v0.0.14.** Existing exports embed their own
-CPU/HLE host; updating the GUI alone does not apply the startup fix. Generated images use ABI 6 by
+**Re-export Static and Hybrid games for v14.0.1.** Existing exports embed their own
+CPU/HLE host; updating the GUI alone does not apply host fixes or the new graphics defaults. Generated images use ABI 6 by
 default, with page-table memory access, guard-generation checks and floating-point
 fast paths. Compatibility output can use ABI 5. Automatic title bundles validate
 manifests, image hashes, ABI and instruction bytes. Hosted library launches use the
@@ -122,7 +123,7 @@ Recording and playback are armed at boot. Use separate functional fixtures when 
 
 Historical speedup measurements are documented in the [v0.0.13 notes](docs/releases/v0.0.13.md). The v0.0.14 table reports bounded functional playtests and does not claim a performance gain or replace the paired campaign safeguards.
 
-See [current release notes](docs/releases/v0.0.14.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [current release notes](docs/releases/v14.0.1.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Changes in recent updates
 

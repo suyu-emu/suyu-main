@@ -33,10 +33,10 @@ class BuildVersion(unittest.TestCase):
             self.git(root, "init", "-b", "version-check")
             self.git(root, "commit", "--allow-empty", "-m",
                      "Provide a release head for version verification")
-            self.git(root, "tag", "-a", "v0.0.14", "-m", "Identify the version probe release")
+            self.git(root, "tag", "-a", "v14.0.1", "-m", "Identify the version probe release")
             release = self.generate(root)
-            self.assertIn('#define BUILD_FULLNAME "suyu v0.0.14"', release)
-            self.assertIn('#define BUILD_VERSION "v0.0.14"', release)
+            self.assertIn('#define BUILD_FULLNAME "suyu v14.0.1"', release)
+            self.assertIn('#define BUILD_VERSION "v14.0.1"', release)
             self.assertIn('#define IS_DEV_BUILD false', release)
             self.git(root, "commit", "--allow-empty", "-m",
                      "Represent development after the release for verification")
@@ -48,11 +48,11 @@ class BuildVersion(unittest.TestCase):
     def test_release_source_archive_without_git(self):
         with tempfile.TemporaryDirectory(prefix="suyu-version-archive-") as temp:
             root = Path(temp)
-            for name, value in {"GIT-COMMIT": "a" * 40, "GIT-TAG": "v0.0.14",
-                                "GIT-REFSPEC": "v0.0.14", "GIT-RELEASE": "v0.0.14"}.items():
+            for name, value in {"GIT-COMMIT": "a" * 40, "GIT-TAG": "v14.0.1",
+                                "GIT-REFSPEC": "v14.0.1", "GIT-RELEASE": "v14.0.1"}.items():
                 (root / name).write_text(value + "\n", encoding="utf-8")
             archive = self.generate(root)
-            self.assertIn('#define BUILD_FULLNAME "suyu v0.0.14"', archive)
+            self.assertIn('#define BUILD_FULLNAME "suyu v14.0.1"', archive)
             self.assertIn('#define IS_DEV_BUILD false', archive)
 
 
