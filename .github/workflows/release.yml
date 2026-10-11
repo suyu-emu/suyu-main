@@ -262,6 +262,11 @@ jobs:
         run: |
           python tests/export_build_kit/test_release_kit.py --kit build/bin/export-build-kit --output build-release-kit-check
           if ($LASTEXITCODE -ne 0) { throw 'Production build kit link check failed' }
+      - name: Test graphics settings GUI and INI persistence
+        shell: pwsh
+        run: |
+          python tests/graphics_settings/run_fixture.py --build build
+          if ($LASTEXITCODE -ne 0) { throw 'Graphics settings GUI/INI tests failed' }
       - name: Package
         shell: pwsh
         run: |
