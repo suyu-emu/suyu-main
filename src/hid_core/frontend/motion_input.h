@@ -20,8 +20,9 @@ public:
     static constexpr float IsAtRestStandard = 0.01f;
     static constexpr float IsAtRestTight = 0.005f;
 
-    static constexpr float GyroMaxValue = 5.0f;
-    static constexpr float AccelMaxValue = 7.0f;
+    // Joy-Con hardware limits: +-2000 degrees per second and +-8G.
+    static constexpr float GyroMaxValue = 2000.0f / 360.0f;
+    static constexpr float AccelMaxValue = 8.0f;
 
     static constexpr std::size_t CalibrationSamples = 300;
 
