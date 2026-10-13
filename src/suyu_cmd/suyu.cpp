@@ -263,6 +263,7 @@ static void PrintHelp(const char* argv0) {
     std::cout << "Usage: " << argv0
               << " [options]\n"
                  "-c, --config          Load the specified configuration file\n"
+                 "-d, --content-dir     Folder with update/DLC NSP files to load (repeatable)\n"
                  "-f, --fullscreen      Start in fullscreen mode\n"
                  "-g, --game            File path of the game to load\n"
                  "--app-name            Display name when the loader has no title metadata\n"
@@ -1594,6 +1595,7 @@ int main(int argc, char** argv) {
     static struct option long_options[] = {
         // clang-format off
         {"config", required_argument, 0, 'c'},
+        {"content-dir", required_argument, 0, 'd'},
         {"fullscreen", no_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
         {"game", required_argument, 0, 'g'},
@@ -1614,7 +1616,7 @@ int main(int argc, char** argv) {
     };
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l::tV:N:B:U:PD:", long_options, &option_index);
+        int arg = getopt_long(argc, argv, "g:fhvp::c:d:u:l::tV:N:B:U:PD:", long_options, &option_index);
         if (arg != -1) {
             switch (static_cast<char>(arg)) {
             case 'B':
@@ -1656,6 +1658,9 @@ int main(int argc, char** argv) {
                 filepath = str_arg;
                 break;
             }
+            case 'd':
+                Settings::values.external_content_dirs.emplace_back(optarg);
+                break;
             case 'l': {
                 std::string str_arg(argv[optind++]);
                 str_arg.append(",0"); // FALLBACK: if string is partially completed ("1234,3")
@@ -2524,6 +2529,24 @@ int main(int argc, char** argv) {
     }
     system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
     system.GetUserChannel().clear();
+
+    // Register the booted container's NCAs, like the Qt frontend's game list does, so the patch
+    // manager can find the base program NCA. Without it an update's BKTR RomFS has no base to
+    // patch and the game is handed the unpatched base RomFS alongside the updated code.
+    static auto manual_provider = std::make_unique<FileSys::ManualContentProvider>();
+    system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                   manual_provider.get());
+    if (!filepath.empty()) {
+        const auto extension = Common::ToLower(std::filesystem::path(filepath).extension().string());
+        if (extension == ".nsp" || extension == ".xci") {
+            if (const auto game_file =
+                    system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read)) {
+                if (!manual_provider->AddEntriesFromContainer(game_file)) {
+                    LOG_WARNING(Frontend, "Could not register the contents of {}", filepath);
+                }
+            }
+        }
+    }
 
     if (static_cast<u32>(load_parameters.applet_id)) {
         // code below based off of suyu/main.cpp : GMainWindow::OnHomeMenu()

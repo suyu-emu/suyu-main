@@ -227,6 +227,17 @@ void QtConfig::ReadPathValues() {
         QString::fromStdString(ReadStringSetting(std::string("recentFiles")))
             .split(QStringLiteral(", "), Qt::SkipEmptyParts, Qt::CaseSensitive);
 
+    Settings::values.external_content_dirs.clear();
+    const int external_dirs_size = BeginArray(std::string("external_content_dirs"));
+    for (int i = 0; i < external_dirs_size; ++i) {
+        SetArrayIndex(i);
+        std::string dir_path = ReadStringSetting(std::string("path"));
+        if (!dir_path.empty()) {
+            Settings::values.external_content_dirs.push_back(std::move(dir_path));
+        }
+    }
+    EndArray();
+
     ReadCategory(Settings::Category::Paths);
 
     EndGroup();
@@ -431,6 +442,13 @@ void QtConfig::SavePathValues() {
 
     WriteStringSetting(std::string("recentFiles"),
                        UISettings::values.recent_files.join(QStringLiteral(", ")).toStdString());
+
+    BeginArray(std::string("external_content_dirs"));
+    for (int i = 0; i < static_cast<int>(Settings::values.external_content_dirs.size()); ++i) {
+        SetArrayIndex(i);
+        WriteStringSetting(std::string("path"), Settings::values.external_content_dirs[i]);
+    }
+    EndArray();
 
     EndGroup();
 }
