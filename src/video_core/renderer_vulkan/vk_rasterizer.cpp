@@ -270,8 +270,46 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 }
 
+namespace {
+// Nintendo Switch Sports initializes indirect draw arguments with a vertex shader that reads a
+// table of GPU pointers and stores {count = 0, instance_count = 1, 0, 0, 0} through each pointer.
+// Those stores target memory outside of the bound storage buffer, which the shader recompiler
+// cannot express, so the arguments stay uninitialized and later draws consume garbage.
+// Emulate the stores here, in command order, before the draw is recorded.
+constexpr u64 SWITCH_SPORTS_ARGS_INIT_VS = 0x19936316c758f2c2ULL;
+} // Anonymous namespace
+
+void RasterizerVulkan::EmulateIndirectArgsInit(bool is_indexed) {
+    GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+    if (!pipeline || pipeline->Key().unique_hashes[1] != SWITCH_SPORTS_ARGS_INIT_VS) {
+        return;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (is_indexed) {
+        LOG_WARNING(Render_Vulkan, "Indexed draw with the indirect args init shader is not emulated");
+        return;
+    }
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled) {
+        return;
+    }
+    const GPUVAddr table = gpu_memory->Read<u64>(cbuf.address + 0x110);
+    static constexpr std::array<u32, 5> init_args{0, 1, 0, 0, 0};
+    const std::span<const u8> init_bytes{reinterpret_cast<const u8*>(init_args.data()),
+                                         sizeof(init_args)};
+    for (u32 i = 0; i < draw_state.vertex_buffer.count; ++i) {
+        const u64 vertex_index = u64(draw_state.vertex_buffer.first) + i;
+        const GPUVAddr args = gpu_memory->Read<u64>(table + vertex_index * sizeof(u64));
+        if (args == 0 || !gpu_memory->GpuToCpuAddress(args)) {
+            continue;
+        }
+        AccelerateInlineToMemory(args, init_bytes.size(), init_bytes);
+    }
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     StallProbe::Accum probe{StallProbe::draw_ns, &StallProbe::draw_count};
+    EmulateIndirectArgsInit(is_indexed);
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
