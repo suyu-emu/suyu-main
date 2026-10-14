@@ -30,6 +30,8 @@ struct OverlapResult {
     SubresourceExtent resources;
 };
 
+[[nodiscard]] bool CanAliasDifferentSamples(const ImageInfo& lhs, const ImageInfo& rhs) noexcept;
+
 [[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;

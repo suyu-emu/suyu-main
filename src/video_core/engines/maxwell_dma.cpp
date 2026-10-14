@@ -114,29 +114,30 @@ void MaxwellDMA::Launch() {
             const bool is_src_pitch = IsPitchKind(src_kind);
             const bool is_dst_pitch = IsPitchKind(dst_kind);
             if (!is_src_pitch && is_dst_pitch) {
-                UNIMPLEMENTED_IF(regs.line_length_in % 16 != 0);
                 UNIMPLEMENTED_IF(regs.offset_in % 16 != 0);
                 UNIMPLEMENTED_IF(regs.offset_out % 16 != 0);
                 read_buffer.resize_destructive(16);
                 for (u32 offset = 0; offset < regs.line_length_in; offset += 16) {
+                    const u32 copy_size = std::min<u32>(16, regs.line_length_in - offset);
                     Tegra::Memory::GpuGuestMemoryScoped<
                         u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
                         tmp_write_buffer(memory_manager,
                                          convert_linear_2_blocklinear_addr(regs.offset_in + offset),
-                                         16, &read_buffer);
-                    tmp_write_buffer.SetAddressAndSize(regs.offset_out + offset, 16);
+                                         copy_size, &read_buffer);
+                    tmp_write_buffer.SetAddressAndSize(regs.offset_out + offset, copy_size);
                 }
             } else if (is_src_pitch && !is_dst_pitch) {
-                UNIMPLEMENTED_IF(regs.line_length_in % 16 != 0);
                 UNIMPLEMENTED_IF(regs.offset_in % 16 != 0);
                 UNIMPLEMENTED_IF(regs.offset_out % 16 != 0);
                 read_buffer.resize_destructive(16);
                 for (u32 offset = 0; offset < regs.line_length_in; offset += 16) {
+                    const u32 copy_size = std::min<u32>(16, regs.line_length_in - offset);
                     Tegra::Memory::GpuGuestMemoryScoped<
                         u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
-                        tmp_write_buffer(memory_manager, regs.offset_in + offset, 16, &read_buffer);
+                        tmp_write_buffer(memory_manager, regs.offset_in + offset, copy_size,
+                                         &read_buffer);
                     tmp_write_buffer.SetAddressAndSize(
-                        convert_linear_2_blocklinear_addr(regs.offset_out + offset), 16);
+                        convert_linear_2_blocklinear_addr(regs.offset_out + offset), copy_size);
                 }
             } else {
                 if (!accelerate.BufferCopy(regs.offset_in, regs.offset_out, regs.line_length_in)) {

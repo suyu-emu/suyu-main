@@ -11,6 +11,8 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/logging.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
@@ -75,7 +77,11 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) {
         if (!shader_info) {
             const u32 start_address{shader_config.offset};
             GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, base_addr, start_address};
-            shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+            shader_info = TryMakeShaderInfo(env, *cpu_shader_addr);
+            if (!shader_info) {
+                last_shaders_valid = false;
+                return false;
+            }
         }
         shader_infos[index] = shader_info;
         unique_hashes[index] = shader_info->unique_hash;
@@ -97,7 +103,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return shader;
     }
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-    return MakeShaderInfo(env, *cpu_shader_addr);
+    return TryMakeShaderInfo(env, *cpu_shader_addr);
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
@@ -229,6 +235,19 @@ ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo
 
     lookup_cache.emplace(addr, std::move(entry));
     return entry_pointer;
+}
+
+const ShaderInfo* ShaderCache::TryMakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
+    try {
+        return MakeShaderInfo(env, cpu_addr);
+    } catch (const Shader::Exception& exception) {
+        // The program could not be walked (e.g. its code still reads as zeros). Skip the draw
+        // instead of crashing; it is analyzed again on the next draw that uses it.
+        if (failed_shader_addrs.insert(cpu_addr).second) {
+            LOG_ERROR(HW_GPU, "Skipping shader at 0x{:x}: {}", cpu_addr, exception.what());
+        }
+        return nullptr;
+    }
 }
 
 const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {

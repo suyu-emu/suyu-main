@@ -1194,6 +1194,17 @@ bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs) {
     return false;
 }
 
+bool CanAliasDifferentSamples(const ImageInfo& lhs, const ImageInfo& rhs) noexcept {
+    // The MSAA conversion pass supports a single mip and layer of RGBA8 storage images.
+    return lhs.type == ImageType::e2D && rhs.type == ImageType::e2D &&
+           lhs.format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM && rhs.format == lhs.format &&
+           lhs.num_samples != rhs.num_samples && (lhs.num_samples == 1 || rhs.num_samples == 1) &&
+           lhs.resources.levels == 1 && rhs.resources.levels == 1 &&
+           lhs.resources.layers == 1 && rhs.resources.layers == 1 && lhs.block == rhs.block &&
+           lhs.tile_width_spacing == rhs.tile_width_spacing &&
+           IsLayerStrideCompatible(lhs, rhs) && IsBlockLinearSizeCompatible(lhs, rhs, 0, 0, false);
+}
+
 std::optional<SubresourceBase> FindSubresource(const ImageInfo& candidate, const ImageBase& image,
                                                GPUVAddr candidate_addr, RelaxedOptions options,
                                                bool broken_views, bool native_bgr) {

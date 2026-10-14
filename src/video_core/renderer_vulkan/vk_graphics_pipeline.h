@@ -225,6 +225,10 @@ public:
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
     }
 
+    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
+    }
+
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
         maxwell3d = maxwell3d_;
         gpu_memory = gpu_memory_;

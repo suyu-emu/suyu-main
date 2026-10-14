@@ -1564,7 +1564,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
             return;
         }
-        constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        if (gpu_addr == overlap.gpu_addr && CanAliasDifferentSamples(new_info, overlap.info)) {
+            options |= RelaxedOptions::Samples;
+        }
         const ImageBase new_image_base(new_info, gpu_addr, cpu_addr);
         if (IsSubresource(new_info, overlap, gpu_addr, options, broken_views, native_bgr)) {
             join_left_aliased_ids.push_back(overlap_id);
@@ -1691,7 +1694,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
-            if (!overlap.IsSafeDownload()) {
+            const bool can_copy_msaa = CanAliasDifferentSamples(new_image.info, overlap.info) &&
+                                      True(overlap.flags & ImageFlagBits::GpuModified) &&
+                                      False(overlap.flags & ImageFlagBits::CpuModified);
+            if (!can_copy_msaa && !overlap.IsSafeDownload()) {
                 continue;
             }
             const auto alias_pointer = join_alias_indices.find(copy_object.id);
@@ -2592,6 +2598,9 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
+    if (CanAliasDifferentSamples(dst.info, src.info)) {
+        return runtime.CopyImageMSAA(dst, src, copies);
+    }
     if (src_format_type == dst_format_type) {
         if constexpr (HAS_EMULATED_COPIES) {
             if (!runtime.CanImageBeCopied(dst, src)) {
@@ -2711,9 +2720,42 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const Extent3D size = image_view.size;
     const auto& regs = maxwell3d->regs;
     const auto& scissor = regs.scissor_test[0];
+    // Only the attachment and aspects targeted by this clear lose their previous contents.
+    // Invalidating anything else skips alias synchronization and drops data written through
+    // an alias (e.g. split-screen HUDs drawn into a non-MSAA view of an MSAA target).
+    const auto& clear = regs.clear_surface;
+    if (id == render_targets.depth_buffer_id) {
+        if (!clear.Z) {
+            return false;
+        }
+        const auto surface_type = VideoCore::Surface::GetFormatType(image.info.format);
+        if (surface_type == VideoCore::Surface::SurfaceType::DepthStencil && !clear.S) {
+            return false;
+        }
+    } else {
+        if (!(clear.R && clear.G && clear.B && clear.A)) {
+            return false;
+        }
+        if (clear.RT >= NUM_RT || render_targets.color_buffer_ids[clear.RT] != id) {
+            return false;
+        }
+    }
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
+    }
+    if (regs.clear_control.use_clear_rect) {
+        const auto& rect = regs.clear_rect;
+        if (rect.x_min != 0 || rect.y_min != 0 || rect.x_max < size.width ||
+            rect.y_max < size.height) {
+            return false;
+        }
+    }
+    if (regs.clear_control.use_viewport_clip0) {
+        const auto& vp = regs.viewports[0];
+        if (vp.x != 0 || vp.y != 0 || vp.width < size.width || vp.height < size.height) {
+            return false;
+        }
     }
     if (regs.clear_control.use_scissor == 0) {
         // If scissor testing is disabled, the clear is always full

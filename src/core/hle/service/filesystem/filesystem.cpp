@@ -802,8 +802,16 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
         LOG_DEBUG(Service_FS, "Initializing ExternalContentProvider with {} configured directories",
                   Settings::values.external_content_dirs.size());
 
-        for (const auto& dir_path : Settings::values.external_content_dirs) {
-            if (!dir_path.empty()) {
+        for (const auto& configured_path : Settings::values.external_content_dirs) {
+            if (!configured_path.empty()) {
+                // Relative folders belong to a portable installation; resolve them against the
+                // executable's folder rather than whatever the working directory happens to be.
+                std::string dir_path = configured_path;
+                if (!std::filesystem::path{Common::FS::ToU8String(dir_path)}.is_absolute()) {
+                    dir_path = Common::FS::PathToUTF8String(
+                        Common::FS::GetExeDirectory() /
+                        std::filesystem::path{Common::FS::ToU8String(dir_path)});
+                }
                 LOG_DEBUG(Service_FS, "Attempting to open directory: {}", dir_path);
                 auto dir = vfs.OpenDirectory(dir_path, FileSys::OpenMode::Read);
                 if (dir != nullptr) {

@@ -269,7 +269,7 @@ Result FSP_SRV::IsExFatSupported(Out<bool> out_is_supported) {
 Result FSP_SRV::OpenSaveDataFileSystem(OutInterface<IFileSystem> out_interface,
                                        FileSys::SaveDataSpaceId space_id,
                                        FileSys::SaveDataAttribute attribute) {
-    LOG_INFO(Service_FS, "called.");
+    LOG_INFO(Service_FS, "called, space_id={}, {}", space_id, attribute.DebugInfo());
 
     FileSys::VirtualDir dir{};
     R_TRY(save_data_controller->OpenSaveData(&dir, space_id, attribute));
@@ -300,8 +300,25 @@ Result FSP_SRV::OpenSaveDataFileSystem(OutInterface<IFileSystem> out_interface,
         break;
     }
 
+    auto size_getter = SizeGetter::FromStorageId(fsc, id);
+    if (space_id == FileSys::SaveDataSpaceId::User &&
+        (attribute.type == FileSys::SaveDataType::Account ||
+         attribute.type == FileSys::SaveDataType::Device)) {
+        // Report the mounted save's allocation, not the capacity of its entire NAND partition.
+        // Read the allocation on each query so ExtendSaveData also updates existing mounts.
+        const auto title_id = attribute.program_id == 0 ? program_id : attribute.program_id;
+        const auto get_capacity = [controller = save_data_controller, attribute, title_id] {
+            return controller->ReadSaveDataSize(attribute.type, title_id, attribute.user_id).normal;
+        };
+        size_getter.get_total_size = get_capacity;
+        size_getter.get_free_size = [get_capacity, dir] {
+            const u64 capacity = get_capacity();
+            const u64 used = dir->GetSize();
+            return used < capacity ? capacity - used : 0;
+        };
+    }
     *out_interface =
-        std::make_shared<IFileSystem>(system, std::move(dir), SizeGetter::FromStorageId(fsc, id));
+        std::make_shared<IFileSystem>(system, std::move(dir), std::move(size_getter));
 
     R_SUCCEED();
 }

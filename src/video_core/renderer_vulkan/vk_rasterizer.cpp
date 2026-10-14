@@ -270,8 +270,46 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 }
 
+namespace {
+// Nintendo Switch Sports initializes indirect draw arguments with a vertex shader that reads a
+// table of GPU pointers and stores {count = 0, instance_count = 1, 0, 0, 0} through each pointer.
+// Those stores target memory outside of the bound storage buffer, which the shader recompiler
+// cannot express, so the arguments stay uninitialized and later draws consume garbage.
+// Emulate the stores here, in command order, before the draw is recorded.
+constexpr u64 SWITCH_SPORTS_ARGS_INIT_VS = 0x19936316c758f2c2ULL;
+} // Anonymous namespace
+
+void RasterizerVulkan::EmulateIndirectArgsInit(bool is_indexed) {
+    GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+    if (!pipeline || pipeline->Key().unique_hashes[1] != SWITCH_SPORTS_ARGS_INIT_VS) {
+        return;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    if (is_indexed) {
+        LOG_WARNING(Render_Vulkan, "Indexed draw with the indirect args init shader is not emulated");
+        return;
+    }
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled) {
+        return;
+    }
+    const GPUVAddr table = gpu_memory->Read<u64>(cbuf.address + 0x110);
+    static constexpr std::array<u32, 5> init_args{0, 1, 0, 0, 0};
+    const std::span<const u8> init_bytes{reinterpret_cast<const u8*>(init_args.data()),
+                                         sizeof(init_args)};
+    for (u32 i = 0; i < draw_state.vertex_buffer.count; ++i) {
+        const u64 vertex_index = u64(draw_state.vertex_buffer.first) + i;
+        const GPUVAddr args = gpu_memory->Read<u64>(table + vertex_index * sizeof(u64));
+        if (args == 0 || !gpu_memory->GpuToCpuAddress(args)) {
+            continue;
+        }
+        AccelerateInlineToMemory(args, init_bytes.size(), init_bytes);
+    }
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     StallProbe::Accum probe{StallProbe::draw_ns, &StallProbe::draw_count};
+    EmulateIndirectArgsInit(is_indexed);
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -450,6 +488,41 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         .baseArrayLayer = regs.clear_surface.layer,
         .layerCount = layer_count,
     };
+    const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
+    const s64 clip_height = regs.surface_clip.height;
+    const auto intersect_rect = [&](s64 x0, s64 y0, s64 x1, s64 y1) {
+        if (lower_left) {
+            const s64 flipped_y0 = clip_height - y1;
+            y1 = clip_height - y0;
+            y0 = flipped_y0;
+        }
+        const auto scale = [&](s64 value) { return (value * up_scale) >> down_shift; };
+        x0 = scale(x0);
+        y0 = scale(y0);
+        x1 = scale(x1);
+        y1 = scale(y1);
+        VkRect2D& rect = clear_rect.rect;
+        const s64 rx1 = s64(rect.offset.x) + rect.extent.width;
+        const s64 ry1 = s64(rect.offset.y) + rect.extent.height;
+        const s64 nx0 = (std::max)(s64(rect.offset.x), x0);
+        const s64 ny0 = (std::max)(s64(rect.offset.y), y0);
+        const s64 nx1 = (std::min)(rx1, x1);
+        const s64 ny1 = (std::min)(ry1, y1);
+        rect.offset.x = static_cast<s32>((std::max<s64>)(nx0, 0));
+        rect.offset.y = static_cast<s32>((std::max<s64>)(ny0, 0));
+        rect.extent.width = static_cast<u32>((std::max<s64>)(nx1 - rect.offset.x, 0));
+        rect.extent.height = static_cast<u32>((std::max<s64>)(ny1 - rect.offset.y, 0));
+    };
+    // The clear rectangle and viewport 0 clip also restrict the cleared area. Ignoring them
+    // clears the whole surface, e.g. wiping the other player's half in split-screen games.
+    if (regs.clear_control.use_clear_rect) {
+        intersect_rect(regs.clear_rect.x_min, regs.clear_rect.y_min, regs.clear_rect.x_max,
+                       regs.clear_rect.y_max);
+    }
+    if (regs.clear_control.use_viewport_clip0) {
+        const auto& vp = regs.viewports[0];
+        intersect_rect(vp.x, vp.y, s64(vp.x) + vp.width, s64(vp.y) + vp.height);
+    }
     const auto clamp_rect_to_render_area = [render_area](VkRect2D& rect) -> bool {
         const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
             auto clamp_offset = [&offset, limit]() {
