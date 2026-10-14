@@ -921,7 +921,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ++env_index;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        try {
+            // Walks the program again so the dump covers it; the same error can recur here.
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        } catch (const Shader::Exception&) {
+        }
         env.Dump(hash, key.unique_hashes[index]);
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
