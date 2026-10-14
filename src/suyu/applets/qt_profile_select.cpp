@@ -117,12 +117,23 @@ QtProfileSelectionDialog::QtProfileSelectionDialog(
         const auto username = Common::StringFromFixedZeroTerminatedBuffer(
             reinterpret_cast<const char*>(profile.username.data()), profile.username.size());
 
-        list_items.push_back(QList<QStandardItem*>{new QStandardItem{
-            GetIcon(user), FormatUserEntryText(QString::fromStdString(username), user)}});
+        // Rows are sorted by name, so remember which profile each row belongs to instead of
+        // relying on the row number matching the profile index.
+        auto* item = new QStandardItem{GetIcon(user),
+                                       FormatUserEntryText(QString::fromStdString(username), user)};
+        const auto profile_index = profile_manager.GetUserIndex(user);
+        item->setData(profile_index ? static_cast<int>(*profile_index) : 0, ProfileIndexRole);
+        list_items.push_back(QList<QStandardItem*>{item});
     }
 
     for (const auto& item : list_items)
         item_model->appendRow(item);
+
+    // Start with the first listed user highlighted so OK without a click returns that row.
+    if (item_model->rowCount() > 0) {
+        tree_view->setCurrentIndex(item_model->index(0, 0));
+        SelectUser(tree_view->currentIndex());
+    }
 
     setLayout(outer_layout);
     SetWindowTitle(parameters);
@@ -144,6 +155,8 @@ int QtProfileSelectionDialog::exec() {
 }
 
 void QtProfileSelectionDialog::accept() {
+    // Keyboard and controller navigation only move the current index; read it here.
+    SelectUser(tree_view->currentIndex());
     QDialog::accept();
 }
 
@@ -157,7 +170,10 @@ int QtProfileSelectionDialog::GetIndex() const {
 }
 
 void QtProfileSelectionDialog::SelectUser(const QModelIndex& index) {
-    user_index = index.row();
+    if (!index.isValid()) {
+        return;
+    }
+    user_index = index.data(ProfileIndexRole).toInt();
 }
 
 void QtProfileSelectionDialog::SetWindowTitle(
