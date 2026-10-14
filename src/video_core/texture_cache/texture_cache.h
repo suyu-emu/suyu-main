@@ -1564,7 +1564,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
             return;
         }
-        constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        if (gpu_addr == overlap.gpu_addr && CanAliasDifferentSamples(new_info, overlap.info)) {
+            options |= RelaxedOptions::Samples;
+        }
         const ImageBase new_image_base(new_info, gpu_addr, cpu_addr);
         if (IsSubresource(new_info, overlap, gpu_addr, options, broken_views, native_bgr)) {
             join_left_aliased_ids.push_back(overlap_id);
@@ -1691,7 +1694,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
-            if (!overlap.IsSafeDownload()) {
+            const bool can_copy_msaa = CanAliasDifferentSamples(new_image.info, overlap.info) &&
+                                      True(overlap.flags & ImageFlagBits::GpuModified) &&
+                                      False(overlap.flags & ImageFlagBits::CpuModified);
+            if (!can_copy_msaa && !overlap.IsSafeDownload()) {
                 continue;
             }
             const auto alias_pointer = join_alias_indices.find(copy_object.id);
@@ -2592,6 +2598,9 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
+    if (CanAliasDifferentSamples(dst.info, src.info)) {
+        return runtime.CopyImageMSAA(dst, src, copies);
+    }
     if (src_format_type == dst_format_type) {
         if constexpr (HAS_EMULATED_COPIES) {
             if (!runtime.CanImageBeCopied(dst, src)) {
