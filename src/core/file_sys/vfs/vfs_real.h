@@ -72,6 +72,7 @@ private:
 
 private:
     void EvictSingleReferenceLocked();
+    void CloseCachedFileLocked(const std::string& path);
     void InsertReferenceIntoListLocked(FileReference& reference);
     void RemoveReferenceFromListLocked(FileReference& reference);
 };

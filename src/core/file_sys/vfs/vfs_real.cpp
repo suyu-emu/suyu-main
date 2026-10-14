@@ -147,8 +147,8 @@ VirtualFile RealVfsFilesystem::MoveFile(std::string_view old_path_, std::string_
     const auto new_path = FS::SanitizePath(new_path_, FS::DirectorySeparator::PlatformDefault);
     {
         std::scoped_lock lk{list_lock};
-        cache.erase(old_path);
-        cache.erase(new_path);
+        CloseCachedFileLocked(old_path);
+        CloseCachedFileLocked(new_path);
     }
     if (!FS::RenameFile(old_path, new_path)) {
         return nullptr;
@@ -160,9 +160,27 @@ bool RealVfsFilesystem::DeleteFile(std::string_view path_) {
     const auto path = FS::SanitizePath(path_, FS::DirectorySeparator::PlatformDefault);
     {
         std::scoped_lock lk{list_lock};
-        cache.erase(path);
+        CloseCachedFileLocked(path);
     }
     return FS::RemoveFile(path);
+}
+
+void RealVfsFilesystem::CloseCachedFileLocked(const std::string& path) {
+    // Windows refuses to delete or rename a file that still has an open handle. Guest code
+    // (e.g. LevelDB in Minecraft) deletes files it may still reference, so close our host
+    // handle first; the file is reopened lazily if it is accessed again.
+    if (const auto it = cache.find(path); it != cache.end()) {
+        if (const auto file = std::static_pointer_cast<RealVfsFile>(it->second.lock()); file) {
+            FileReference& reference = *file->reference;
+            if (reference.file) {
+                this->RemoveReferenceFromListLocked(reference);
+                reference.file.reset();
+                num_open_files--;
+                this->InsertReferenceIntoListLocked(reference);
+            }
+        }
+        cache.erase(it);
+    }
 }
 
 VirtualDir RealVfsFilesystem::OpenDirectory(std::string_view path_, OpenMode perms) {
