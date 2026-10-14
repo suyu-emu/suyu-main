@@ -488,6 +488,41 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         .baseArrayLayer = regs.clear_surface.layer,
         .layerCount = layer_count,
     };
+    const bool lower_left = regs.window_origin.mode != Maxwell::WindowOrigin::Mode::UpperLeft;
+    const s64 clip_height = regs.surface_clip.height;
+    const auto intersect_rect = [&](s64 x0, s64 y0, s64 x1, s64 y1) {
+        if (lower_left) {
+            const s64 flipped_y0 = clip_height - y1;
+            y1 = clip_height - y0;
+            y0 = flipped_y0;
+        }
+        const auto scale = [&](s64 value) { return (value * up_scale) >> down_shift; };
+        x0 = scale(x0);
+        y0 = scale(y0);
+        x1 = scale(x1);
+        y1 = scale(y1);
+        VkRect2D& rect = clear_rect.rect;
+        const s64 rx1 = s64(rect.offset.x) + rect.extent.width;
+        const s64 ry1 = s64(rect.offset.y) + rect.extent.height;
+        const s64 nx0 = (std::max)(s64(rect.offset.x), x0);
+        const s64 ny0 = (std::max)(s64(rect.offset.y), y0);
+        const s64 nx1 = (std::min)(rx1, x1);
+        const s64 ny1 = (std::min)(ry1, y1);
+        rect.offset.x = static_cast<s32>((std::max<s64>)(nx0, 0));
+        rect.offset.y = static_cast<s32>((std::max<s64>)(ny0, 0));
+        rect.extent.width = static_cast<u32>((std::max<s64>)(nx1 - rect.offset.x, 0));
+        rect.extent.height = static_cast<u32>((std::max<s64>)(ny1 - rect.offset.y, 0));
+    };
+    // The clear rectangle and viewport 0 clip also restrict the cleared area. Ignoring them
+    // clears the whole surface, e.g. wiping the other player's half in split-screen games.
+    if (regs.clear_control.use_clear_rect) {
+        intersect_rect(regs.clear_rect.x_min, regs.clear_rect.y_min, regs.clear_rect.x_max,
+                       regs.clear_rect.y_max);
+    }
+    if (regs.clear_control.use_viewport_clip0) {
+        const auto& vp = regs.viewports[0];
+        intersect_rect(vp.x, vp.y, s64(vp.x) + vp.width, s64(vp.y) + vp.height);
+    }
     const auto clamp_rect_to_render_area = [render_area](VkRect2D& rect) -> bool {
         const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
             auto clamp_offset = [&offset, limit]() {

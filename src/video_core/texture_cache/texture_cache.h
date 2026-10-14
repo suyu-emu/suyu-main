@@ -2720,9 +2720,42 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const Extent3D size = image_view.size;
     const auto& regs = maxwell3d->regs;
     const auto& scissor = regs.scissor_test[0];
+    // Only the attachment and aspects targeted by this clear lose their previous contents.
+    // Invalidating anything else skips alias synchronization and drops data written through
+    // an alias (e.g. split-screen HUDs drawn into a non-MSAA view of an MSAA target).
+    const auto& clear = regs.clear_surface;
+    if (id == render_targets.depth_buffer_id) {
+        if (!clear.Z) {
+            return false;
+        }
+        const auto surface_type = VideoCore::Surface::GetFormatType(image.info.format);
+        if (surface_type == VideoCore::Surface::SurfaceType::DepthStencil && !clear.S) {
+            return false;
+        }
+    } else {
+        if (!(clear.R && clear.G && clear.B && clear.A)) {
+            return false;
+        }
+        if (clear.RT >= NUM_RT || render_targets.color_buffer_ids[clear.RT] != id) {
+            return false;
+        }
+    }
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
+    }
+    if (regs.clear_control.use_clear_rect) {
+        const auto& rect = regs.clear_rect;
+        if (rect.x_min != 0 || rect.y_min != 0 || rect.x_max < size.width ||
+            rect.y_max < size.height) {
+            return false;
+        }
+    }
+    if (regs.clear_control.use_viewport_clip0) {
+        const auto& vp = regs.viewports[0];
+        if (vp.x != 0 || vp.y != 0 || vp.width < size.width || vp.height < size.height) {
+            return false;
+        }
     }
     if (regs.clear_control.use_scissor == 0) {
         // If scissor testing is disabled, the clear is always full
