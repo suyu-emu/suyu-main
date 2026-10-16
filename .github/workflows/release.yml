@@ -390,12 +390,21 @@ jobs:
           - platform: linux
             os: ubuntu-24.04
             archive: suyu-libretro-linux-x86_64.tar.gz
+            kind: libretro-linux
+          # The same core for ARM64 Linux (Raspberry Pi 5, Snapdragon and other
+          # ARM64 laptops and handhelds), built natively on GitHub's ARM64 runner
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            archive: suyu-libretro-linux-arm64.tar.gz
+            kind: libretro-linux
           - platform: windows
             os: windows-2022
             archive: suyu-libretro-windows-x86_64.zip
+            kind: libretro-windows
           - platform: macos
             os: macos-15
             archive: suyu-libretro-macos-arm64.zip
+            kind: libretro-macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -404,7 +413,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - name: Install dependencies (Linux)
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -421,7 +430,7 @@ jobs:
             libegl-dev libdrm-dev libgbm-dev libvulkan-dev
           V=3.31.6
           curl -fsSL -o /tmp/cmake.tar.gz \
-            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-x86_64.tar.gz"
+            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-$(uname -m).tar.gz"
           sudo mkdir -p /opt/cmake
           sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
           echo /opt/cmake/bin >> "$GITHUB_PATH"
@@ -450,7 +459,7 @@ jobs:
         run: |
           extra=()
           case '${{ matrix.platform }}' in
-            linux) extra+=(-Dfmt_FORCE_BUNDLED=ON) ;;
+            linux*) extra+=(-Dfmt_FORCE_BUNDLED=ON) ;;
             macos) extra+=(-Dfmt_FORCE_BUNDLED=ON -DVulkanHeaders_FORCE_BUNDLED=ON
                            "-DCMAKE_PREFIX_PATH=$(brew --prefix)") ;;
           esac
@@ -463,7 +472,7 @@ jobs:
         shell: bash
         run: cmake --build build --target suyu_libretro
       - name: Package (Linux)
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         run: |
           mkdir -p _pkg
           cp "$(find build -name suyu_libretro.so -print -quit)" _pkg/
@@ -503,12 +512,12 @@ jobs:
           (cd _pkg && zip -qry "../${{ matrix.archive }}" .)
       - name: Validate package policy (Linux, macOS)
         if: matrix.platform != 'windows'
-        run: python3 tools/package_policy/scan_release.py --kind 'libretro-${{ matrix.platform }}' '${{ matrix.archive }}'
+        run: python3 tools/package_policy/scan_release.py --kind '${{ matrix.kind }}' '${{ matrix.archive }}'
       - name: Validate package policy (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          python tools/package_policy/scan_release.py --kind 'libretro-${{ matrix.platform }}' '${{ matrix.archive }}'
+          python tools/package_policy/scan_release.py --kind '${{ matrix.kind }}' '${{ matrix.archive }}'
           if ($LASTEXITCODE -ne 0) { throw 'Package-policy validation failed for the libretro archive' }
       - uses: actions/upload-artifact@v4
         with:
@@ -726,6 +735,7 @@ jobs:
             suyu-macos-arm64.zip \
             suyu-android-arm64.apk \
             suyu-libretro-linux-x86_64.tar.gz \
+            suyu-libretro-linux-arm64.tar.gz \
             suyu-libretro-windows-x86_64.zip \
             suyu-libretro-macos-arm64.zip \
             suyu-libretro-android-arm64.zip \
@@ -753,6 +763,7 @@ jobs:
               suyu-macos-arm64.zip) kind=macos ;;
               suyu-android-arm64.apk) kind=android-apk ;;
               suyu-libretro-linux-x86_64.tar.gz) kind=libretro-linux ;;
+              suyu-libretro-linux-arm64.tar.gz) kind=libretro-linux ;;
               suyu-libretro-windows-x86_64.zip) kind=libretro-windows ;;
               suyu-libretro-macos-arm64.zip) kind=libretro-macos ;;
               suyu-libretro-android-arm64.zip) kind=libretro-android ;;
