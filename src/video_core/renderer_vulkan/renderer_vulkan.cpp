@@ -33,6 +33,7 @@
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_external.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -87,9 +88,35 @@ std::string BuildCommaSeparatedExtensions(
     return fmt::format("{}", fmt::join(available_extensions, ","));
 }
 
+VKAPI_ATTR void VKAPI_CALL ExternalDestroyInstance(VkInstance, const VkAllocationCallbacks*) {}
+
+/// The frontend's instance (External::IsActive()), left for the frontend to destroy, or one of
+/// the renderer's own.
+vk::Instance CreateRendererInstance(const Common::DynamicLibrary& library,
+                                    vk::InstanceDispatch& dld,
+                                    Core::Frontend::WindowSystemType window_type) {
+    if (!External::IsActive()) {
+        return CreateInstance(library, dld, VK_API_VERSION_1_1, window_type,
+                              Settings::values.renderer_debug.GetValue());
+    }
+    const auto& context = External::GetContext();
+    dld.vkGetInstanceProcAddr = context.get_instance_proc_addr;
+    if (!vk::Load(dld) || !vk::Load(context.instance, dld)) {
+        LOG_ERROR(Render_Vulkan, "Failed to load the frontend's Vulkan instance functions");
+        throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    dld.vkDestroyInstance = ExternalDestroyInstance;
+    return vk::Instance(context.instance, dld);
+}
+
 } // Anonymous namespace
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
+    if (External::IsActive()) {
+        // The physical device the frontend presents with
+        const vk::PhysicalDevice physical_device(External::GetContext().gpu, dld);
+        return Device(*instance, physical_device, surface, dld);
+    }
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
     const u32 device_index = Settings::values.vulkan_device.GetValue();
     if (device_index >= u32(devices.size())) {
@@ -111,11 +138,7 @@ try
     , library(OpenLibrary(context.get()))
     , dld()
     // Create raw Vulkan instance first
-    , instance(CreateInstance(*library,
-                            dld,
-                            VK_API_VERSION_1_1,
-                            render_window.GetWindowInfo().type,
-                            Settings::values.renderer_debug.GetValue()))
+    , instance(CreateRendererInstance(*library, dld, render_window.GetWindowInfo().type))
     // Create debug messenger if debug is enabled
     , debug_messenger(Settings::values.renderer_debug ? CreateDebugUtilsCallback(instance)
                                                     : vk::DebugUtilsMessenger{})
@@ -159,6 +182,13 @@ try
 
     is_headless = (render_window.GetWindowInfo().type == Core::Frontend::WindowSystemType::Headless);
 
+    if (External::IsActive()) {
+        auto& external = External::GetContext();
+        external.device = *device.GetLogical();
+        external.queue = *device.GetGraphicsQueue();
+        external.queue_family = device.GetGraphicsFamily();
+    }
+
     if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
         turbo_mode.emplace(instance, dld);
         scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
@@ -195,7 +225,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
         RenderScreenshot(framebuffers);
 
-        if (!framebuffers.empty()) {
+        if (External::IsActive()) {
+            PresentExternal(framebuffers);
+        } else if (!framebuffers.empty()) {
             const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
             headless_width = layout.width;
             headless_height = layout.height;
@@ -277,6 +309,79 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
     // Copy backing image data to the capture buffer
     dst_buffer.Invalidate();
     return dst_buffer;
+}
+
+void RendererVulkan::PresentExternal(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (framebuffers.empty()) {
+        return;
+    }
+    // More slots than the frontend holds (External::PickSlot), so a free one is always there
+    constexpr u32 SlotCount = 5;
+    constexpr VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    if (external_frames.size() != SlotCount) {
+        external_frames.resize(SlotCount);
+    }
+    const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
+    headless_width = layout.width;
+    headless_height = layout.height;
+
+    const u32 slot = External::PickSlot(SlotCount);
+    Frame& frame = external_frames[slot];
+
+    // The frontend sampled this image in an earlier frame on the same queue: its reads
+    // finish before the image is drawn into again. Its old contents are not kept.
+    scheduler.RequestOutsideRenderPassOperationContext();
+    if (frame.image) {
+        scheduler.Record([image = *frame.image](vk::CommandBuffer cmdbuf) {
+            const VkImageMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = image,
+                .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, barrier);
+        });
+    }
+
+    // Makes the slot's image on first use and when the size changes (PresentManager::RecreateFrame)
+    blit_swapchain.DrawToFrame(device, rasterizer, &frame, framebuffers, layout, SlotCount,
+                               format);
+
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([image = *frame.image](vk::CommandBuffer cmdbuf) {
+        const VkImageMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+    });
+    // Submitted, not waited for: the frontend's work on the same queue comes after it
+    scheduler.Flush();
+
+    External::Publish(External::Frame{
+        .image = *frame.image,
+        .view = *frame.image_view,
+        .format = format,
+        .width = frame.width,
+        .height = frame.height,
+        .slot = slot,
+    });
 }
 
 void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers) {

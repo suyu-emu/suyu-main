@@ -14,6 +14,7 @@
 #include "common/logging.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_external.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::vk {
@@ -647,6 +648,31 @@ void Semaphore::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_SEMAPHORE, name);
 }
 
+namespace {
+// A device made for a frontend that owns it (External::IsActive()): the frontend's queue
+// lock around every use of the shared queue, and the device left for the frontend to destroy.
+PFN_vkQueueSubmit external_queue_submit{};
+PFN_vkQueueSubmit2 external_queue_submit2{};
+
+VKAPI_ATTR VkResult VKAPI_CALL ExternalQueueSubmit(VkQueue queue, uint32_t count,
+                                                   const VkSubmitInfo* submits, VkFence fence) {
+    External::LockQueue();
+    const VkResult result = external_queue_submit(queue, count, submits, fence);
+    External::UnlockQueue();
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL ExternalQueueSubmit2(VkQueue queue, uint32_t count,
+                                                    const VkSubmitInfo2* submits, VkFence fence) {
+    External::LockQueue();
+    const VkResult result = external_queue_submit2(queue, count, submits, fence);
+    External::UnlockQueue();
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL ExternalDestroyDevice(VkDevice, const VkAllocationCallbacks*) {}
+} // Anonymous namespace
+
 Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreateInfo> queues_ci,
                       Span<const char*> enabled_extensions, const void* next,
                       DeviceDispatch& dispatch) {
@@ -663,8 +689,24 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
         .pEnabledFeatures = nullptr,
     };
     VkDevice device;
-    Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
+    if (External::IsActive() && External::GetContext().create_device) {
+        device = External::GetContext().create_device(physical_device, &ci);
+        if (device == VK_NULL_HANDLE) {
+            throw Exception(VK_ERROR_INITIALIZATION_FAILED);
+        }
+    } else {
+        Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
+    }
     Load(device, dispatch);
+    if (External::IsActive()) {
+        external_queue_submit = dispatch.vkQueueSubmit;
+        external_queue_submit2 = dispatch.vkQueueSubmit2;
+        dispatch.vkQueueSubmit = ExternalQueueSubmit;
+        if (dispatch.vkQueueSubmit2) {
+            dispatch.vkQueueSubmit2 = ExternalQueueSubmit2;
+        }
+        dispatch.vkDestroyDevice = ExternalDestroyDevice;
+    }
     return Device(device, dispatch);
 }
 

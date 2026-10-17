@@ -1,6 +1,6 @@
 # suyu libretro core
 
-The current libretro video path supports Vulkan. Core options are read when
+The current libretro video path supports Vulkan. Where RetroArch runs its Vulkan video driver (context negotiation v2), the frames are drawn in RetroArch's own Vulkan context and handed over as images; otherwise they are read back to host memory first, which costs a copy and a wait for the GPU on every frame. Core options are read when
 content loads; close and reopen content after changing an option. The exception
 is **Show Game Performance** (on by default), which applies immediately: once a
 second it shows the game's own frame rate and the average frame time, or the number

@@ -195,7 +195,9 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        // Headless there is no swapchain to take the format from
+        .format = swapchain.GetImageFormat() != VK_FORMAT_UNDEFINED ? swapchain.GetImageFormat()
+                                                                     : image_view_format,
         .extent =
             {
                 .width = width,
@@ -206,7 +208,10 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        // Sampled: inside a libretro frontend the frame is handed over as this image, and the
+        // frontend draws it by sampling (RendererVulkan::PresentExternal)
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,

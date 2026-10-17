@@ -19,13 +19,10 @@ namespace LibretroCore {
 // WindowSystemInfo::render_surface doc comment. This lets Core::System boot
 // and run a game with no real window at all.
 //
-// NOT YET IMPLEMENTED: presenting decoded frames back through libretro's
-// retro_video_refresh callback. That requires either (a) a Vulkan
-// RETRO_HW_RENDER_INTERFACE bridge so RetroArch supplies the swapchain
-// surface directly, or (b) a CPU-side readback path (vkCmdCopyImageToBuffer
-// on the presented swapchain image, mapped to host memory) - video_core's
-// RendererBase currently exposes neither. This is real, separate work on
-// the Vulkan renderer itself, not something to fake here.
+// Frames reach the frontend either as images in its own Vulkan context
+// (RETRO_HW_CONTEXT_VULKAN with context negotiation v2, Vulkan::External) or,
+// where the frontend has no such context, read back to host memory and passed
+// to retro_video_refresh (RendererBase::GetLastRenderedFrame).
 class RetroEmuWindow final : public Core::Frontend::EmuWindow {
 public:
     RetroEmuWindow();

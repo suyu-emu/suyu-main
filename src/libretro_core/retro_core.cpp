@@ -76,6 +76,9 @@
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/vulkan_common/vulkan_external.h"
+// After vulkan_external.h, which sets VK_NO_PROTOTYPES: the core types, no platform headers
+#include "libretro_core/libretro_vulkan.h"
 
 namespace {
 
@@ -455,6 +458,202 @@ constexpr RetroToVirtual kButtonMap[] = {
 bool g_prev_buttons[20] = {};
 } // namespace
 
+
+// ---------------------------------------------------------------------------
+// Vulkan presentation through the frontend's context (RETRO_HW_CONTEXT_VULKAN).
+//
+// The frontend makes the instance and, through context negotiation v2, the device
+// with the renderer's create info plus what it needs itself; the renderer works on
+// that device (Vulkan::External), takes the frontend's queue lock around its
+// submits and hands each finished frame over as an image, given to the frontend
+// with set_image from retro_run. No frame is read back to the CPU. The game only
+// starts once the device exists, so retro_load_game leaves that to create_device2.
+// Without negotiation v2 the core reads frames back as before.
+// ---------------------------------------------------------------------------
+namespace {
+bool g_vulkan_present = false;     // the frontend took the HW render request
+bool g_start_deferred = false;     // retro_load_game left the start to create_device2
+retro_hw_render_interface_vulkan* g_vulkan = nullptr;
+std::array<retro_vulkan_image, 8> g_vulkan_images{};  // per slot; the frontend keeps the pointer
+bool StartLoadedGame();
+
+retro_hw_render_interface_vulkan* CurrentVulkanInterface() {
+    // Asked every frame: RetroArch rebuilds its video driver behind the core's back
+    // (fullscreen toggle) and frees the interface it handed out before.
+    retro_hw_render_interface* iface = nullptr;
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &iface) || !iface ||
+        iface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN) {
+        return nullptr;
+    }
+    return reinterpret_cast<retro_hw_render_interface_vulkan*>(iface);
+}
+
+void UseVulkanInterface(retro_hw_render_interface_vulkan* vulkan) {
+    if (vulkan == g_vulkan) {
+        return;
+    }
+    g_vulkan = vulkan;
+    if (vulkan) {
+        Vulkan::External::SetQueueLock([vulkan] { vulkan->lock_queue(vulkan->handle); },
+                                       [vulkan] { vulkan->unlock_queue(vulkan->handle); });
+    } else {
+        Vulkan::External::SetQueueLock(nullptr, nullptr);
+    }
+}
+
+void OnVulkanContextReset() {
+    UseVulkanInterface(CurrentVulkanInterface());
+}
+
+void OnVulkanContextDestroy() {
+    UseVulkanInterface(nullptr);
+}
+
+const VkApplicationInfo* GetVulkanApplicationInfo() {
+    static const VkApplicationInfo info{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = nullptr,
+        .pApplicationName = "suyu",
+        .applicationVersion = 0,
+        .pEngineName = "suyu",
+        .engineVersion = 0,
+        .apiVersion = VK_API_VERSION_1_3,
+    };
+    return &info;
+}
+
+// Negotiation v1 cannot pass the renderer's create info to the frontend; only v2 is offered
+bool CreateVulkanDeviceV1(retro_vulkan_context*, VkInstance, VkPhysicalDevice, VkSurfaceKHR,
+                          PFN_vkGetInstanceProcAddr, const char**, unsigned, const char**,
+                          unsigned, const VkPhysicalDeviceFeatures*) {
+    return false;
+}
+
+bool CreateVulkanDevice2(retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu,
+                         VkSurfaceKHR, PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                         retro_vulkan_create_device_wrapper_t create_device_wrapper,
+                         void* opaque) {
+    if (gpu == VK_NULL_HANDLE) {
+        // The frontend leaves the choice to the core: the first device
+        const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            get_instance_proc_addr(instance, "vkEnumeratePhysicalDevices"));
+        u32 count = 1;
+        if (!enumerate || enumerate(instance, &count, &gpu) < 0 || count == 0) {
+            LOG_CRITICAL(Frontend, "libretro: no Vulkan device to run on");
+            return false;
+        }
+    }
+    auto& external = Vulkan::External::GetContext();
+    external = {};
+    external.get_instance_proc_addr = get_instance_proc_addr;
+    external.instance = instance;
+    external.gpu = gpu;
+    external.create_device = [create_device_wrapper, opaque](VkPhysicalDevice physical,
+                                                             const VkDeviceCreateInfo* info) {
+        return create_device_wrapper(physical, opaque, info);
+    };
+    Vulkan::External::SetActive(true);
+    Vulkan::External::ResetFrames();
+
+    // The game starts here, so that the renderer makes its device through the frontend
+    const bool started = !g_start_deferred || StartLoadedGame();
+    g_start_deferred = false;
+    external.create_device = nullptr;
+    if (!started || external.device == VK_NULL_HANDLE) {
+        Vulkan::External::SetActive(false);
+        return false;
+    }
+    context->gpu = gpu;
+    context->device = external.device;
+    context->queue = external.queue;
+    context->queue_family_index = external.queue_family;
+    context->presentation_queue = external.queue;
+    context->presentation_queue_family_index = external.queue_family;
+    return true;
+}
+
+void DestroyVulkanDevice() {
+    // The frontend destroys the device it made; the renderer is gone by now (retro_unload_game)
+    UseVulkanInterface(nullptr);
+    Vulkan::External::SetActive(false);
+}
+
+// Asks the frontend for a Vulkan context made through negotiation v2. False leaves the
+// core on the read-back path.
+bool RequestVulkanPresent() {
+    retro_hw_render_context_negotiation_interface support{
+        RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0};
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT,
+                      &support) ||
+        support.interface_version < 2) {
+        LOG_INFO(Frontend, "libretro: no Vulkan context negotiation v2, frames are read back");
+        return false;
+    }
+    static retro_hw_render_callback hw_render{};
+    hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+    hw_render.version_major = VK_API_VERSION_1_3;
+    hw_render.version_minor = 0;
+    hw_render.context_reset = OnVulkanContextReset;
+    hw_render.context_destroy = OnVulkanContextDestroy;
+    // The renderer cannot move to another device: RetroArch keeps this one when it rebuilds
+    // its video driver (a fullscreen toggle, a driver setting) instead of destroying it
+    // under the running renderer. Its interface is asked for every frame anyway.
+    hw_render.cache_context = true;
+    if (!g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render)) {
+        LOG_INFO(Frontend, "libretro: the frontend has no Vulkan context, frames are read back");
+        return false;
+    }
+    static retro_hw_render_context_negotiation_interface_vulkan negotiation{};
+    negotiation.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+    negotiation.interface_version = 2;
+    negotiation.get_application_info = GetVulkanApplicationInfo;
+    negotiation.create_device = CreateVulkanDeviceV1;
+    negotiation.destroy_device = DestroyVulkanDevice;
+    negotiation.create_instance = nullptr;
+    negotiation.create_device2 = CreateVulkanDevice2;
+    g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, &negotiation);
+    LOG_INFO(Frontend, "libretro: frames are handed to the frontend's Vulkan context");
+    return true;
+}
+
+// retro_run: the newest finished frame to the frontend, or a repeat of the last one
+void PresentVulkanFrame() {
+    auto* vulkan = CurrentVulkanInterface();
+    UseVulkanInterface(vulkan);
+    ++g_perf_frontend_frames;
+    Vulkan::External::Frame frame;
+    if (vulkan && Vulkan::External::Consume(frame)) {
+        auto& image = g_vulkan_images[frame.slot % g_vulkan_images.size()];
+        image = {};
+        image.image_view = frame.view;
+        image.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        image.create_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = frame.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = frame.format,
+            .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vulkan->set_image(vulkan->handle, &image, 0, nullptr, vulkan->queue_index);
+        Vulkan::External::MarkShown(frame.slot);
+        ++g_perf_unique_frames;
+        g_have_presented = true;
+        g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
+        return;
+    }
+    // Nothing new: the frontend repeats the last image
+    auto& renderer = g_system->Renderer();
+    g_video_cb(g_have_presented ? RETRO_HW_FRAME_BUFFER_VALID : nullptr,
+               renderer.GetHeadlessWidth(), renderer.GetHeadlessHeight(), 0);
+}
+} // namespace
+
 RETRO_API void retro_run() {
     // This frontend is the sole periodic consumer of the destructive stats read.
     // Sample guest rendering/timing, independently of retro_run's frontend FPS.
@@ -597,6 +796,10 @@ RETRO_API void retro_run() {
         }
     }
 
+    if (g_video_cb && g_system && g_game_loaded && Vulkan::External::IsActive()) {
+        PresentVulkanFrame();
+        return;
+    }
     if (g_video_cb && g_system && g_game_loaded) {
         auto& renderer = g_system->Renderer();
         if (renderer.IsHeadless()) {
@@ -920,6 +1123,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         g_tas_playback = true;
     }
 
+    // With the frontend's Vulkan context the game starts in create_device2, where the renderer
+    // can make its device through the frontend; otherwise here, reading frames back
+    g_vulkan_present = RequestVulkanPresent();
+    if (g_vulkan_present) {
+        g_start_deferred = true;
+        return true;
+    }
+    return StartLoadedGame();
+}
+
+namespace {
+bool StartLoadedGame() {
     Service::AM::FrontendAppletParameters load_parameters{};
     load_parameters.applet_id = Service::AM::AppletId::Application;
 
@@ -972,6 +1187,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     LOG_INFO(Frontend, "libretro core: game loaded and running");
     return true;
 }
+} // namespace
 
 RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retro_game_info* /*info*/,
                                        size_t /*num_info*/) {
@@ -981,6 +1197,13 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 RETRO_API void retro_unload_game() {
     g_sample_perf = false;
     g_have_presented = false;
+    g_start_deferred = false;
+    if (g_vulkan) {
+        // The frontend repeats the last image; take it back and let the frontend finish with
+        // it before the renderer that owns it goes
+        g_vulkan->set_image(g_vulkan->handle, nullptr, 0, nullptr, g_vulkan->queue_index);
+        g_vulkan->wait_sync_index(g_vulkan->handle);
+    }
     if (g_system && g_game_loaded) {
         g_system->ShutdownMainProcess();
     }

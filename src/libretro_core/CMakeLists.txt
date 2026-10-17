@@ -10,6 +10,8 @@ add_library(suyu_libretro SHARED
 
 target_link_libraries(suyu_libretro PRIVATE common core input_common frontend_common audio_core network)
 target_link_libraries(suyu_libretro PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+# The Vulkan types of RetroArch's HW render interface (libretro_vulkan.h)
+target_link_libraries(suyu_libretro PRIVATE Vulkan::Headers)
 
 if (ANDROID)
     target_link_options(suyu_libretro PRIVATE "-Wl,-Bsymbolic")
