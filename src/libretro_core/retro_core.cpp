@@ -65,7 +65,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
+#include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/drivers/tas_input.h"
 #include "input_common/main.h"
@@ -276,6 +278,17 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     // instead of being offered and then failing mid-session.
     uint64_t quirks = RETRO_SERIALIZATION_QUIRK_INCOMPLETE;
     cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
+
+    // Four players, each a Pro Controller or nothing; RetroArch lists these per
+    // port under Controls, and None takes a port's input away from the game
+    static const struct retro_controller_description pads[] = {
+        {"Pro Controller", RETRO_DEVICE_JOYPAD},
+        {"None", RETRO_DEVICE_NONE},
+    };
+    static const struct retro_controller_info ports[] = {
+        {pads, 2}, {pads, 2}, {pads, 2}, {pads, 2}, {nullptr, 0},
+    };
+    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) {
@@ -421,7 +434,24 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info) {
     info->timing.sample_rate = 48000.0;
 }
 
-RETRO_API void retro_set_controller_port_device(unsigned /*port*/, unsigned /*device*/) {}
+namespace {
+constexpr unsigned kMaxPlayers = 4;
+// What RetroArch has on each port: RETRO_DEVICE_JOYPAD or RETRO_DEVICE_NONE
+unsigned g_port_device[kMaxPlayers] = {RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD,
+                                       RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD};
+// Players 2-4 the core has connected. Player 1 is connected by suyu's own
+// defaults; the others are not, and connecting all of them at the start
+// would show every game four controllers whether or not anyone holds them.
+// So a player's controller is connected when its port is first used, as
+// plugging one in on the console, and disconnected when the port is set to None.
+bool g_player_connected[kMaxPlayers] = {};
+} // namespace
+
+RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) {
+    if (port < kMaxPlayers) {
+        g_port_device[port] = device == RETRO_DEVICE_NONE ? RETRO_DEVICE_NONE : RETRO_DEVICE_JOYPAD;
+    }
+}
 
 RETRO_API void retro_reset() {
     LOG_WARNING(Frontend, "libretro core: retro_reset() requested but not yet implemented "
@@ -452,7 +482,54 @@ constexpr RetroToVirtual kButtonMap[] = {
     {RETRO_DEVICE_ID_JOYPAD_LEFT, VB::ButtonLeft},
     {RETRO_DEVICE_ID_JOYPAD_RIGHT, VB::ButtonRight},
 };
-bool g_prev_buttons[20] = {};
+bool g_prev_buttons[kMaxPlayers][20] = {};
+
+// The Switch's names for what each RetroPad input does, so RetroArch can show
+// and remap them (without these it hides every input as unbound)
+void SetInputDescriptors() {
+    static const char* const names[][2] = {
+        {"A", nullptr}, {"B", nullptr}, {"X", nullptr}, {"Y", nullptr}, {"L", nullptr},
+        {"R", nullptr}, {"ZL", nullptr}, {"ZR", nullptr}, {"Left Stick Press", nullptr},
+        {"Right Stick Press", nullptr}, {"+", nullptr}, {"-", nullptr}, {"D-Pad Up", nullptr},
+        {"D-Pad Down", nullptr}, {"D-Pad Left", nullptr}, {"D-Pad Right", nullptr},
+    };
+    static_assert(std::size(names) == std::size(kButtonMap));
+    std::vector<retro_input_descriptor> descriptors;
+    for (unsigned port = 0; port < kMaxPlayers; ++port) {
+        for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+            descriptors.push_back({port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id, names[i][0]});
+        }
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Left Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Left Stick Y"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Right Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Right Stick Y"});
+    }
+    descriptors.push_back({0, 0, 0, 0, nullptr});
+    g_environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, descriptors.data());
+}
+
+// A player's Pro Controller plugged in or pulled out (players 2-4)
+void SetPlayerConnected(unsigned player, bool connected) {
+    if (g_player_connected[player] == connected) {
+        return;
+    }
+    auto* controller = g_system->HIDCore().GetEmulatedControllerByIndex(player);
+    if (!controller) {
+        return;
+    }
+    if (connected) {
+        controller->SetNpadStyleIndex(Core::HID::NpadStyleIndex::Fullkey);
+        controller->Connect();
+    } else {
+        controller->Disconnect();
+    }
+    g_player_connected[player] = connected;
+    LOG_INFO(Frontend, "libretro: player {} {}", player + 1, connected ? "connected" : "disconnected");
+}
 } // namespace
 
 RETRO_API void retro_run() {
@@ -532,26 +609,51 @@ RETRO_API void retro_run() {
         g_input_poll_cb();
     }
 
-    // Bridge libretro input to suyu HID via VirtualGamepad.
+    // Bridge libretro input to suyu HID via VirtualGamepad, a port per player.
     if (g_input_state_cb && g_input_subsystem && g_game_loaded) {
         auto* vgp = g_input_subsystem->GetVirtualGamepad();
         if (vgp) {
-            for (const auto& m : kButtonMap) {
-                const bool pressed = g_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro_id) != 0;
-                const int idx = static_cast<int>(m.virtual_button);
-                if (pressed != g_prev_buttons[idx]) {
-                    g_prev_buttons[idx] = pressed;
-                    vgp->SetButtonState(0, m.virtual_button, pressed);
+            using VS = InputCommon::VirtualGamepad::VirtualStick;
+            for (unsigned port = 0; port < kMaxPlayers; ++port) {
+                if (g_port_device[port] == RETRO_DEVICE_NONE) {
+                    if (port > 0) {
+                        SetPlayerConnected(port, false);
+                    }
+                    continue;
                 }
+                const auto axis = [port](unsigned index, unsigned id) {
+                    return g_input_state_cb(port, RETRO_DEVICE_ANALOG, index, id) / 32768.0f;
+                };
+                const float lx = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ly = -axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+                const float rx = axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ry = -axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+                bool pressed[std::size(kButtonMap)];
+                bool any = false;
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    pressed[i] = g_input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id) != 0;
+                    any = any || pressed[i];
+                }
+                if (port > 0 && !g_player_connected[port]) {
+                    // Not plugged in until someone uses it: a button, or a stick
+                    // pushed past where a resting stick drifts to
+                    constexpr float kWake = 0.5f;
+                    if (!any && std::abs(lx) < kWake && std::abs(ly) < kWake &&
+                        std::abs(rx) < kWake && std::abs(ry) < kWake) {
+                        continue;
+                    }
+                    SetPlayerConnected(port, true);
+                }
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    const int idx = static_cast<int>(kButtonMap[i].virtual_button);
+                    if (pressed[i] != g_prev_buttons[port][idx]) {
+                        g_prev_buttons[port][idx] = pressed[i];
+                        vgp->SetButtonState(port, kButtonMap[i].virtual_button, pressed[i]);
+                    }
+                }
+                vgp->SetStickPosition(port, VS::Left, lx, ly);
+                vgp->SetStickPosition(port, VS::Right, rx, ry);
             }
-            // Left analog stick
-            const float lx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ly = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Left, lx, ly);
-            // Right analog stick
-            const float rx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ry = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Right, rx, ry);
         }
     }
 
@@ -672,6 +774,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                      !!g_system, !!g_emu_window, !!game, game ? !!game->path : false);
         return false;
     }
+
+    SetInputDescriptors();
 
     g_game_path = game->path;
     // need_fullpath makes content availability the core's responsibility. Avoid
@@ -996,6 +1100,11 @@ RETRO_API void retro_unload_game() {
     }
     g_tas_playback = false;
     g_game_loaded = false;
+    // The next title starts with only player 1, and every button up
+    std::fill(std::begin(g_player_connected), std::end(g_player_connected), false);
+    for (auto& buttons : g_prev_buttons) {
+        std::fill(std::begin(buttons), std::end(buttons), false);
+    }
     g_game_path.clear();
     if (g_explicit_provider) {
         g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
