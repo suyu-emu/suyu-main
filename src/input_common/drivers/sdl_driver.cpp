@@ -684,6 +684,8 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
     start_thread = SDL_WasInit(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD) == 0;
     if (start_thread && !SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) {
         LOG_CRITICAL(Input, "SDL_Init failed with: {}", SDL_GetError());
+        // Nothing to quit, and no vibration thread to join, at destruction
+        start_thread = false;
         return;
     }
 
@@ -717,8 +719,12 @@ SDLDriver::~SDLDriver() {
     SDL_RemoveEventWatch(&SDLEventWatcher, this);
 
     initialized = false;
-    if (start_thread) {
+    // Joined only if it was started: join() on a thread that never ran throws, and from a
+    // destructor that ended the process (the libretro core's retro_deinit, where SDL_Init fails)
+    if (vibration_thread.joinable()) {
         vibration_thread.join();
+    }
+    if (start_thread) {
         SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
     }
 }
