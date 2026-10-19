@@ -600,6 +600,7 @@ if (ENABLE_SDL2)
 endif()
 
 if (MSVC)
+    target_link_options(suyu PRIVATE "/FORCE:MULTIPLE")
     if (SUYU_USE_BUNDLED_SDL2)
         include(CopySuyuSDLDeps)
         copy_suyu_SDL_deps(suyu)
