@@ -21,16 +21,16 @@ with AddressSanitizer + UndefinedBehaviorSanitizer.
 
 `python3 research/ios/tests/test_portable.py`: **8/8 passed**.
 
-| Test | Observed result |
-| --- | --- |
-| Release synthetic static link / ADD-SVC dispatch / symbol screen | Passed |
-| `SUYU_NO_JIT=OFF` | Correctly rejected at configure |
-| Remove three index-symbol renames | Correctly failed multi-module link |
-| Mix generated runtime/header revisions | Correctly rejected at configure |
-| Uniform but wrong `GuestContext` offset | Correctly failed compilation |
-| Export path with spaces and square brackets | Built and passed |
-| Private-shaped export with aborting block bodies | Metadata probe passed without executing blocks |
-| Empty entitlement file and separate app display identity | Parsed and passed |
+|                               Test                               |                Observed result                 |
+|------------------------------------------------------------------|------------------------------------------------|
+| Release synthetic static link / ADD-SVC dispatch / symbol screen | Passed                                         |
+| `SUYU_NO_JIT=OFF`                                                | Correctly rejected at configure                |
+| Remove three index-symbol renames                                | Correctly failed multi-module link             |
+| Mix generated runtime/header revisions                           | Correctly rejected at configure                |
+| Uniform but wrong `GuestContext` offset                          | Correctly failed compilation                   |
+| Export path with spaces and square brackets                      | Built and passed                               |
+| Private-shaped export with aborting block bodies                 | Metadata probe passed without executing blocks |
+| Empty entitlement file and separate app display identity         | Parsed and passed                              |
 
 Separate Clang ASan/UBSan build: **1/1 CTest passed**, no sanitizer diagnostic
 in this synthetic execution. This tests the registry/probe, not the Suyu core.

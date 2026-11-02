@@ -64,6 +64,7 @@ Use this guide for when you want to configure specific controller settings to be
 ---
 
 #### Steps
+
 1. Launch Eden and wait for it to load.
 2. Navigate to *Emulation > Configure...*
 3. Select **Controls** from the left-hand menu and configure your controller for the way you want it to be in game.
@@ -82,7 +83,7 @@ Use this guide when you want to set up specific controller profiles for specific
 
 - Eden Emulator set up and fully configured
 - Controller Profile Created
-    - See [*Configuring Controller Profiles*](./ControllerProfiles.md) for instructions on how to do this if needed.
+  - See [*Configuring Controller Profiles*](./ControllerProfiles.md) for instructions on how to do this if needed.
 
 ---
 
@@ -93,8 +94,11 @@ Use this guide when you want to set up specific controller profiles for specific
 
     <aside>
 
-    ***NOTE***: You may have to resize the window to see all tabs, or press the arrows by the tabs to see **Input Profiles**.
+   ***NOTE***: You may have to resize the window to see all tabs, or press the arrows by the tabs to see **Input Profiles**.
 
     </aside>
-1. Click **OK** to apply the profile mapping.
-2. Launch the game and confirm that the profile is applied, regardless of what the global configuration is.
+
+3. Click **OK** to apply the profile mapping.
+
+4. Launch the game and confirm that the profile is applied, regardless of what the global configuration is.
+
