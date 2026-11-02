@@ -218,6 +218,12 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size_t size, Asid asid,
                                       bool track) {
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
+    // Device writes reach the backing with no CPU-side hook, so recompiled code
+    // mapped here must keep its per-entry check (ABI 6 GG1).
+    if (Core::RecompGuardGen::Watching()) {
+        Core::RecompGuardGen::OnDeviceMap(process_memory->GetPageTableView().entries,
+                                          virtual_address, size);
+    }
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     std::scoped_lock lk(mapping_guard);

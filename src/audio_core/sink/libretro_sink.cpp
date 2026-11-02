@@ -16,4 +16,14 @@ LibretroSampleQueue& LibretroSampleQueue::Instance() {
     return instance;
 }
 
+LibretroSink*& LibretroSink::Instance() {
+    static LibretroSink* instance = nullptr;
+    return instance;
+}
+
+std::mutex& LibretroSink::InstanceMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 } // namespace AudioCore::Sink

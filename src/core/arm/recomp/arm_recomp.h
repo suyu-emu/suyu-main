@@ -4,9 +4,14 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <memory>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 
 namespace Kernel {
 class KProcess;
@@ -16,6 +21,7 @@ namespace Core {
 
 class System;
 class DynarmicExclusiveMonitor;
+class ExclusiveMonitor;
 
 /**
  * Signature of a recompiled block produced by suyu::recomp::EmitProject.
@@ -44,24 +50,119 @@ using RecompLookupFn = RecompBlockFn (*)(u64 pc);
  * own.
  */
 void SetRecompLookup(RecompLookupFn lookup);
+/// Selects the maximum nonrecursive module-local slice for the loaded image ABI.
+/// Legacy direct-call images must remain at 32 to fit the guest fiber stack.
+void SetRecompLongSlices(bool enabled);
+/// True only after every loaded compiled module negotiated guard version 2.
+void SetRecompCodeGuardReady(bool ready);
+bool IsRecompCodeGuardReady();
+
+/// ABI 6 (FM1): the arguments the loader passes to each module's
+/// recomp_image_fastmem_v1. They describe this host's page table and its view
+/// of the generated context; a module that was compiled against anything else
+/// answers 0 and the bundle is refused.
+struct RecompFastmemLayout {
+    u32 page_bits;
+    u32 stride_log2;
+    u64 pointer_mask;
+    u32 off_table;
+    u32 off_limit;
+};
+RecompFastmemLayout GetRecompFastmemLayout();
+/// True only after every loaded module is ABI 6 and passed the handshake above.
+/// SUYU_RECOMP_FASTMEM=0 still keeps the fast path off at run time.
+void SetRecompFastmemReady(bool ready);
+bool IsRecompFastmemReady();
+
+/// ABI 6 feature GG1 (generation code guard). The loader calls this after
+/// SetRecompLookup, with what each GG1 module's recomp_image_guard_gen_v1
+/// returned, and before the process is created. The guard only engages with
+/// guard-v2 negotiated and without SUYU_RECOMP_GUARD_GEN=0; otherwise every
+/// module verifies on every entry. Returns whether it engaged.
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules);
+
+/// ABI 6 feature FPX1 (exact native FP): the arguments the loader passes to each
+/// FPX1 module's recomp_image_fpx_v1, this host's view of the generated
+/// context's FP fields and of its kill-switch bit.
+struct RecompFpxLayout {
+    u32 off_fpcr;
+    u32 off_fpsr;
+    u64 inhibit_bit;
+};
+RecompFpxLayout GetRecompFpxLayout();
+/// True only after every loaded module reports FPX1 and passed that handshake.
+/// While set, ArmRecomp keeps the host FP mode the fast paths rely on (MXCSR or
+/// FPCR, see core/arm/recomp/guest_fp_env.h) on every guest-core thread;
+/// SUYU_RECOMP_FPX=0 turns the fast paths off through the kill-switch bit.
+void SetRecompFpxReady(bool ready);
+bool IsRecompFpxReady();
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by
 /// the static pass are module-relative - the loader picks the real base at run
 /// time - so without this every pointer the guest computes is short by that
 /// base and lands near null.
-/// `index` is the module's position in load order, lowest base first. Names
-/// cannot be relied on to identify a module: a game's main NSO is named after
-/// the game ("cross2_Release.nss"), and its sdk and subsdk modules carry names
-/// like "nnSdk" and "multimedia", none of which match the file names the
-/// exporter used. Load order is the same on every title - rtld, main, the
-/// subsdks, then sdk - so the index is what actually lines up.
-using RecompBaseFn = void (*)(size_t index, const char* module, u64 base);
+/// `index` is the module's position in load order, lowest base first, and
+/// `build_id` its build ID as 64 lower-case hex digits (empty if unknown). The
+/// build ID is what identifies a module: names do not (a game's main NSO is
+/// named after the game, "cross2_Release.nss", its others "nnSdk" and
+/// "multimedia"), and neither does a position among the images, because an
+/// export may leave modules out. See RecompGaps::MatchImage.
+using RecompBaseFn = void (*)(size_t index, const char* module, const char* build_id, u64 base);
 void SetRecompBaseSetter(RecompBaseFn setter);
+
+/// Called once per process after the base setter has seen every loaded module
+/// and before the first block runs. Logs any registered image left without a
+/// base and returns how many of those have their module loaded; a strict run
+/// refuses to start when that is nonzero.
+using RecompBindCheckFn = size_t (*)();
+void SetRecompBindCheck(RecompBindCheckFn check);
+
+// Installed only for a stopped, explicitly prepared static-image session.
+using RecompModules = std::map<u64, std::string>;
+using RecompPrepareFn = bool (*)(const RecompModules& modules);
+void SetRecompPrepareCallback(RecompPrepareFn callback);
+bool HasRecompPrepareCallback();
+// Must complete before the application process is published to the applet manager.
+bool PrepareRecompProcess(Kernel::KProcess& process, const RecompModules& modules);
 
 /// Returns the registered lookup, or nullptr when no recompiled image is
 /// loaded and the JIT should be used.
 RecompLookupFn GetRecompLookup();
+
+/// What the CPU is actually doing, for display while a game is running.
+///
+/// Whether execution is statically recompiled is otherwise only visible in a
+/// coverage file written after the fact, which is no use to someone watching
+/// the game. `jit_transitions` is the number that settles it: an image that
+/// never reaches the JIT reports zero, and one transition is one too many.
+struct RecompLiveStats {
+    u64 static_blocks;      ///< blocks executed from recompiled images
+    u64 jit_transitions;    ///< times execution had to leave them
+    u64 forced_cutoff_pc;   ///< diagnostic static-block cutoff handoff PC
+    u64 forced_cutoff_blocks;
+    bool backend_active;    ///< ArmRecomp is the CPU for this process
+    bool jit_available;     ///< false when built without a dynamic recompiler
+    /// No JIT fallback is permitted: uncovered code stops execution rather than
+    /// handing off. This is what separates a "suyu static AOT" run from a
+    /// "Hybrid AOT + JIT" one - both execute recompiled code, but only the
+    /// hybrid one is allowed to leave it - so the frontend cannot name the
+    /// running backend without it.
+    bool strict_mode;
+};
+RecompLiveStats GetRecompLiveStats();
+
+// Process-wide monotonically accumulated diagnostic counters. Fields are sampled
+// independently; callers may subtract a stopped-session baseline.
+struct RecompExecutionStats {
+    u64 blocks{};
+    u64 svc_calls{};
+    u64 lookup_misses{};
+    u64 unhandled{};
+    u64 no_fallback{};
+};
+RecompExecutionStats GetRecompExecutionStats();
+std::array<u64, 4> GetRecompCurrentPcs();
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing
@@ -91,7 +192,7 @@ public:
     /// debugger that is not attached and the game hangs on a black screen with
     /// no forward progress.
     explicit ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
-                       Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
+                       Kernel::KProcess* process, ExclusiveMonitor* exclusive_monitor,
                        std::size_t core_index);
     ~ArmRecomp() override;
 
@@ -117,6 +218,8 @@ public:
 
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
     void RewindBreakpointInstruction() override;
+
+friend bool PrepareRecompProcess(Kernel::KProcess&, const RecompModules&);
 
 private:
     /// Builds the JIT fallback if needed and marks this thread as running on

@@ -30,7 +30,7 @@
 #include "input_common/drivers/sdl_driver.h"
 #endif
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include "input_common/drivers/android.h"
 #endif
 
@@ -85,7 +85,7 @@ struct InputSubsystem::Impl {
         RegisterEngine("cemuhookudp", udp_client);
         RegisterEngine("tas", tas_input);
         RegisterEngine("camera", camera);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         RegisterEngine("android", android);
 #endif
         RegisterEngine("virtual_amiibo", virtual_amiibo);
@@ -119,7 +119,7 @@ struct InputSubsystem::Impl {
         UnregisterEngine(udp_client);
         UnregisterEngine(tas_input);
         UnregisterEngine(camera);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         UnregisterEngine(android);
 #endif
         UnregisterEngine(virtual_amiibo);
@@ -144,7 +144,7 @@ struct InputSubsystem::Impl {
         auto mouse_devices = mouse->GetInputDevices();
         devices.insert(devices.end(), mouse_devices.begin(), mouse_devices.end());
 #endif
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         auto android_devices = android->GetInputDevices();
         devices.insert(devices.end(), android_devices.begin(), android_devices.end());
 #endif
@@ -176,7 +176,7 @@ struct InputSubsystem::Impl {
         if (engine == mouse->GetEngineName()) {
             return mouse;
         }
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         if (engine == android->GetEngineName()) {
             return android;
         }
@@ -261,7 +261,7 @@ struct InputSubsystem::Impl {
         if (engine == mouse->GetEngineName()) {
             return true;
         }
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         if (engine == android->GetEngineName()) {
             return true;
         }
@@ -294,7 +294,7 @@ struct InputSubsystem::Impl {
     void BeginConfiguration() {
         keyboard->BeginConfiguration();
         mouse->BeginConfiguration();
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         android->BeginConfiguration();
 #endif
 #ifdef ENABLE_LIBUSB
@@ -310,7 +310,7 @@ struct InputSubsystem::Impl {
     void EndConfiguration() {
         keyboard->EndConfiguration();
         mouse->EndConfiguration();
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
         android->EndConfiguration();
 #endif
 #ifdef ENABLE_LIBUSB
@@ -355,7 +355,7 @@ struct InputSubsystem::Impl {
     std::shared_ptr<Joycons> joycon;
 #endif
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     std::shared_ptr<Android> android;
 #endif
 };
@@ -412,7 +412,7 @@ const Camera* InputSubsystem::GetCamera() const {
     return impl->camera.get();
 }
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 Android* InputSubsystem::GetAndroid() {
     return impl->android.get();
 }

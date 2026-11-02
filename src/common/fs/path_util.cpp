@@ -5,13 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <ankerl/unordered_dense.h>
 
 #include "common/assert.h"
 #include "common/fs/fs.h"
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include "common/fs/fs_android.h"
 #endif
 #include "common/fs/fs_paths.h"
@@ -459,7 +460,7 @@ std::vector<std::string> SplitPathComponentsCopy(std::string_view filename) {
 
 std::string SanitizePath(std::string_view path_, DirectorySeparator directory_separator) {
     std::string path(path_);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (Android::IsContentUri(path)) {
         return path;
     }
@@ -494,7 +495,7 @@ std::string GetParentPath(std::string_view path) {
         return std::string(path);
     }
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
     if (path[0] != '/') {
         std::string path_string{path};
         return FS::Android::GetParentDirectory(path_string);

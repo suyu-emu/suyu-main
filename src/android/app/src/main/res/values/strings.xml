@@ -421,6 +421,7 @@
     <string name="licenses_description">Projects that make suyu for Android possible</string>
     <string name="build">Build</string>
     <string name="user_data">User data</string>
+    <string name="import_user_data">Import user data</string>
     <string name="user_data_description">Import/export all app data.\n\nWhen importing user data, all existing user data will be deleted!\n\nImporting data from Citron may cause issues. It\'s recommended to manually import all needed data.</string>
     <string name="exporting_user_data">Exporting user data…</string>
     <string name="importing_user_data">Importing user data…</string>

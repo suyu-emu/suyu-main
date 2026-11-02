@@ -85,6 +85,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <glad/glad.h>
 
 #define QT_NO_OPENGL
+#include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -96,6 +97,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QFileInfo>
 #include <QFileDialog>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -105,6 +109,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QScreen>
 #include <QSplashScreen>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSortFilterProxyModel>
 #include <QStandardPaths>
 #include <QElapsedTimer>
@@ -144,6 +149,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_image_features.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
@@ -586,6 +593,16 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
             QTimer::singleShot(0, this, [this]() { ApplyAppMode(AppMode::Gamer); });
             continue;
         }
+        // Open straight into Tools > Install Decryption Keys / Install Firmware, once the
+        // window is up. An exported game missing either starts suyu this way.
+        if (args[i] == QStringLiteral("-install-keys")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallDecryptionKeys(); });
+            continue;
+        }
+        if (args[i] == QStringLiteral("-install-firmware")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallFirmware(); });
+            continue;
+        }
         // Launch game with a specific user
         if (args[i] == QStringLiteral("-u")) {
             if (i >= args.size() - 1) {
@@ -728,13 +745,11 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
     // The CPU backend is chosen when the process starts, so the recompiled
     // images have to be in place *before* BootGame - loading them afterwards
     // (as the deferred SUYU_RECOMP_DIR hook below did for a command-line game)
-    // silently boots the game on the JIT instead. SUYU_RECOMP_DIR wins when
-    // set; otherwise a game inside an export package brings its own images.
+    // silently boots the game on the JIT instead. SUYU_RECOMP_DIR is the
+    // explicit debugging override. Automatic package and cache selection
+    // happens in BootGame after the loader reports the title ID.
     if (!game_path.isEmpty()) {
-        QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
-        if (recomp_dir.isEmpty()) {
-            recomp_dir = FindRecompiledImageDirFor(game_path);
-        }
+        const QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
         if (!recomp_dir.isEmpty()) {
             const int loaded = LoadRecompiledImagesFrom(recomp_dir);
             if (loaded == 0) {
@@ -1729,6 +1744,8 @@ void GMainWindow::ConnectWidgetEvents() {
             [this](const std::string&) { OnExportGame(); });
     connect(game_list, &GameList::LaunchRecompiledRequested, this,
             &GMainWindow::OnLaunchRecompiledBuild);
+    connect(game_list, &GameList::LaunchStaticBuildRequested, this,
+            &GMainWindow::OnLaunchStaticBuild);
     connect(game_list, &GameList::AddDirectory, this, &GMainWindow::OnGameListAddDirectory);
     connect(game_list_placeholder, &GameListPlaceholder::AddDirectory, this,
             &GMainWindow::OnGameListAddDirectory);
@@ -1823,6 +1840,8 @@ void GMainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Reset_Window_Size_800, &GMainWindow::ResetWindowSize800);
     connect_menu(ui->action_Reset_Window_Size_900, &GMainWindow::ResetWindowSize900);
     connect_menu(ui->action_Reset_Window_Size_1080, &GMainWindow::ResetWindowSize1080);
+    SetupResolutionScaleMenu();
+
     ui->menu_Reset_Window_Size->addActions({ui->action_Reset_Window_Size_720,
                                             ui->action_Reset_Window_Size_800,
                                             ui->action_Reset_Window_Size_900,
@@ -2045,36 +2064,8 @@ void GMainWindow::AllowOSSleep() {
 #endif
 }
 
-bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params) {
-    if (Loader::AppLoader_NRO::IdentifyType(
-            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
-        if (!CheckFirmwarePresence()) {
-            const auto response = QMessageBox::question(
-                this, tr("Firmware Not Found"),
-                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
-                   "If you already installed firmware, this may be a detection mismatch.\n"
-                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-
-        if (!ContentManager::AreKeysPresent()) {
-            const auto response = QMessageBox::warning(
-                this, tr("No Decryption Keys Detected"),
-                tr("No local decryption keys were detected.\n\n"
-                   "Install your keys via\n"
-                   "Tools > Install Decryption Keys,\n"
-                   "or configure an external decryption tool if you prefer.\n\n"
-                   "If your games are already decrypted, choose Continue."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-    }
-
+bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params,
+                          u64 title_id, bool allow_auto_recomp, bool require_auto_recomp) {
     // Shutdown previous session if the emu thread is still active...
     if (emu_thread != nullptr) {
         ShutdownGame();
@@ -2331,7 +2322,8 @@ void GMainWindow::ConfigureFilesystemProvider(const std::string& filepath) {
 }
 
 void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
-                           StartGameType type) try {
+                           StartGameType type, bool require_auto_recomp,
+                           InputCommon::TasInput::TasBootMode tas_boot_mode) try {
     LOG_INFO(Frontend, "suyu starting...");
 
     // Check for keys and firmware before the loader opens the file, so a
@@ -2443,7 +2435,8 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
     // with recursive directory scans while the launch path is initializing.
     game_list->CancelPopulate();
 
-    if (!LoadROM(filename, params)) {
+    if (!LoadROM(filename, params, title_id, type == StartGameType::Normal,
+                 require_auto_recomp)) {
         return;
     }
 
@@ -5407,6 +5400,17 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                 last_emu_speed_.load(std::memory_order_relaxed);
             state[QStringLiteral("shaders_building")] =
                 (emulation_running && system) ? system->GPU().ShaderNotify().ShadersBuilding() : 0;
+            const auto recomp = Core::GetRecompLiveStats();
+            state[QStringLiteral("static_backend_active")] = recomp.backend_active;
+            state[QStringLiteral("static_blocks")] = static_cast<qint64>(recomp.static_blocks);
+            state[QStringLiteral("jit_transitions")] =
+                static_cast<qint64>(recomp.jit_transitions);
+            state[QStringLiteral("forced_cutoff_pc")] =
+                QString::number(recomp.forced_cutoff_pc, 16);
+            state[QStringLiteral("forced_cutoff_blocks")] =
+                static_cast<qint64>(recomp.forced_cutoff_blocks);
+            state[QStringLiteral("jit_available")] = recomp.jit_available;
+            state[QStringLiteral("guard_v2_ready")] = Core::IsRecompCodeGuardReady();
             // TAS playback progress. A replayed script is a fixed workload, so
             // the honest CPU benchmark is how long a backend takes to reach the
             // last frame - comparing FPS at equal wall-clock compares two runs
@@ -5416,9 +5420,18 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                     input_subsystem->GetTas()->GetStatus();
                 state[QStringLiteral("tas_running")] =
                     tas_state == InputCommon::TasInput::TasState::Running;
+                state[QStringLiteral("tas_recording")] =
+                    tas_state == InputCommon::TasInput::TasState::Recording;
                 state[QStringLiteral("tas_frame")] = static_cast<qint64>(tas_frame);
                 state[QStringLiteral("tas_total_frames")] =
                     static_cast<qint64>(tas_lengths[0]);
+                const auto [completion_generation, completed_commands, completion_looping] =
+                    input_subsystem->GetTas()->GetCompletionStatus();
+                state[QStringLiteral("tas_completion_generation")] =
+                    static_cast<qint64>(completion_generation);
+                state[QStringLiteral("tas_completed_commands")] =
+                    static_cast<qint64>(completed_commands);
+                state[QStringLiteral("tas_completion_looping")] = completion_looping;
             }
             state[QStringLiteral("qt_ssl_available")] = qt_ssl_available_;
             state[QStringLiteral("qt_ssl_build_version")] = qt_ssl_build_version_;
@@ -6037,7 +6050,11 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                          {QStringLiteral("format"),
                                           QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
                                                       {QStringLiteral("description"),
-                                                       QStringLiteral("aot_test_export only: 'source' or 'build'. Defaults to whatever the dialog's combo shows.")}}}}},
+                                                       QStringLiteral("aot_test_export only: 'source' or 'build'. Defaults to whatever the dialog's combo shows.")}}},
+                                         {QStringLiteral("backend"),
+                                          QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                                                      {QStringLiteral("description"),
+                                                       QStringLiteral("aot_test_export only: 'static', 'hybrid', or 'dynarmic'. Defaults to whatever the dialog's combo shows.")}}}}},
                             {QStringLiteral("required"), QJsonArray{QStringLiteral("action")}}},
                 [this](const QJsonObject& params) -> QJsonObject {
                     const QString action = params[QStringLiteral("action")].toString().trimmed().toLower();
@@ -6098,7 +6115,71 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         const int format_index = fmt == QStringLiteral("build")   ? 1
                                                  : fmt == QStringLiteral("source") ? 0
                                                                                    : -1;
-                        dialog->TriggerExportForTesting(rom_path, output_dir, format_index);
+                        // Return the RPC response before the long export begins.
+                        // The caller polls get_aot_export_status while OnExport
+                        // pumps the nested Qt event loop.
+                        // RecompileBackend values: 0 = suyu static, 1 = Hybrid AOT + JIT,
+                        // 2 = Dynarmic JIT. Without this the harness could only
+                        // ever drive whichever backend the dialog opened on.
+                        const QString backend_name =
+                            params[QStringLiteral("backend")].toString().trimmed().toLower();
+                        const int backend_index =
+                            backend_name == QStringLiteral("static")     ? 0
+                            : backend_name == QStringLiteral("hybrid")   ? 1
+                            : backend_name == QStringLiteral("dynarmic") ? 2
+                                                                         : -1;
+                        const int full_scan = params.contains(QStringLiteral("full_scan"))
+                                                  ? (params[QStringLiteral("full_scan")].toBool() ? 1 : 0)
+                                                  : -1;
+                        const auto app_version =
+                            static_cast<quint32>(params[QStringLiteral("app_version")].toInteger());
+                        const QString display_version =
+                            params[QStringLiteral("display_version")].toString();
+                        // Headless runs never answer a prompt: an existing destination
+                        // is a reported conflict unless the caller chooses otherwise.
+                        GameExportDialog::TestExportOptions options;
+                        const QString conflict =
+                            params[QStringLiteral("conflict")].toString().trimmed().toLower();
+                        options.conflict =
+                            conflict == QStringLiteral("keep_both")
+                                ? Common::PackagePolicy::ConflictPolicy::KeepBoth
+                            : conflict == QStringLiteral("replace")
+                                ? Common::PackagePolicy::ConflictPolicy::ReplaceWithBackup
+                                : Common::PackagePolicy::ConflictPolicy::Fail;
+                        const auto tri_state = [&params](const char* key) {
+                            const QString name = QString::fromLatin1(key);
+                            return params.contains(name) ? (params[name].toBool() ? 1 : 0) : -1;
+                        };
+                        options.include_save = tri_state("include_save");
+                        options.include_shader = tri_state("include_shader");
+                        options.include_config = tri_state("include_config");
+                        options.fail_at = params[QStringLiteral("fail_at")].toString().trimmed();
+                        // "reference" (uses the game file) or "portable" (sealed game file in
+                        // the package); anything else leaves the dialog's choice.
+                        const QString package =
+                            params[QStringLiteral("package")].toString().trimmed().toLower();
+                        options.package = package == QStringLiteral("portable")    ? 1
+                                          : package == QStringLiteral("reference") ? 0
+                                                                                   : -1;
+                        dialog->SetTestExportOptions(options);
+                        QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
+                                                       backend_index, full_scan, app_version,
+                                                       display_version] {
+                            dialog->TriggerExportForTesting(rom_path, output_dir, format_index,
+                                                            backend_index, full_scan, app_version,
+                                                            display_version);
+                        });
+                    } else if (action == QStringLiteral("aot_select_rom")) {
+                        // Test-only: select a ROM in the open GameExportDialog without
+                        // exporting, so its Update and Coverage rows can be read back
+                        // through get_aot_export_status.
+                        auto* dialog = qobject_cast<GameExportDialog*>(QApplication::activeModalWidget());
+                        const QString rom_path = params[QStringLiteral("rom_path")].toString().trimmed();
+                        if (!dialog || rom_path.isEmpty()) {
+                            return QJsonObject{{QStringLiteral("success"), false},
+                                               {QStringLiteral("error"), QStringLiteral("Needs an open GameExportDialog and rom_path")}};
+                        }
+                        dialog->SetRomPath(rom_path);
                     } else if (action == QStringLiteral("nintendo_test_one_click")) {
                         // Test-only: directly invoke the One-Click Sign In
                         // handler on whatever NintendoAccountDialog is
@@ -6600,7 +6681,10 @@ static int CountPlayableLibraryEntries(QAbstractItemModel* model) {
         for (int row = 0; row < rows; ++row) {
             const QModelIndex idx = model->index(row, 0, parent);
             const QString path = idx.data(kPathRole).toString();
-            if (!path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
+            const bool is_game =
+                idx.data(GameListItem::TypeRole).value<GameListItemType>() ==
+                GameListItemType::Game;
+            if (is_game && !path.isEmpty() && !path.startsWith(QStringLiteral("owned://")) &&
                 QFileInfo(path).isFile()) {
                 ++count;
             }
@@ -7653,541 +7737,6 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
     Core::SetRecompFpxReady(bundle_fpx == 1);
     LOG_INFO(Frontend, "Recompiled FPX1 native FP: {}",
              bundle_fpx == 1 ? "negotiated" : "not used");
-    LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
-             dir.toStdString());
-    return static_cast<int>(loaded_images.size());
-}
-
-void GMainWindow::OnLoadRecompiledImage() {
-    if (emulation_running) {
-        QMessageBox::warning(this, tr("Recompiled Image"),
-                             tr("Stop the running game first. The CPU backend is chosen when a "
-                                "process starts, so an image loaded now would not be used."));
-        return;
-    }
-
-    // An image stays selected until it is cleared, and every later game would
-    // then try to run on it. Since an image only covers the one title it was
-    // built from, offer to go back to the JIT rather than leaving that as a
-    // trap the user has to work out for themselves.
-    if (RecompiledImagesLoaded()) {
-        const auto choice = QMessageBox::question(
-            this, tr("Recompiled Image"),
-            tr("A recompiled image is already loaded, and every game started now will try to "
-               "run on it.\n\nGo back to the JIT?"),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
-        if (choice == QMessageBox::Yes) {
-            UnloadRecompiledImages();
-            return;
-        }
-    }
-
-    // Ask for the directory the export produced rather than one library, so
-    // every module of the title is picked up together. SUYU_RECOMP_DIR skips
-    // the picker - it makes the whole load headless-testable, which the file
-    // dialog is not when a system overlay steals focus.
-    QString dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
-    const bool unattended = !dir.isEmpty();
-    if (dir.isEmpty()) {
-        dir = QFileDialog::getExistingDirectory(
-            this, tr("Select the recompiled folder for this game"));
-    }
-    if (dir.isEmpty()) {
-        return;
-    }
-
-    const int count = LoadRecompiledImagesFrom(dir);
-    if (count == 0) {
-        if (!unattended) {
-            QMessageBox::warning(
-                this, tr("Recompiled Image"),
-                tr("No recompiled images were found in that folder. Export the game first - the "
-                   "images are built under its 'recompiled' directory, one per module."));
-        }
-        return;
-    }
-
-    // No modal when the load was driven by the environment variable - that path
-    // is meant to run unattended.
-    if (!unattended) {
-        QMessageBox::information(
-            this, tr("Recompiled Image"),
-            tr("Loaded %1 module image(s). The next game you start will run on the static "
-               "recompiler instead of the JIT, driven by suyu's own kernel, services and GPU."
-               "\n\nThis is experimental: the images only cover the code the static pass reached, "
-               "and execution stops if the game branches outside it.")
-                .arg(count));
-    }
-}
-
-void GMainWindow::OnLaunchRecompiledBuild(const QString& game_name,
-                                          const std::string& game_path) {
-    const QStringList builds =
-        GameExportDialog::FindRecompiledExecutables(game_name, QString::fromStdString(game_path));
-    if (builds.isEmpty()) {
-        QMessageBox::warning(
-            this, tr("Recompiled Build"),
-            tr("No standalone recompiled build was found for this game. Use "
-               "'Recompile for PC...' to export it, then build the 'recompiled' target."));
-        return;
-    }
-
-    // Prefer the package launcher (suyu-cmd bundled as <GameName>.exe) if present.
-    // It's prepended so it's always first if it exists.
-    QString exe = builds.front();
-    if (builds.size() > 1) {
-        QStringList labels;
-        labels.reserve(builds.size());
-        for (const QString& candidate : builds) {
-            const QFileInfo cfi(candidate);
-            const QString fname = cfi.completeBaseName();
-            // Package launcher: exe name matches the game name (not "recompiled")
-            if (fname != QStringLiteral("recompiled")) {
-                labels.append(tr("[Full launcher] %1").arg(candidate));
-                continue;
-            }
-            // Legacy module exe: walk up to 'recompiled' directory for module name
-            QDir dir = cfi.absoluteDir();
-            QString module = dir.dirName();
-            while (dir.cdUp()) {
-                if (dir.dirName() == QStringLiteral("recompiled")) {
-                    break;
-                }
-                module = dir.dirName();
-            }
-            labels.append(QStringLiteral("[module: %1]  %2").arg(module, candidate));
-        }
-        bool ok = false;
-        const QString chosen = QInputDialog::getItem(
-            this, tr("Launch Recompiled Build"), tr("Which recompiled module should run?"), labels,
-            0, false, &ok);
-        if (!ok) {
-            return;
-        }
-        exe = builds.at(labels.indexOf(chosen));
-    }
-
-    // Detached on purpose: the recompiled build is a separate program, and
-    // closing suyu should not take it down with it.
-    const QString working_dir = QFileInfo(exe).absolutePath();
-    qint64 pid = 0;
-    if (!QProcess::startDetached(exe, QStringList{}, working_dir, &pid)) {
-        QMessageBox::critical(this, tr("Recompiled Build"),
-                              tr("Could not start the recompiled build:\n%1").arg(exe));
-        return;
-    }
-
-    LOG_INFO(Frontend, "Launched standalone recompiled build '{}' (pid {})", exe.toStdString(),
-             pid);
-    statusBar()->showMessage(tr("Launched recompiled build (pid %1)").arg(pid), 5000);
-}
-
-void GMainWindow::RunFirstRunSetupIfNeeded() {
-    QSettings settings(QStringLiteral("suyu"), QStringLiteral("suyu"));
-    if (settings.value(QStringLiteral("first_run_done"), false).toBool()) {
-        return;
-    }
-    // Written before the dialog runs, not after: if any step crashes or the
-    // user force-quits, they get their emulator next launch rather than this
-    // screen again.
-    settings.setValue(QStringLiteral("first_run_done"), true);
-
-    QDialog dialog(this);
-    dialog.setWindowTitle(tr("Welcome to suyu"));
-    auto* layout = new QVBoxLayout(&dialog);
-
-    auto* heading = new QLabel(tr("<h2>Let's get you set up</h2>"), &dialog);
-    layout->addWidget(heading);
-    auto* blurb = new QLabel(
-        tr("Each step is optional and you can change any of it later from the Tools menu."),
-        &dialog);
-    blurb->setWordWrap(true);
-    layout->addWidget(blurb);
-
-    // Each entry is a button plus a one-line explanation of what it does, so
-    // the user isn't agreeing to something unexplained on first launch.
-    const auto add_step = [&](const QString& text, const QString& detail, auto handler) {
-        auto* button = new QPushButton(text, &dialog);
-        layout->addWidget(button);
-        auto* note = new QLabel(QStringLiteral("<small>%1</small>").arg(detail), &dialog);
-        note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("color: #999; margin-bottom: 8px;"));
-        layout->addWidget(note);
-        connect(button, &QPushButton::clicked, &dialog, handler);
-    };
-
-    add_step(tr("Set up a user profile"),
-             tr("Creates the Switch user your saves are stored against."),
-             [this]() { OnOpenControllerMenu(); });
-    add_step(tr("Link your Nintendo Account"),
-             tr("Imports the games you own so your library shows them, with cover art."),
-             [this]() { OnNintendoAccount(); });
-    add_step(tr("Set up Steam"),
-             tr("Adds suyu and your games to Steam so they launch from your Steam library."),
-             [this]() { OnSteamIntegration(); });
-
-    auto* done = new QPushButton(tr("Finish"), &dialog);
-    done->setDefault(true);
-    layout->addWidget(done);
-    connect(done, &QPushButton::clicked, &dialog, &QDialog::accept);
-
-    dialog.exec();
-}
-
-namespace {
-    // A title is several NSO modules - main, rtld, sdk, subsdk0 - and each
-    // recompiles to its own image. Execution begins in rtld, the dynamic
-    // linker, not in main, so loading a single image is not enough: the very
-    // first block lookup misses and the CPU halts with "No recompiled block at
-    // PC". Every image for the title is loaded and their lookups chained.
-    //
-    // Held for the process lifetime: the recompiled blocks live in these
-    // libraries, so unloading one while a game is running would pull the code
-    // out from under the CPU.
-    // Every image is keyed by an offset *within its own module* (0-based), so
-    // two images legitimately both have a block at offset 0. A lookup that
-    // doesn't first pin down which module owns a given absolute PC will
-    // silently hand back the wrong module's block - the CPU keeps "running"
-    // but is executing whatever code happened to share that offset in a
-    // different module, with no error anywhere. base tracks each image's
-    // load address once the kernel reports it, so dispatch can pick the
-    // owning image by address range before reducing to an offset.
-    struct RecompImage {
-        std::string name;
-        Core::RecompLookupFn lookup;
-        void (*set_base)(u64);
-        // Hands out the image's block index so the dispatcher can do the lookup
-        // itself instead of calling across the shared-object boundary for it.
-        int (*get_index)(u64*, u64*, Core::RecompBlockFn**);
-        u64 base = 0;
-    };
-std::vector<QLibrary*> loaded_images;
-std::vector<RecompImage> loaded_records;
-
-// A compact, sorted view of the records above. The dispatcher runs tens of
-// millions of times a second, and a RecompImage is ~56 bytes with a std::string
-// at the front, so walking the records themselves touches a cache line per
-// image. These entries are 24 bytes and contiguous.
-struct OwnerEntry {
-    u64 base;
-    Core::RecompLookupFn lookup;
-    // A direct view of the image's block index. Hitting it is a bounds check and
-    // one load; missing it falls back to `lookup`, which also covers addresses
-    // outside the indexed range.
-    u64 idx_lo;
-    u64 idx_hi;
-    Core::RecompBlockFn* idx;
-    int record;
-};
-std::array<OwnerEntry, 16> owner_entries{};
-int owner_count = 0;
-
-void RebuildOwnerTable() {
-    int n = 0;
-    for (size_t k = 0; k < loaded_records.size() && n < static_cast<int>(owner_entries.size());
-         ++k) {
-        const auto& r = loaded_records[k];
-        if (r.base == 0 || !r.lookup) {
-            continue;
-        }
-        u64 lo = 0, hi = 0;
-        Core::RecompBlockFn* idx = nullptr;
-        if (!r.get_index || !r.get_index(&lo, &hi, &idx)) {
-            lo = 1;   // An empty range no pc can satisfy.
-            hi = 0;
-            idx = nullptr;
-        }
-        owner_entries[n++] = OwnerEntry{r.base, r.lookup, lo, hi, idx, static_cast<int>(k)};
-    }
-    std::sort(owner_entries.begin(), owner_entries.begin() + n,
-              [](const OwnerEntry& a, const OwnerEntry& b) { return a.base < b.base; });
-    owner_count = n;
-}
-} // Anonymous namespace
-
-void GMainWindow::UnloadRecompiledImages() {
-    Core::SetRecompLookup(nullptr);
-    for (auto* lib : loaded_images) {
-        lib->unload();
-        lib->deleteLater();
-    }
-    loaded_images.clear();
-    loaded_records.clear();
-    owner_count = 0;
-}
-
-bool GMainWindow::RecompiledImagesLoaded() const {
-    return !loaded_images.empty();
-}
-
-QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path) {
-    // Every export package layout - Windows package dir, Linux AppDir usr/bin,
-    // macOS Contents/Resources - puts aot_cache beside the bundled ROM, so the
-    // ROM's own directory is the only place worth looking.
-    const QString base = QFileInfo(game_path).absolutePath();
-    const QStringList candidates = {
-        base + QStringLiteral("/aot_cache/recompiled"),
-        base + QStringLiteral("/recompiled"),
-    };
-
-#ifdef _WIN32
-    const QString pattern = QStringLiteral("*.dll");
-#elif defined(__APPLE__)
-    const QString pattern = QStringLiteral("*.dylib");
-#else
-    const QString pattern = QStringLiteral("*.so");
-#endif
-
-    for (const QString& candidate : candidates) {
-        if (!QDir(candidate).exists()) {
-            continue;
-        }
-        // The tree exists as soon as the export runs, but it only holds C
-        // sources until someone builds it. Pointing the loader at an unbuilt
-        // tree would just log a failure, so treat "no built image" as "no
-        // images" and let the game boot on the JIT.
-        QDirIterator probe(candidate, {pattern}, QDir::Files, QDirIterator::Subdirectories);
-        if (probe.hasNext()) {
-            return candidate;
-        }
-    }
-    return {};
-}
-
-void GMainWindow::EnterSingleGameMode() {
-    // This build launches one game. The library, its menus and the status bar
-    // all offer to do things there is no second game to do them to, so the
-    // window is stripped to the render surface.
-    single_game_mode_ = true;
-    ui->menubar->hide();
-    statusBar()->hide();
-    game_list->hide();
-    game_list_placeholder->hide();
-    LOG_INFO(Frontend, "Single-game mode: library UI hidden");
-}
-
-// Loads every module image found under `dir` and installs the chained
-// dispatcher. Returns the number of images loaded, 0 on failure - the caller
-// decides whether that deserves a dialog, because the single-game launcher
-// path runs unattended and must not stop on a modal.
-int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
-#ifdef _WIN32
-    const QString pattern = QStringLiteral("*.dll");
-#elif defined(__APPLE__)
-    const QString pattern = QStringLiteral("*.dylib");
-#else
-    const QString pattern = QStringLiteral("*.so");
-#endif
-
-    QDirIterator it(dir, {pattern}, QDir::Files, QDirIterator::Subdirectories);
-    std::vector<QLibrary*> found;
-    std::vector<RecompImage> records;
-    while (it.hasNext()) {
-        auto* lib = new QLibrary(it.next(), this);
-        if (!lib->load()) {
-            lib->deleteLater();
-            continue;
-        }
-        const auto fn =
-            reinterpret_cast<Core::RecompLookupFn>(lib->resolve("recomp_image_lookup"));
-        if (!fn) {
-            // Some other library that happens to sit in the tree.
-            lib->unload();
-            lib->deleteLater();
-            continue;
-        }
-        found.push_back(lib);
-
-        // The module this image was built from is the directory holding it,
-        // walking up past the build output folders cmake created.
-        QDir owner = QFileInfo(lib->fileName()).absoluteDir();
-        while (owner.dirName() == QStringLiteral("Release") ||
-               owner.dirName() == QStringLiteral("Debug") ||
-               owner.dirName() == QStringLiteral("build")) {
-            if (!owner.cdUp()) {
-                break;
-            }
-        }
-        auto* set_base =
-            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
-        auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
-            lib->resolve("recomp_image_index"));
-        records.push_back(
-            RecompImage{owner.dirName().toStdString(), fn, set_base, get_index, 0});
-    }
-
-    if (found.empty()) {
-        return 0;
-    }
-
-    for (auto* lib : loaded_images) {
-        lib->unload();
-        lib->deleteLater();
-    }
-    loaded_images = std::move(found);
-    loaded_records = std::move(records);
-
-    // Kernel module names carry an "nn" prefix that the export directories do
-    // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
-        // Try the name first - it works for rtld - then fall back to load
-        // order. A game's own modules are not named after the files they were
-        // exported from: main is named after the game ("cross2_Release.nss"),
-        // and the others come through as "nnSdk" and "multimedia". Load order
-        // is identical across titles, so position is the dependable key.
-        // Switch load order is rtld, main, subsdk0..subsdk9, sdk. This table had
-        // only four entries {rtld, main, subsdk0, sdk}, which silently mismaps
-        // any title with more than one subsdk: the module at index 3 is subsdk1,
-        // but a 4-entry table hands it the *sdk* image, and every module from
-        // index 4 on gets no image at all.
-        //
-        // a second title loads nine modules. Four were left uncovered and one
-        // was given the wrong image, so most PCs resolved to a neighbouring
-        // module and missed. sdk is still matched by name first (kernel calls it
-        // "nnSdk"), which is what keeps it correct regardless of module count -
-        // it is the only entry whose position depends on how many subsdks a
-        // title happens to have.
-        static const char* kByLoadOrder[] = {
-            "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
-            "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
-            "sdk",
-        };
-
-        std::string name = module;
-        auto ci_equal = [](const std::string& a, const std::string& b) {
-            return a.size() == b.size() &&
-                   std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
-                       return std::tolower(static_cast<unsigned char>(x)) ==
-                              std::tolower(static_cast<unsigned char>(y));
-                   });
-        };
-        auto match = [&](const std::string& candidate) -> RecompImage* {
-            for (auto& record : loaded_records) {
-                // Kernel module names ("nnSdk") and export directory names
-                // ("sdk") differ in case as well as the "nn" prefix already
-                // stripped above - a case-sensitive compare here silently
-                // fails and falls through to guessing by load order instead
-                // of the name actually matching.
-                if (ci_equal(record.name, candidate)) {
-                    return &record;
-                }
-            }
-            return nullptr;
-        };
-        RecompImage* record = match(name);
-        if (!record && name.rfind("nn", 0) == 0) {
-            record = match(name.substr(2));
-        }
-        if (!record && index < std::size(kByLoadOrder)) {
-            record = match(kByLoadOrder[index]);
-        }
-        if (record && record->set_base) {
-            record->base = base;
-            record->set_base(base);
-            RebuildOwnerTable();
-            LOG_INFO(Frontend, "Recompiled image for module '{}' (#{}) based at {:#x}", name,
-                     index, base);
-        } else {
-            LOG_WARNING(Frontend, "No recompiled image for module '{}' (#{}, base {:#x})", name,
-                        index, base);
-        }
-    });
-
-    // Every image is keyed by an offset within its own module, so the
-    // dispatcher must first work out which module owns this absolute PC -
-    // the image with the greatest base that does not exceed it - before
-    // reducing to an offset and asking that image alone. Asking every image
-    // in turn (as before) would silently return a different module's block
-    // whenever two modules both define something at the same offset, which
-    // they always do at offset 0 (every module's entry block). A plain
-    // function pointer is required here, so the table has to be reached via
-    // a namespace-scope static rather than a capture.
-    static const auto chained = [](u64 pc) -> Core::RecompBlockFn {
-        // Most block boundaries stay inside the module that owned the previous
-        // one, so remember which that was and try it before scanning. The scan
-        // itself is short - nine images at most - but it runs tens of millions
-        // of times a second, and each iteration touches a separate record.
-        //
-        // A plain int, not thread-local: an aligned int cannot tear, and being
-        // wrong is harmless. A wrong image's lookup returns null (its index is
-        // bounds-checked against its own address range) and the full scan below
-        // runs anyway, so the worst case is one wasted call. That is what makes
-        // this safe to share across threads where a (pc, fn) cache was not.
-        // Per-thread, not shared. The CPU threads are usually in different
-        // modules, so a single shared hint has them overwriting each other's and
-        // the fast path misses for everyone.
-        thread_local int hint = -1;
-        const int n = owner_count;
-        if (hint >= 0 && hint < n && owner_entries[hint].base <= pc) {
-            const auto& e = owner_entries[hint];
-            if (pc >= e.idx_lo && pc <= e.idx_hi) {
-                // The index covers every 4-byte slot in the module's range and
-                // holds null where no block starts, so a null here means the
-                // same thing the call would have returned.
-                if (auto* block = e.idx[(pc - e.idx_lo) >> 2]) {
-                    return block;
-                }
-            } else if (auto* block = e.lookup(pc)) {
-                return block;
-            }
-        }
-
-        // Entries are sorted by base, so the owner is the last one at or below
-        // pc and the scan can stop at the first entry above it.
-        int owner_slot = -1;
-        for (int k = 0; k < n; ++k) {
-            if (owner_entries[k].base > pc) {
-                break;
-            }
-            owner_slot = k;
-        }
-        RecompImage* owner =
-            owner_slot >= 0 ? &loaded_records[owner_entries[owner_slot].record] : nullptr;
-        if (owner) {
-            // Absolute PC, not owner-relative: recomp_image_lookup subtracts
-            // g_module_base itself (arm64_to_c.h:2316). Passing an already
-            // relative PC subtracted the base twice, underflowed, and missed
-            // every single time - which is why the AOT path executed zero
-            // blocks and silently ran everything on the JIT instead.
-            const auto& e = owner_entries[owner_slot];
-            Core::RecompBlockFn block = nullptr;
-            if (pc >= e.idx_lo && pc <= e.idx_hi) {
-                block = e.idx[(pc - e.idx_lo) >> 2];
-            } else {
-                block = e.lookup(pc);
-            }
-            if (block) {
-                hint = owner_slot;
-                return block;
-            }
-            // An owner was found and simply had no block at that offset. That is
-            // an ordinary uncovered-code miss and the JIT handles it. Saying "no
-            // owning image" here, as this used to, sends you looking for a
-            // module-mapping bug when there is none.
-            LOG_DEBUG(Frontend,
-                      "recomp dispatch: {} has no block at +{:#x} (pc={:#x}); using JIT",
-                      owner->name, pc - owner->base, pc);
-            return nullptr;
-        }
-        // No owning image and no owner-relative hit above: this used to fall
-        // back to asking every image at the raw PC, which silently ran
-        // whichever module happened to have a block at that offset - masking
-        // real emitter bugs as wrong-module execution instead of a clean
-        // error (this is exactly how one such bug went undetected). Log
-        // loudly instead of guessing.
-        // Genuinely no image claims an address below this PC. That means a
-        // module the exporter never produced an image for - which is expected
-        // when a title has more modules than the ExeFS had NSOs - so the JIT
-        // takes it. Rate-limited: at block granularity this fires constantly.
-        static std::atomic<int> unowned_reports{0};
-        if (unowned_reports.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_WARNING(Frontend,
-                        "recomp dispatch: no image covers pc={:#x} ({} images loaded); using JIT",
-                        pc, loaded_records.size());
-        }
-        return nullptr;
-    };
-    Core::SetRecompLookup(+chained);
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());

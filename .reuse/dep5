@@ -108,17 +108,17 @@ Files: externals/FidelityFX-FSR/*
 Copyright: 2021 Advanced Micro Devices, Inc.
 License: MIT
 
-Files: src/yuzu/*.ui
+Files: src/suyu/*.ui
 Copyright: 2018-2022 yuzu Emulator Project
 License: GPL-2.0-or-later
 
-Files: src/yuzu/loading_screen.ui
+Files: src/suyu/loading_screen.ui
 Copyright: 2019 James Rowe <jroweboy@gmail.com>
 License: GPL-2.0-or-later
 
-Files: src/yuzu/applets/aboutdialog.ui
-       src/yuzu/applets/qt_software_keyboard.ui
-       src/yuzu/util/overlay_dialog.ui
+Files: src/suyu/aboutdialog.ui
+       src/suyu/applets/qt_software_keyboard.ui
+       src/suyu/util/overlay_dialog.ui
 Copyright: 2020-2021 Its-Rei <kupfel@gmail.com>
            2020-2021 yuzu Emulator Project
 License: GPL-2.0-or-later

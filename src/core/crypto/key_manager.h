@@ -319,26 +319,11 @@ private:
     bool dev_mode;
     void LoadFromFile(const std::filesystem::path& file_path, bool is_title_keys);
 
-    template <size_t Size>
-    void WriteKeyToFile(KeyCategory category, std::string_view keyname,
-                        const std::array<u8, Size>& key);
-
-    void DeriveGeneralPurposeKeys(std::size_t crypto_revision);
-
-    void DeriveETicketRSAKey();
-
-    void SetKeyWrapped(S128KeyType id, Key128 key, u64 field1 = 0, u64 field2 = 0);
-    void SetKeyWrapped(S256KeyType id, Key256 key, u64 field1 = 0, u64 field2 = 0);
-
     /// Parses the title key section of a ticket.
     std::optional<Key128> ParseTicketTitleKey(const Ticket& ticket);
 };
 
 Key128 GenerateKeyEncryptionKey(Key128 source, Key128 master, Key128 kek_seed, Key128 key_seed);
-Key128 DeriveKeyblobKey(const Key128& sbk, const Key128& tsec, Key128 source);
-Key128 DeriveKeyblobMACKey(const Key128& keyblob_key, const Key128& mac_source);
-Key128 DeriveMasterKey(const std::array<u8, 0x90>& keyblob, const Key128& master_source);
-std::array<u8, 0x90> DecryptKeyblob(const std::array<u8, 0xB0>& encrypted_keyblob, const Key128& key);
 
 Loader::ResultStatus DeriveSDKeys(std::array<Key256, 2>& sd_keys, KeyManager& keys);
 

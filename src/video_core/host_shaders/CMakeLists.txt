@@ -91,6 +91,8 @@ else()
     find_program(GLSLANGVALIDATOR "glslangValidator")
 endif()
 
+option(SUYU_DEFER_SHADER_COMPILER_CHECK
+    "Allow configuring CPU/library-only targets without glslangValidator (renderer builds still require it)" OFF)
 if ("${GLSLANGVALIDATOR}" STREQUAL "GLSLANGVALIDATOR-NOTFOUND")
     if(NOT SUYU_DEFER_SHADER_COMPILER_CHECK)
         message(FATAL_ERROR "Required program `glslangValidator` not found.")

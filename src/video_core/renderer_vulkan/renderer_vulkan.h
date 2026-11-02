@@ -108,6 +108,7 @@ private:
     Frame applet_frame;
 
     bool is_headless{false};
+    std::vector<Frame> external_frames;
     std::vector<u8> headless_frame_data;
     u32 headless_width{1280};
     u32 headless_height{720};

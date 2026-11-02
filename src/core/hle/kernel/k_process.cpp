@@ -24,6 +24,7 @@
 #ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#endif
 #include "core/arm/recomp/arm_recomp.h"
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
@@ -1331,7 +1332,7 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
             // first uncovered PC hangs the thread for good.
             m_arm_interfaces[i] = std::make_unique<Core::ArmRecomp>(
                 kernel.System(), kernel.IsMulticore(), recomp_lookup, this,
-                &static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
+                m_exclusive_monitor.get(), i);
         }
         return;
     }

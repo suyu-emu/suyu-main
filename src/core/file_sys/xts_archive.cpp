@@ -9,7 +9,6 @@
 #include <regex>
 #include <string>
 
-#include <openssl/err.h>
 #include <openssl/evp.h>
 
 #include "common/fs/path_util.h"
@@ -31,24 +30,12 @@ constexpr u64 NAX_HEADER_PADDING_SIZE = 0x4000;
 template <typename SourceData, typename SourceKey, typename Destination>
 static bool CalculateHMAC256(Destination* out, const SourceKey* key, std::size_t key_length,
                              const SourceData* data, std::size_t data_length) {
-    size_t out_len = 0;
-
-    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
-    if (!mac) return false;
-
-    static EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    if (!ctx) return false;
-
-    static OSSL_PARAM params[] = {
-        OSSL_PARAM_construct_utf8_string("digest", (char*)"SHA256", 0),
-        OSSL_PARAM_construct_end()
-    };
-
-    if (!EVP_MAC_init(ctx, reinterpret_cast<const unsigned char*>(key), key_length, params))
+    Core::Crypto::HMACSHA256Hash hash{};
+    if (!Core::Crypto::CalculateHMACSHA256(hash, key, key_length, data, data_length)) {
         return false;
-
-    return EVP_MAC_update(ctx, reinterpret_cast<const unsigned char*>(data), data_length) &&
-           EVP_MAC_final(ctx, reinterpret_cast<unsigned char*>(out), &out_len, 32);
+    }
+    std::memcpy(out, hash.data(), hash.size());
+    return true;
 }
 
 NAX::NAX(VirtualFile file_)

@@ -21,6 +21,10 @@ class System;
 /// chrome (title/icon) should read as the game, not the suyu dev frontend.
 extern bool g_native_export_mode;
 
+/// Defined in suyu.cpp. True when this executable runs as an exported package (a static
+/// build, or a copy with the exporter's README beside it), whatever its CPU backend.
+extern bool g_export_package;
+
 namespace InputCommon {
 class InputSubsystem;
 enum class MouseButton;
@@ -129,6 +133,17 @@ protected:
 
     /// Keeps track of how often to update the title bar during gameplay
     u64 last_time = 0;
+
+    /// Set at startup and whenever a gamepad comes or goes; see AutoAssignControllers.
+    bool gamepad_check_pending = true;
+    /// Further looks for a gamepad SDL lists before the input backend does.
+    static constexpr int kGamepadRetries = 4;
+    int gamepad_retries = kGamepadRetries;
+    /// Pads connected at any point this session ("guid:port").
+    std::set<std::string> pads_seen;
+    /// Assignments reach the game at once but the config file at most every 2 s.
+    bool controls_save_pending = false;
+    u64 last_controls_save = 0;
 
     /// Input subsystem to use with this window.
     InputCommon::InputSubsystem* input_subsystem;

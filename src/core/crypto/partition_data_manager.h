@@ -31,10 +31,6 @@ public:
     // BOOT0
     bool HasBoot0() const;
     FileSys::VirtualFile GetBoot0Raw() const;
-    EncryptedKeyBlob GetEncryptedKeyblob(std::size_t index) const;
-    EncryptedKeyBlobs GetEncryptedKeyblobs() const;
-    std::vector<u8> GetSecureMonitor() const;
-    std::vector<u8> GetPackage1Decrypted() const;
 
     // Fuses
     bool HasFuses() const;
@@ -47,12 +43,6 @@ public:
     // Package2
     bool HasPackage2(Package2Type type = Package2Type::NormalMain) const;
     FileSys::VirtualFile GetPackage2Raw(Package2Type type = Package2Type::NormalMain) const;
-    void DecryptPackage2(const std::array<std::array<u8, 16>, 0x20>& package2_keys,
-                         Package2Type type);
-    const std::vector<u8>& GetPackage2FSDecompressed(
-        Package2Type type = Package2Type::NormalMain) const;
-    const std::vector<u8>& GetPackage2SPLDecompressed(
-        Package2Type type = Package2Type::NormalMain) const;
 
     // PRODINFO
     bool HasProdInfo() const;

@@ -43,14 +43,6 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         }
     }
 
-    {
-        static bool announced = false;
-        if (!announced) {
-            announced = true;
-            LOG_INFO(Kernel, "PhysicalCore::RunThread reached, core={}", m_core_index);
-        }
-    }
-
     interface->Initialize();
 
     const auto EnterContext = [&]() {

@@ -6,6 +6,7 @@
 
 #include <QApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHeaderView>
@@ -509,6 +510,55 @@ void GameList::AddNintendoLibraryEntries() {
     }
 }
 
+void GameList::AddStaticBuildEntries() {
+    const QStringList builds = GameExportDialog::FindAllRecompiledExecutables();
+    if (builds.isEmpty()) {
+        return;
+    }
+
+    auto* static_dir = new GameListStaticBuildsDir();
+    for (const QString& executable : builds) {
+        const QFileInfo info(executable);
+        QFile readme(info.dir().filePath(QStringLiteral("README_NATIVE_EXPORT.txt")));
+        // Packages from before the rename say "Hybrid AOT + JIT".
+        const QString first_line = readme.open(QIODevice::ReadOnly | QIODevice::Text)
+                                       ? QString::fromUtf8(readme.readLine())
+                                       : QString();
+        const bool is_hybrid =
+            first_line.contains(QStringLiteral("Hybrid JIT + AOT"), Qt::CaseInsensitive) ||
+            first_line.contains(QStringLiteral("Hybrid AOT + JIT"), Qt::CaseInsensitive);
+        const QString backend_label =
+            is_hybrid ? tr("suyu Hybrid JIT + AOT") : tr("suyu static AOT (Experimental)");
+        QList<QStandardItem*> row;
+        auto* build_item =
+            new GameListStaticBuildItem(executable, info.completeBaseName(), backend_label);
+        build_item->setToolTip(
+            is_hybrid
+                ? tr("Runs recompiled code first and falls back to the Dynarmic JIT for "
+                     "uncovered code. Performance varies by game.")
+                : tr("Experimental static build with no JIT fallback. Loading and gameplay can "
+                     "be slower; performance varies by game."));
+        row.append(build_item);
+        row.append(new GameListItem(QStringLiteral("Native")));
+        row.append(new GameListItem);
+        row.append(new GameListItem(backend_label));
+        row.append(new GameListItemSize(static_cast<qulonglong>(info.size())));
+        row.append(new GameListItemPlayTime(0));
+        static_dir->appendRow(row);
+    }
+
+    int insert_at = item_model->invisibleRootItem()->rowCount();
+    if (insert_at > 0 &&
+        item_model->invisibleRootItem()
+                ->child(insert_at - 1)
+                ->data(GameListItem::TypeRole)
+                .value<GameListItemType>() == GameListItemType::AddDir) {
+        --insert_at;
+    }
+    item_model->invisibleRootItem()->insertRow(insert_at, static_dir);
+    tree_view->setExpanded(static_dir->index(), true);
+}
+
 void GameList::ValidateEntry(const QModelIndex& item) {
     const auto selected = item.sibling(item.row(), 0);
 
@@ -686,6 +736,16 @@ void GameList::PopupContextMenu(const QPoint& menu_location) {
         break;
     }
     context_menu.exec(tree_view->viewport()->mapToGlobal(menu_location));
+}
+
+void GameList::AddStaticBuildPopup(QMenu& context_menu, const QString& executable) {
+    QAction* launch = context_menu.addAction(tr("Launch AOT build"));
+    QAction* open_folder = context_menu.addAction(tr("Open build folder"));
+    connect(launch, &QAction::triggered, this,
+            [this, executable] { emit LaunchStaticBuildRequested(executable); });
+    connect(open_folder, &QAction::triggered, this, [this, executable] {
+        emit OpenDirectory(QFileInfo(executable).absolutePath());
+    });
 }
 
 void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::string& path,
@@ -1058,6 +1118,11 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
             Qt::QueuedConnection);
 
     QThreadPool::globalInstance()->start(current_worker.get());
+}
+
+void GameList::ShutdownPopulate() {
+    population_shutdown = true;
+    CancelPopulate();
 }
 
 void GameList::CancelPopulate() {

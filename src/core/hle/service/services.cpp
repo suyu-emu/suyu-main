@@ -29,6 +29,7 @@
 #include "core/hle/service/hid/hid.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/i2c/i2c.h"
+#ifndef SUYU_NO_JIT
 #include "core/hle/service/jit/jit.h"
 #endif
 #include "core/hle/service/lbl/lbl.h"

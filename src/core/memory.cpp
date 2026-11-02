@@ -111,6 +111,13 @@ struct Memory::Impl {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
 
+        // Before the fastmem early-out: the recompiler needs every permission
+        // change on its code (ABI 6 GG1), fastmem arena or not.
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnProtect(page_table.entries.data(), vaddr, size,
+                                            True(perms & Common::MemoryPermission::Write));
+        }
+
         if (!current_page_table->fastmem_arena) {
             return;
         }
@@ -701,6 +708,8 @@ struct Memory::Impl {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ 0x{:016X} = 0x{:016X}", sizeof(T) * 8, addr, u64(data));
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
+            NoteRecompWrite(addr, sizeof(T));
+        }
     }
 
     template <typename T>

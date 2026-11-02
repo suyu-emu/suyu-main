@@ -1564,7 +1564,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
             return;
         }
-        constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        if (gpu_addr == overlap.gpu_addr && CanAliasDifferentSamples(new_info, overlap.info)) {
+            options |= RelaxedOptions::Samples;
+        }
         const ImageBase new_image_base(new_info, gpu_addr, cpu_addr);
         if (IsSubresource(new_info, overlap, gpu_addr, options, broken_views, native_bgr)) {
             join_left_aliased_ids.push_back(overlap_id);

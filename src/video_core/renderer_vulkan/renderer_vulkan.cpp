@@ -182,6 +182,13 @@ try
 
     is_headless = (render_window.GetWindowInfo().type == Core::Frontend::WindowSystemType::Headless);
 
+    if (External::IsActive()) {
+        auto& external = External::GetContext();
+        external.device = *device.GetLogical();
+        external.queue = *device.GetGraphicsQueue();
+        external.queue_family = device.GetGraphicsFamily();
+    }
+
     if (Settings::values.renderer_force_max_clock.GetValue() && device.ShouldBoostClocks()) {
         turbo_mode.emplace(instance, dld);
         scheduler.RegisterOnSubmit([this] { turbo_mode->QueueSubmitted(); });
@@ -218,7 +225,9 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
         RenderScreenshot(framebuffers);
 
-        if (!framebuffers.empty()) {
+        if (External::IsActive()) {
+            PresentExternal(framebuffers);
+        } else if (!framebuffers.empty()) {
             const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
             headless_width = layout.width;
             headless_height = layout.height;

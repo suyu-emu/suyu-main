@@ -89,7 +89,6 @@ VirtualFile BISFactory::OpenPartitionStorage(BisPartitionId id,
     // keys from the console data (BOOT0, fuses, package2); keys come only from key files.
     Core::Crypto::PartitionDataManager pdm{file_system->OpenDirectory(
         Common::FS::GetSuyuPathString(Common::FS::SuyuPath::NANDDir), OpenMode::Read)};
-    keys.PopulateFromPartitionData(pdm);
 
     switch (id) {
     case BisPartitionId::CalibrationBinary:
