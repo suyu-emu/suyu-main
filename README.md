@@ -279,6 +279,10 @@ See [Legal.MD](https://github.com/suyu-emu/LEGAL.MD).
 
 Nintendo Switch 2 emulation builds upon the same legal foundations as Nintendo Switch emulation. The suyu Emulator does not circumvent Nintendo's technological protection measures for Switch 2 software, as users are required to provide their own Switch 2 software and encryption keys, which they must lawfully acquire. The Switch 2's use of standard encryption (AES) and the requirement for user-provided keys places it under the same interoperability exemptions (DMCA Section 1201(f)) that apply to Switch 1 emulation. Additionally, Switch 2 emulation benefits from the fact that the Switch 2 platform shares significant architectural similarities with the original Switch, further reducing any potential legal exposure related to reverse engineering for interoperability purposes.
 
+### Nintendo Switch 2
+
+Nintendo Switch 2 emulation builds upon the same legal foundations as Nintendo Switch emulation. The suyu Emulator does not circumvent Nintendo's technological protection measures for Switch 2 software, as users are required to provide their own Switch 2 software and encryption keys, which they must lawfully acquire. The Switch 2's use of standard encryption (AES) and the requirement for user-provided keys places it under the same interoperability exemptions (DMCA Section 1201(f)) that apply to Switch 1 emulation. Additionally, Switch 2 emulation benefits from the fact that the Switch 2 platform shares significant architectural similarities with the original Switch, further reducing any potential legal exposure related to reverse engineering for interoperability purposes.
+
 ## Nextendo Network (experimental)
 
 This fork includes an opt-in Nextendo DNS redirection layer. It does not ship Nintendo
