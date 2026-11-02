@@ -16,7 +16,7 @@ suyu. Without that file and those keys an export does not run.
 > with your game content and keys. The exporter does not check who owns the game, and nothing about how an
 > export is made shows that it may be shared. Do not upload exports, or logs and dumps
 > made with them, to suyu's release or support channels.
-
+>
 > **Re-export Static and Hybrid packages for v14.0.1.** The graphics defaults and
 > host fixes are embedded in each game's package. Updating suyu alone does not change an existing
 > game executable. Packages made with v0.0.10 or earlier still need regeneration
@@ -100,6 +100,7 @@ run a game.
   package's `README_NATIVE_EXPORT.txt` say which compiler it used. To choose a
   particular `clang-cl.exe`, set `SUYU_CLANG_CL` to its path; to use Microsoft's
   compiler anyway, set `SUYU_RECOMP_COMPILER=msvc`.
+
 - **Source (developers)** writes the generated C project, its `CMakeLists.txt` and a
   build script, and stops there. It does not include a compiled program, so the result
   is not playable; it is for compiling elsewhere or inspecting the generated code. This
@@ -120,13 +121,13 @@ export continue on the JIT for that module. Clear it to stop the export instead.
 
 The **Update** row shows which update the export will use:
 
-| Message | Meaning |
-|---|---|
-| Update X is available and turned on | The export uses that update. |
-| Update included in this game file | The game file carries its own update, and the export uses it. |
-| Updates are turned off for this game | Turn them on in the game's **Properties > Add-Ons**. |
-| The installed update cannot be read | Reinstall it, or check your keys. Otherwise the export uses the base game. |
-| No update installed | The export uses the base game version. |
+|               Message                |                                  Meaning                                   |
+|--------------------------------------|----------------------------------------------------------------------------|
+| Update X is available and turned on  | The export uses that update.                                               |
+| Update included in this game file    | The game file carries its own update, and the export uses it.              |
+| Updates are turned off for this game | Turn them on in the game's **Properties > Add-Ons**.                       |
+| The installed update cannot be read  | Reinstall it, or check your keys. Otherwise the export uses the base game. |
+| No update installed                  | The export uses the base game version.                                     |
 
 When an update is used, a **From:** line shows where it comes from.
 
@@ -229,11 +230,11 @@ install it first.
 
 What is needed when:
 
-| | At export time | When the exported game runs |
-|---|---|---|
-| Game file | Yes, to read and translate it | Yes, every time; the package has no game data |
-| Keys | Yes, for encrypted game files | Yes, from the installed suyu, to decrypt the game file |
-| Firmware | No (suyu warns if none is installed) | From the installed suyu; some screens need it |
+|           |            At export time            |              When the exported game runs               |
+|-----------|--------------------------------------|--------------------------------------------------------|
+| Game file | Yes, to read and translate it        | Yes, every time; the package has no game data          |
+| Keys      | Yes, for encrypted game files        | Yes, from the installed suyu, to decrypt the game file |
+| Firmware  | No (suyu warns if none is installed) | From the installed suyu; some screens need it          |
 
 Keys that decrypt a game, and hashes or checks that match a game's content, do not show
 who owns the game or that it may be shared.
@@ -318,3 +319,4 @@ to the game's `.exe`.
 - Standalone `.nca` exports stop when an installed update changes RomFS.
 - A repeat export always builds from scratch; it no longer reuses generated code left
   in an earlier package.
+

@@ -6,12 +6,12 @@ legible.
 
 ## Base
 
-| | |
-|---|---|
-| upstream | `suyu-emu/suyu-v0.0.4` (archived) |
-| commit | `d1d09321d7ab84252291e05b3efbc8a8dfa57481` |
-| tag | `v0.04-latest` |
-| license | GPL-3.0-or-later (with GPL-2.0-or-later files inherited from yuzu) |
+|          |                                                                    |
+|----------|--------------------------------------------------------------------|
+| upstream | `suyu-emu/suyu-v0.0.4` (archived)                                  |
+| commit   | `d1d09321d7ab84252291e05b3efbc8a8dfa57481`                         |
+| tag      | `v0.04-latest`                                                     |
+| license  | GPL-3.0-or-later (with GPL-2.0-or-later files inherited from yuzu) |
 
 Upstream is inconsistent about its own version: the repository is named
 `suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
