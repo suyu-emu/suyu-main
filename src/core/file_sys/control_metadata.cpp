@@ -24,24 +24,6 @@
 
 namespace FileSys {
 
-bool IsValidControlMetadata(const NCA& nca, u64 program_id) {
-    if (nca.GetStatus() != Loader::ResultStatus::Success ||
-        nca.GetType() != NCAContentType::Control ||
-        GetBaseTitleID(nca.GetTitleId()) != GetBaseTitleID(program_id) || !nca.GetRomFS()) {
-        return false;
-    }
-    const auto directory = ExtractRomFS(nca.GetRomFS());
-    if (!directory) {
-        return false;
-    }
-    auto file = directory->GetFile("control.nacp");
-    if (!file) {
-        file = directory->GetFile("Control.nacp");
-    }
-    std::array<u8, sizeof(RawNACP)> data{};
-    return file && file->Read(data.data(), data.size()) == data.size();
-}
-
 const std::array<const char*, size_t(Language::Count)> LANGUAGE_NAMES{{
     "AmericanEnglish",
     "BritishEnglish",

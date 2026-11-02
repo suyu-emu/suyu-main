@@ -175,12 +175,19 @@ void DiscordImpl::Update() {
                                    std::chrono::system_clock::now().time_since_epoch())
                                    .count();
 
-        // Published right away with the cached cover or the suyu logo. An uncached cover is
-        // looked up on Wikipedia, which receives the title, and replaces the logo when found.
-        LookUpCover();
-        LOG_INFO(Frontend, "Discord presence: publishing \"{}\" with image key {}", game_title,
-                 game_url.empty() ? default_image : game_url);
-        UpdateGameStatus();
+        // Used to format Icon URL for suyu website game compatibility page
+        std::string icon_name = GetGameString(game_title);
+        game_url = fmt::format("https://suyu.dev/images/game/boxart/{}.png", icon_name);
+
+        QNetworkAccessManager manager;
+        QNetworkRequest request;
+        request.setUrl(QUrl(QString::fromStdString(game_url)));
+        request.setTransferTimeout(3000);
+        QNetworkReply* reply = manager.head(request);
+        QEventLoop request_event_loop;
+        QObject::connect(reply, &QNetworkReply::finished, &request_event_loop, &QEventLoop::quit);
+        request_event_loop.exec();
+        UpdateGameStatus(reply->error());
         return;
     }
 

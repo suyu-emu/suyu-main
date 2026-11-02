@@ -75,11 +75,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "faster or not.\n200% for a 30 FPS game is 60 FPS, and for a "
               "60 FPS game it will be 120 FPS.\nDisabling it means unlocking the framerate to the "
               "maximum your PC can reach."));
-    INSERT(Settings, slow_speed_limit, tr("Slow Speed"),
-           tr("Speed limit used while the Slow Speed hotkey is active."));
-    INSERT(Settings, turbo_speed_limit, tr("Turbo Speed"),
-           tr("Speed limit used while the Turbo Speed hotkey is active."));
-    INSERT(Settings, current_speed_mode, QStringLiteral(), QStringLiteral());
     INSERT(Settings, sync_core_speed, tr("Synchronize core speed"),
            tr("Synchronizes CPU core speed to game's maximum rendering speed, which can be useful to "
               "increase FPS without increasing the actual speed of the game (animations, physics, etc.)\n"
@@ -94,11 +89,6 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Select the CPU execution backend.\n"
               "Dynarmic: portable JIT recompiler (default).\n"
               "NCE: native code execution on compatible ARM64 hosts."));
-    INSERT(Settings, cache_affinity, tr("Prefer the cores with the largest L3 cache"),
-           tr("On CPUs whose L3 caches differ in size, such as Ryzen X3D parts with stacked cache "
-              "on one die, runs the emulator on the cores sharing the largest L3.\nDoes nothing "
-              "when every L3 is the same size or the CPU affinity is already restricted. Applies "
-              "when a game starts."));
 
     // Cpu Debug
 
@@ -241,29 +231,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Enables Fast GPU Time. This option will force most games to run at their highest "
               "native resolution."));
     INSERT(Settings, fast_gpu_time, tr("Fast GPU Time divisor (Hack)"),
-           tr("Selects the GPU tick divisor while Fast GPU Time is enabled. Normal keeps the "
-              "original tick rate; the other choices divide ticks by 256 or 512."));
-    INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU inner invalidation (Hack)"),
-           tr("Skips invalidating cached GPU data after CPU memory changes. May improve performance "
-              "but can cause incorrect rendering."));
-    INSERT(Settings, fix_bloom_effects, tr("Fix bloom effects (Hack)"),
-           tr("Uses an alternate depth-to-color blit for bloom effects. Requires a restart."));
-    INSERT(Settings, emulate_bgr565, tr("Emulate BGR565 textures (Hack)"),
-           tr("Emulates BGR565 texture support for Vulkan. Requires a restart."));
-    INSERT(Settings, rescale_hack, tr("Enable legacy rescale pass (Hack)"),
-           tr("Uses legacy shader rescaling behavior as a compatibility workaround. "
-              "Requires a restart."));
-    INSERT(Settings, gpu_unswizzle_enabled, tr("Use GPU texture unswizzling (Hack)"),
-           tr("Uses Vulkan compute to decode supported textures. Disable if it causes driver or "
-              "rendering issues. Requires a restart."));
-    INSERT(Settings, gpu_unswizzle_texture_size, tr("GPU unswizzle texture threshold (MiB)"),
-           tr("Selects the minimum texture size eligible for GPU unswizzling. Requires a restart."));
-    INSERT(Settings, gpu_unswizzle_stream_size, tr("GPU unswizzle stream size (MiB)"),
-           tr("Selects the size of texture data chunks used for GPU unswizzling. "
-              "Requires a restart."));
-    INSERT(Settings, gpu_unswizzle_chunk_size, tr("GPU unswizzle batch size (slices)"),
-           tr("Selects the number of depth slices processed in each GPU dispatch. Larger batches "
-              "can increase the risk of driver timeouts. Requires a restart."));
+           tr("Overclocks the emulated GPU to increase dynamic resolution and render distance.\n"
+              "Use 128 for maximal performance and 512 for maximal graphics fidelity (default 256)."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "

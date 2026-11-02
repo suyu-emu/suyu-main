@@ -6,12 +6,9 @@
 #include <string>
 
 #ifdef SUYU_CMD_STATIC_RECOMP
-#include <cstdint>
 #include <filesystem>
 #ifdef _WIN32
 #include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
 #endif
 #endif
 
@@ -33,53 +30,18 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     // generic "suyu ..." title that would otherwise flash for a moment
     // before the game's own title gets set later in the boot sequence.
     const std::string window_title = [] {
-        std::filesystem::path exe;
-#if defined(_WIN32)
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
-        exe = exe_w;
-#elif defined(__APPLE__)
-        // Ask for the length first; the answer can exceed PATH_MAX once
-        // symlinks and bundle nesting are in play.
-        std::uint32_t size = 0;
-        _NSGetExecutablePath(nullptr, &size);
-        std::string buffer;
-        buffer.resize(size);
-        if (size != 0 && _NSGetExecutablePath(buffer.data(), &size) == 0) {
-            exe = buffer.c_str();
-        }
-#else
-        std::error_code ec;
-        exe = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (ec) {
-            exe.clear();
-        }
-#endif
-        // A generic name beats an empty title bar when the lookup fails.
-        return exe.empty() ? std::string{"suyu"} : exe.stem().string();
+        return std::filesystem::path(exe_w).stem().string();
     }();
 #else
     const std::string window_title = fmt::format("suyu {} | {}-{} (Vulkan)", Common::g_build_name,
                                                  Common::g_scm_branch, Common::g_scm_desc);
 #endif
-    // A binary launched outside an .app bundle is treated as a background
-    // application on macOS, so its window opens behind whatever has focus and the
-    // compositor throttles it. Asking for foreground treatment before the window
-    // exists is what makes the later raise take effect.
-    const bool headless_capture = std::getenv("SUYU_CMD_CAPTURE_HEADLESS") != nullptr;
-    if (!headless_capture) {
-        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "0");
-    }
-
-    auto window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (headless_capture) {
-        window_flags |= SDL_WINDOW_HIDDEN;
-    }
-
     render_window =
         SDL_CreateWindow(window_title.c_str(),
                          Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height,
-                         window_flags);
+                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
     if (render_window == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create SDL3 window: {}", SDL_GetError());
@@ -125,14 +87,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     }
 #elif defined(SDL_PLATFORM_MACOS)
     window_info.type = Core::Frontend::WindowSystemType::Cocoa;
-    // VK_EXT_metal_surface takes a CAMetalLayer. The view SDL_Metal_CreateView returns is an
-    // NSView, and MoltenVK raises an Objective-C exception for anything that is not a layer.
-    metal_view = SDL_Metal_CreateView(render_window);
-    window_info.render_surface = metal_view ? SDL_Metal_GetLayer(metal_view) : nullptr;
-    if (window_info.render_surface == nullptr) {
-        LOG_CRITICAL(Frontend, "Failed to get the CAMetalLayer for the window: {}", SDL_GetError());
-        std::exit(EXIT_FAILURE);
-    }
+    window_info.render_surface = SDL_Metal_CreateView(render_window);
 #elif defined(SDL_PLATFORM_ANDROID)
     window_info.type = Core::Frontend::WindowSystemType::Android;
     window_info.render_surface = SDL_GetPointerProperty(
@@ -143,16 +98,7 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
 #endif
     (void)props;
 
-    // Diagnostic captures can run without entering the user's active desktop.
-    // The Vulkan surface still exists and the renderer supplies frame captures.
-    if (!headless_capture) {
-        SDL_ShowWindow(render_window);
-        // Showing a window does not focus it. Without this the window sits behind the
-        // launching terminal, and on macOS a non-frontmost window has its CAMetalLayer
-        // throttled, which looks like an emulator performance problem rather than a
-        // window management one.
-        SDL_RaiseWindow(render_window);
-    }
+    SDL_ShowWindow(render_window);
     OnResize();
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     SDL_PumpEvents();

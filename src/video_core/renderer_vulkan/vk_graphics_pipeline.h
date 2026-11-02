@@ -225,10 +225,6 @@ public:
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
     }
 
-    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
-        return key;
-    }
-
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
         maxwell3d = maxwell3d_;
         gpu_memory = gpu_memory_;
@@ -274,8 +270,6 @@ private:
     size_t num_image_elements{};
     u32 num_textures{};
     bool fragment_has_color0_output{};
-    u64 layout_signature{};
-    bool precompile_only{};
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;

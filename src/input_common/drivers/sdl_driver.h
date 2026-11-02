@@ -118,7 +118,7 @@ private:
 
     /// Map of GUID of a list of corresponding virtual Joysticks
     ankerl::unordered_dense::map<Common::UUID, std::vector<std::shared_ptr<SDLJoystick>>> joystick_map;
-    mutable std::mutex joystick_map_mutex;
+    std::mutex joystick_map_mutex;
 
     bool start_thread = false;
     std::atomic<bool> initialized = false;

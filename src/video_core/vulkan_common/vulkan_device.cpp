@@ -898,8 +898,7 @@ bool Device::ShouldBoostClocks() const {
 }
 
 bool Device::HasTimelineSemaphore() const {
-    if (GetDriverID() == VK_DRIVER_ID_MESA_TURNIP &&
-        properties.properties.driverVersion < VK_MAKE_API_VERSION(0, 23, 2, 0)) {
+    if (GetDriverID() == VK_DRIVER_ID_MESA_TURNIP) {
         return false;
     }
     return features.timeline_semaphore.timelineSemaphore;
@@ -1123,11 +1122,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.transform_feedback.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
-    }
-    if (extensions.graphics_pipeline_library) {
-        properties.graphics_pipeline_library.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
-        SetNext(next, properties.graphics_pipeline_library);
     }
     if (extensions.maintenance5) {
         properties.maintenance5.sType =

@@ -1003,7 +1003,7 @@ void Module::Interface::GetBaasAccountManagerForApplication(HLERequestContext& c
     }
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
-    rb.PushIpcInterface<IManagerForApplication>(ctx, system, profile_manager, uuid);
+    rb.PushIpcInterface<IManagerForApplication>(ctx, system, profile_manager);
 }
 
 void Module::Interface::IsUserAccountSwitchLocked(HLERequestContext& ctx) {

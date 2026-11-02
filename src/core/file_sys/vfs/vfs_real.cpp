@@ -23,7 +23,7 @@
 #define stat _stat64
 #endif
 
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
 #include "common/fs/fs_android.h"
 #endif
 
@@ -306,7 +306,7 @@ RealVfsFile::~RealVfsFile() {
 }
 
 std::string RealVfsFile::GetName() const {
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     if (path[0] != '/') {
         return FS::Android::GetFilename(path);
     }

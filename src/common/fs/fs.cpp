@@ -6,7 +6,7 @@
 
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
 #include "common/fs/fs_android.h"
 #endif
 #include "common/fs/path_util.h"
@@ -480,7 +480,7 @@ void IterateDirEntriesRecursively(const std::filesystem::path& path, const DirEn
 
 bool Exists(const fs::path& path) {
     std::error_code ec;
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     if (Android::IsContentUri(path)) {
         return Android::Exists(path);
     } else {
@@ -493,7 +493,7 @@ bool Exists(const fs::path& path) {
 
 bool IsFile(const fs::path& path) {
     std::error_code ec;
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     if (Android::IsContentUri(path)) {
         return !Android::IsDirectory(path);
     } else {
@@ -506,7 +506,7 @@ bool IsFile(const fs::path& path) {
 
 bool IsDir(const fs::path& path) {
     std::error_code ec;
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     if (Android::IsContentUri(path)) {
         return Android::IsDirectory(path);
     } else {
@@ -559,7 +559,7 @@ fs::file_type GetEntryType(const fs::path& path) {
 }
 
 u64 GetSize(const fs::path& path) {
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     if (Android::IsContentUri(path)) {
         return Android::GetSize(path);
     }

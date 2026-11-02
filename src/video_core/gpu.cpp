@@ -12,7 +12,6 @@
 #include <memory>
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"

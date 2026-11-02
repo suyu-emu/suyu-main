@@ -248,13 +248,6 @@ option(SUYU_BUILD_LIBRETRO_CORE "Build suyu as a libretro core (suyu_libretro.dl
 if (SUYU_BUILD_LIBRETRO_CORE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
-option(SUYU_ANDROID_LIBRETRO "Build Android libretro without standalone app JNI" OFF)
-if (SUYU_ANDROID_LIBRETRO)
-    if (NOT ANDROID OR NOT SUYU_BUILD_LIBRETRO_CORE)
-        message(FATAL_ERROR "SUYU_ANDROID_LIBRETRO requires Android and SUYU_BUILD_LIBRETRO_CORE")
-    endif()
-    add_compile_definitions(SUYU_ANDROID_LIBRETRO)
-endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
 cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" ON "NOT ANDROID" OFF)
@@ -275,9 +268,6 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the suyu-cli executable" ON "NOT ANDROID" OFF)
-if(NOT ENABLE_SDL3 AND (ENABLE_QT OR YUZU_CMD))
-    message(FATAL_ERROR "SDL3-disabled core builds require ENABLE_QT=OFF and YUZU_CMD=OFF")
-endif()
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR PLATFORM_LINUX" OFF)
 
@@ -382,11 +372,6 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(IOS)
-    enable_language(OBJCXX)
-    set(CMAKE_OBJCXX_STANDARD 20)
-    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
-endif()
 
 # Output binaries to bin/
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
@@ -759,53 +744,6 @@ if (MSVC AND CXX_CLANG)
 endif()
 
 add_subdirectory(src)
-if(SUYU_NO_JIT)
-    target_compile_definitions(common PRIVATE SUYU_NO_JIT=1)
-endif()
-
-option(SUYU_BUILD_IOS_CORE_PROBE "Build iHorizon with the real iOS core initialization probe" OFF)
-if(SUYU_BUILD_IOS_CORE_PROBE)
-    if(NOT IOS OR NOT SUYU_NO_JIT)
-        message(FATAL_ERROR "The iHorizon core probe requires iOS and SUYU_NO_JIT")
-    endif()
-    set(IHORIZON_APP_SOURCE "" CACHE PATH "iHorizon launcher source directory")
-    if(NOT EXISTS "${IHORIZON_APP_SOURCE}/apple/main.mm")
-        message(FATAL_ERROR "Set IHORIZON_APP_SOURCE to the iHorizon checkout")
-    endif()
-    add_subdirectory(research/ios)
-    set_property(TARGET iHorizon PROPERTY SOURCES
-        "${IHORIZON_APP_SOURCE}/apple/main.mm"
-        "${CMAKE_CURRENT_SOURCE_DIR}/research/ios/src/core_probe.cpp")
-    target_include_directories(iHorizon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_compile_definitions(iHorizon PRIVATE IHORIZON_WITH_CORE=1)
-    target_compile_options(iHorizon PRIVATE -fno-rtti)
-    target_link_libraries(iHorizon PRIVATE core input_common frontend_common objc ${PLATFORM_LIBRARIES})
-    target_link_libraries(iHorizon PRIVATE "${MOLTENVK_LIBRARY}")
-    # Xcode's simulator SDK does not ship libc++experimental. Keep the global
-    # compile feature flag, but select the ordinary libc++ archive at this final
-    # app link. The physical-device SDK continues to use its existing path.
-    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
-        target_link_options(iHorizon PRIVATE -nostdlib++ -lc++)
-    endif()
-    option(IHORIZON_GAMEPLAY "Build the controlled iOS gameplay frontend" OFF)
-    if(IHORIZON_GAMEPLAY)
-        set(IHORIZON_GAME_IDENTITY_FILE "" CACHE FILEPATH "Private signed content identity manifest")
-        if(NOT EXISTS "${IHORIZON_GAME_IDENTITY_FILE}")
-            message(FATAL_ERROR "Gameplay requires the exact private content identity manifest")
-        endif()
-        target_sources(iHorizon PRIVATE "${IHORIZON_APP_SOURCE}/apple/game_session.mm"
-            "${IHORIZON_APP_SOURCE}/apple/vulkan_probe.mm"
-            "${IHORIZON_APP_SOURCE}/apple/platform_input.mm"
-            "${CMAKE_CURRENT_SOURCE_DIR}/research/ios/src/core_bridge.cpp"
-            "${IHORIZON_GAME_IDENTITY_FILE}")
-        set_source_files_properties("${IHORIZON_GAME_IDENTITY_FILE}" TARGET_DIRECTORY iHorizon
-            PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
-        target_compile_definitions(iHorizon PRIVATE IHORIZON_GAMEPLAY=1)
-        target_link_libraries(iHorizon PRIVATE Vulkan::Headers)
-    endif()
-    set_target_properties(iHorizon PROPERTIES
-        MACOSX_BUNDLE_INFO_PLIST "${IHORIZON_APP_SOURCE}/apple/Info.plist.in")
-endif()
 
 if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-disas)

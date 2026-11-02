@@ -270,19 +270,36 @@ Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {
         if (svc_mem_info.permission == Kernel::Svc::MemoryPermission::ReadExecute &&
             (svc_mem_info.state == Kernel::Svc::MemoryState::Code ||
              svc_mem_info.state == Kernel::Svc::MemoryState::AliasCode)) {
-            // Try to read the module name from its path, which starts the
-            // read-only segment right after the code.
-            std::array<u8, Core::RecompGaps::kRodataModuleNameBytes> rodata{};
-            const VAddr rodata_start = svc_mem_info.base_address + svc_mem_info.size;
-            // The longest read can run past a small module's last mapped page;
-            // the older layout never needed its first 12 bytes.
-            const bool read = memory.ReadBlock(rodata_start, rodata.data(), rodata.size()) ||
-                              memory.ReadBlock(rodata_start, rodata.data(), rodata.size() - 12);
-            if (read) {
-                std::string name =
-                    Core::RecompGaps::ModuleNameFromRodata(rodata.data(), rodata.size());
-                if (!name.empty()) {
-                    modules.emplace(svc_mem_info.base_address, std::move(name));
+            // Try to read the module name from its path.
+            constexpr s32 PathLengthMax = 0x200;
+            struct {
+                u32 zero;
+                s32 path_length;
+                std::array<char, PathLengthMax> path;
+            } module_path;
+
+            if (memory.ReadBlock(svc_mem_info.base_address + svc_mem_info.size, &module_path,
+                                 sizeof(module_path))) {
+                if (module_path.zero == 0 && module_path.path_length > 0) {
+                    // Truncate module name.
+                    module_path.path[PathLengthMax - 1] = '\0';
+
+                    // Ignore leading directories.
+                    char* path_pointer = module_path.path.data();
+                    char* path_end =
+                        path_pointer + (std::min)(PathLengthMax, module_path.path_length);
+
+                    for (s32 i = 0; i < (std::min)(PathLengthMax, module_path.path_length) &&
+                                    module_path.path[i] != '\0';
+                         i++) {
+                        if (module_path.path[i] == '/' || module_path.path[i] == '\\') {
+                            path_pointer = module_path.path.data() + i + 1;
+                        }
+                    }
+
+                    // Insert output.
+                    modules.emplace(svc_mem_info.base_address,
+                                    std::string_view(path_pointer, path_end));
                 }
             }
         }

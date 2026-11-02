@@ -159,7 +159,6 @@ private:
 
     ankerl::unordered_dense::map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     ankerl::unordered_dense::map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
-    GraphicsPipelineLibraryCache graphics_library_cache;
 
     ShaderPools main_pools;
 

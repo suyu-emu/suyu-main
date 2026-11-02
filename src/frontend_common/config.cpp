@@ -299,7 +299,7 @@ void Config::ReadDataStorageValues() {
     using namespace Common::FS;
 
     const auto setPath = [this](const SuyuPath& path, const char* setting) {
-        SetSuyuPath(path, ResolveStoredPath(ReadStringSetting(std::string(setting))));
+        SetSuyuPath(path, ReadStringSetting(std::string(setting)));
     };
 
     setPath(SuyuPath::NANDDir, "nand_directory");
@@ -312,7 +312,7 @@ void Config::ReadDataStorageValues() {
     if (save_dir_setting.empty()) {
         SetSuyuPath(SuyuPath::SaveDir, GetSuyuPathString(SuyuPath::NANDDir));
     } else {
-        SetSuyuPath(SuyuPath::SaveDir, ResolveStoredPath(save_dir_setting));
+        SetSuyuPath(SuyuPath::SaveDir, save_dir_setting);
     }
 
     ReadCategory(Settings::Category::DataStorage);
@@ -398,7 +398,7 @@ void Config::ReadScreenshotValues() {
 
     ReadCategory(Settings::Category::Screenshots);
     FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir,
-                    ResolveStoredPath(ReadStringSetting(std::string("screenshot_path"))));
+                    ReadStringSetting(std::string("screenshot_path")));
 
     EndGroup();
 }
@@ -596,8 +596,8 @@ void Config::SaveDataStorageValues() {
     using namespace Common::FS;
 
     const auto writePath = [this](const char* setting, const SuyuPath& path) {
-        WriteStringSetting(std::string(setting), ToStoredPath(FS::GetSuyuPathString(path)),
-                           std::make_optional(ToStoredPath(FS::GetSuyuPathString(path))));
+        WriteStringSetting(std::string(setting), FS::GetSuyuPathString(path),
+                           std::make_optional(FS::GetSuyuPathString(path)));
     };
 
     writePath("nand_directory", SuyuPath::NANDDir);
@@ -697,7 +697,7 @@ void Config::SaveScreenshotValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Screenshots));
 
     WriteStringSetting(std::string("screenshot_path"),
-                       ToStoredPath(FS::GetSuyuPathString(FS::SuyuPath::ScreenshotsDir)));
+                       FS::GetSuyuPathString(FS::SuyuPath::ScreenshotsDir));
     WriteCategory(Settings::Category::Screenshots);
 
     EndGroup();

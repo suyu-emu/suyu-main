@@ -1,12 +1,6 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <cstdlib>
-#include <cwchar>
-#include <set>
-#include <string>
-#include <vector>
 #include <SDL3/SDL.h>
 // SDL3 removed these constants; define compat shims
 static constexpr Uint8 SDL_PRESSED = 1;
@@ -26,7 +20,6 @@ static constexpr Uint8 SDL_RELEASED = 0;
 #include "input_common/main.h"
 #include "common/param_package.h"
 #include "common/settings_input.h"
-#include "suyu_cmd/controller_assign.h"
 #include "suyu_cmd/emu_window/emu_window_sdl2.h"
 #include "suyu_cmd/native_status.h"
 #include "suyu_cmd/sdl_config.h"
@@ -802,6 +795,469 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
 } // namespace
 #endif
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <shellapi.h>
+#include <cstdio>
+#include <array>
+#include <filesystem>
+#include <iterator>
+#include <vector>
+#include <system_error>
+#include <string>
+#include <vector>
+
+// ── F12 debug panel ─────────────────────────────────────────────────────────
+// A real interactive window (not a message box): live status text refreshed on
+// a timer, a list of the mod folders currently visible to the patch manager,
+// and buttons that open the folders this build actually uses. Deliberately
+// carries no emulator branding — an exported game shows the game's own name.
+namespace {
+
+constexpr int kIdStatus = 1001;
+constexpr int kIdMods = 1002;
+constexpr int kIdOpenUser = 1003;
+constexpr int kIdOpenMods = 1004;
+constexpr int kIdOpenKeys = 1005;
+constexpr int kIdClose = 1006;
+constexpr int kIdDevices = 1007;
+constexpr int kIdApplyPad = 1008;
+constexpr int kIdKeyboard = 1009;
+constexpr int kIdRescanPads = 1010;
+constexpr int kIdBindList = 1011;
+constexpr int kIdBindOne = 1012;
+constexpr int kIdClearOne = 1013;
+constexpr UINT_PTR kTimer = 1;
+
+std::filesystem::path DevExeDir() {
+    wchar_t exe_path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+    return std::filesystem::path(exe_path).parent_path();
+}
+
+std::wstring DevKeysDir() {
+    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::KeysDir).wstring();
+}
+
+void DevOpen(const std::filesystem::path& p) {
+    std::error_code ec;
+    std::filesystem::create_directories(p, ec);
+    ShellExecuteW(nullptr, L"explore", p.wstring().c_str(), nullptr, nullptr, SW_SHOW);
+}
+
+struct DevPanelState {
+    Core::System* system{};
+    InputCommon::InputSubsystem* input{};
+    HWND status{};
+    HWND mods{};
+    HWND devices{};
+    HWND binds{};
+    std::vector<Common::ParamPackage> device_list;
+};
+
+// Per-button remapping. Auto-map covers the common case; this covers the rest -
+// pick the entry, press the input you want, done. Same "press what you want"
+// flow the emulator's own input dialog uses, driven off the input backend's
+// polling API rather than a second mapping implementation.
+void DevRefreshBinds(DevPanelState& st) {
+    const int sel = static_cast<int>(SendMessageW(st.binds, LB_GETCURSEL, 0, 0));
+    SendMessageW(st.binds, LB_RESETCONTENT, 0, 0);
+    const auto& player = Settings::values.players.GetValue()[0];
+    const auto add = [&](const char* label, const std::string& param) {
+        Common::ParamPackage pkg{param};
+        std::string shown = param.empty() ? "(unset)" : pkg.Get("display", param);
+        if (shown.size() > 60) {
+            shown.resize(60);
+        }
+        const std::string line = std::string(label) + "  =  " + shown;
+        const std::wstring wide(line.begin(), line.end());
+        SendMessageW(st.binds, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
+    };
+    for (std::size_t i = 0; i < Settings::NativeButton::NumButtons; ++i) {
+        add(Settings::NativeButton::mapping[i], player.buttons[i]);
+    }
+    for (std::size_t i = 0; i < Settings::NativeAnalog::NumAnalogs; ++i) {
+        add(Settings::NativeAnalog::mapping[i], player.analogs[i]);
+    }
+    if (sel >= 0) {
+        SendMessageW(st.binds, LB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+    }
+}
+
+void DevBindSelected(DevPanelState& st, bool clear) {
+    const int sel = static_cast<int>(SendMessageW(st.binds, LB_GETCURSEL, 0, 0));
+    constexpr int kButtonCount = static_cast<int>(Settings::NativeButton::NumButtons);
+    constexpr int kAnalogCount = static_cast<int>(Settings::NativeAnalog::NumAnalogs);
+    if (sel < 0 || sel >= kButtonCount + kAnalogCount || st.input == nullptr) {
+        return;
+    }
+    const bool is_analog = sel >= kButtonCount;
+    auto& player = Settings::values.players.GetValue()[0];
+
+    if (clear) {
+        if (is_analog) {
+            player.analogs[sel - kButtonCount].clear();
+        } else {
+            player.buttons[sel].clear();
+        }
+        DevRefreshBinds(st);
+        return;
+    }
+
+    st.input->BeginMapping(is_analog ? InputCommon::Polling::InputType::Stick
+                                     : InputCommon::Polling::InputType::Button);
+    // Poll rather than block: the panel owns the message loop, and a modal
+    // "press something" dialog with no way out is worse than a timeout.
+    Common::ParamPackage captured;
+    const DWORD deadline = GetTickCount() + 5000;
+    while (GetTickCount() < deadline) {
+        captured = st.input->GetNextInput();
+        if (captured.Has("engine")) {
+            break;
+        }
+        MSG m;
+        while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        Sleep(10);
+    }
+    st.input->StopMapping();
+
+    if (!captured.Has("engine")) {
+        MessageBoxW(nullptr, L"No input detected - nothing changed.", L"Controls",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (is_analog) {
+        player.analogs[sel - kButtonCount] = captured.Serialize();
+    } else {
+        player.buttons[sel] = captured.Serialize();
+    }
+    player.connected = true;
+    if (st.system != nullptr) {
+        st.system->HIDCore().ReloadInputDevices();
+    }
+    DevRefreshBinds(st);
+}
+
+// Controller setup, done the way a player expects: pick the pad from a list and
+// press one button. The full per-button remapper belongs in the emulator's own
+// UI - what a shipped game build needs is for a plugged-in pad to just work,
+// and a way back to keyboard when it does not.
+void DevRefreshDevices(DevPanelState& st) {
+    SendMessageW(st.devices, CB_RESETCONTENT, 0, 0);
+    st.device_list.clear();
+    if (st.input == nullptr) {
+        return;
+    }
+    for (const auto& device : st.input->GetInputDevices()) {
+        const std::string name = device.Get("display", device.Get("class", "Unknown"));
+        if (name == "Any" || name == "Keyboard/Mouse") {
+            continue;
+        }
+        st.device_list.push_back(device);
+        const std::wstring wide(name.begin(), name.end());
+        SendMessageW(st.devices, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
+    }
+    if (st.device_list.empty()) {
+        SendMessageW(st.devices, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(L"(no controller detected - plug one in and rescan)"));
+    }
+    SendMessageW(st.devices, CB_SETCURSEL, 0, 0);
+}
+
+void DevApplyPadMapping(DevPanelState& st) {
+    const auto index = static_cast<std::size_t>(SendMessageW(st.devices, CB_GETCURSEL, 0, 0));
+    if (st.input == nullptr || index >= st.device_list.size()) {
+        MessageBoxW(nullptr, L"No controller selected.", L"Controls", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const auto& device = st.device_list[index];
+    // GetValue() hands back a reference to the live array, so the mappings are
+    // written straight into the setting.
+    auto& player = Settings::values.players.GetValue()[0];
+    for (const auto& [button, param] : st.input->GetButtonMappingForDevice(device)) {
+        player.buttons[button] = param.Serialize();
+    }
+    for (const auto& [analog, param] : st.input->GetAnalogMappingForDevice(device)) {
+        player.analogs[analog] = param.Serialize();
+    }
+    for (const auto& [motion, param] : st.input->GetMotionMappingForDevice(device)) {
+        player.motions[motion] = param.Serialize();
+    }
+    player.connected = true;
+    if (st.system != nullptr) {
+        st.system->HIDCore().ReloadInputDevices();
+    }
+    MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
+                MB_OK | MB_ICONINFORMATION);
+}
+
+void DevApplyKeyboardMapping(DevPanelState& st) {
+    // Same layout the emulator ships as its keyboard default.
+    static constexpr std::array<int, Settings::NativeButton::NumButtons> kButtons = {
+        SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_Z, SDL_SCANCODE_X,
+        SDL_SCANCODE_T, SDL_SCANCODE_G, SDL_SCANCODE_F, SDL_SCANCODE_H,
+        SDL_SCANCODE_Q, SDL_SCANCODE_W, SDL_SCANCODE_M, SDL_SCANCODE_N,
+        SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_B,
+    };
+    static constexpr std::array<std::array<int, 4>, Settings::NativeAnalog::NumAnalogs> kAnalogs{{
+        {SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT},
+        {SDL_SCANCODE_I, SDL_SCANCODE_K, SDL_SCANCODE_J, SDL_SCANCODE_L},
+    }};
+    // GetValue() hands back a reference to the live array, so the mappings are
+    // written straight into the setting.
+    auto& player = Settings::values.players.GetValue()[0];
+    for (std::size_t i = 0; i < kButtons.size() && i < player.buttons.size(); ++i) {
+        player.buttons[i] = InputCommon::GenerateKeyboardParam(kButtons[i]);
+    }
+    for (std::size_t i = 0; i < kAnalogs.size() && i < player.analogs.size(); ++i) {
+        player.analogs[i] = InputCommon::GenerateAnalogParamFromKeys(
+            kAnalogs[i][0], kAnalogs[i][1], kAnalogs[i][2], kAnalogs[i][3], 0, 0.5f);
+    }
+    player.connected = true;
+    if (st.system != nullptr) {
+        st.system->HIDCore().ReloadInputDevices();
+    }
+    MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
+                MB_OK | MB_ICONINFORMATION);
+}
+
+std::wstring DevStatusText(Core::System& system) {
+    std::string game_name;
+    [[maybe_unused]] auto _ = system.GetGameName(game_name);
+    const auto perf = system.GetAndResetPerfStats();
+    wchar_t buf[2048];
+    const auto exe_dir = DevExeDir();
+    swprintf(buf, std::size(buf),
+             L"Title:        %hs\r\n"
+             L"Title ID:     %016llX\r\n"
+             L"FPS:          %.1f   Speed: %.0f%%   Frame: %.2f ms\r\n"
+             L"CPU backend:  %hs\r\n"
+             L"\r\n"
+             L"User data:    %s\r\n"
+             L"Mods:         %s\r\n"
+             L"Keys:         %s\r\n",
+             game_name.empty() ? "(not loaded)" : game_name.c_str(),
+             static_cast<unsigned long long>(system.GetApplicationProcessProgramID()),
+             perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
+             g_native_export_mode ? "ArmRecomp (static recompiled modules)" : "dynarmic JIT",
+             (exe_dir / L"user").wstring().c_str(), (exe_dir / L"mods").wstring().c_str(),
+             DevKeysDir().c_str());
+    return buf;
+}
+
+void DevRefreshMods(HWND list) {
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    const auto mods_dir = DevExeDir() / L"mods";
+    bool any = false;
+    std::error_code ec;
+    if (std::filesystem::is_directory(mods_dir, ec)) {
+        for (const auto& tid : std::filesystem::directory_iterator(mods_dir, ec)) {
+            if (!tid.is_directory()) {
+                continue;
+            }
+            for (const auto& mod : std::filesystem::directory_iterator(tid.path(), ec)) {
+                const std::wstring entry =
+                    tid.path().filename().wstring() + L"  /  " + mod.path().filename().wstring();
+                SendMessageW(list, LB_ADDSTRING, 0,
+                             reinterpret_cast<LPARAM>(entry.c_str()));
+                any = true;
+            }
+        }
+    }
+    if (!any) {
+        SendMessageW(list, LB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(L"(none - drop <title id>/<mod name>/ into mods/)"));
+    }
+}
+
+LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* st = reinterpret_cast<DevPanelState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_TIMER:
+        if (st != nullptr && st->system != nullptr) {
+            SetWindowTextW(st->status, DevStatusText(*st->system).c_str());
+        }
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case kIdOpenUser:
+            DevOpen(DevExeDir() / L"user");
+            return 0;
+        case kIdOpenMods:
+            DevOpen(DevExeDir() / L"mods");
+            return 0;
+        case kIdOpenKeys:
+            DevOpen(DevKeysDir());
+            return 0;
+        case kIdClose:
+            DestroyWindow(hwnd);
+            return 0;
+        case kIdRescanPads:
+            if (st != nullptr) {
+                DevRefreshDevices(*st);
+            }
+            return 0;
+        case kIdApplyPad:
+            if (st != nullptr) {
+                DevApplyPadMapping(*st);
+                DevRefreshBinds(*st);
+            }
+            return 0;
+        case kIdKeyboard:
+            if (st != nullptr) {
+                DevApplyKeyboardMapping(*st);
+                DevRefreshBinds(*st);
+            }
+            return 0;
+        case kIdBindOne:
+            if (st != nullptr) {
+                DevBindSelected(*st, false);
+            }
+            return 0;
+        case kIdClearOne:
+            if (st != nullptr) {
+                DevBindSelected(*st, true);
+            }
+            return 0;
+        case kIdBindList:
+            if (HIWORD(wp) == LBN_DBLCLK && st != nullptr) {
+                DevBindSelected(*st, false);
+            }
+            return 0;
+        case kIdMods:
+            if (HIWORD(wp) == LBN_DBLCLK && st != nullptr) {
+                DevRefreshMods(st->mods);
+            }
+            return 0;
+        default:
+            break;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, kTimer);
+        PostQuitMessage(0);
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
+    static bool registered = false;
+    static const wchar_t* kClass = L"SuyuGameDebugPanel";
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = DevPanelProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = kClass;
+        wc.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1),
+                                                 IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    std::string game_name;
+    [[maybe_unused]] auto _ = system.GetGameName(game_name);
+    const std::wstring title =
+        (game_name.empty() ? std::wstring(L"Game") : std::wstring(game_name.begin(), game_name.end())) +
+        L" - Debug Panel (F12)";
+
+    const HWND hwnd = CreateWindowExW(0, kClass, title.c_str(),
+                                      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT,
+                                      CW_USEDEFAULT, 720, 780, nullptr, nullptr,
+                                      GetModuleHandleW(nullptr), nullptr);
+    if (hwnd == nullptr) {
+        return;
+    }
+
+    const HINSTANCE inst = GetModuleHandleW(nullptr);
+    DevPanelState state{};
+    state.system = &system;
+    state.input = input;
+    state.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                   WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
+                                       ES_AUTOVSCROLL | WS_VSCROLL,
+                                   10, 10, 690, 190, hwnd,
+                                   reinterpret_cast<HMENU>(kIdStatus), inst, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Mods discovered under mods/ (double-click to rescan):",
+                    WS_CHILD | WS_VISIBLE, 12, 208, 500, 18, hwnd, nullptr, inst, nullptr);
+    state.mods = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY, 10, 228, 690,
+                                 110, hwnd, reinterpret_cast<HMENU>(kIdMods), inst, nullptr);
+    CreateWindowExW(0, L"STATIC", L"Controls - Player 1:", WS_CHILD | WS_VISIBLE, 12, 348, 140, 18,
+                    hwnd, nullptr, inst, nullptr);
+    state.devices = CreateWindowExW(0, L"COMBOBOX", nullptr,
+                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST, 150, 344,
+                                    280, 200, hwnd, reinterpret_cast<HMENU>(kIdDevices), inst,
+                                    nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Rescan", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 440, 344, 80,
+                    26, hwnd, reinterpret_cast<HMENU>(kIdRescanPads), inst, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Use controller", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 344,
+                    172, 26, hwnd, reinterpret_cast<HMENU>(kIdApplyPad), inst, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Use keyboard", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 376,
+                    172, 26, hwnd, reinterpret_cast<HMENU>(kIdKeyboard), inst, nullptr);
+    CreateWindowExW(0, L"STATIC",
+                    L"Pick an entry and press Rebind (or double-click), then press the input you want:",
+                    WS_CHILD | WS_VISIBLE, 12, 410, 560, 18, hwnd, nullptr, inst, nullptr);
+    state.binds = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
+                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY, 10, 430, 510,
+                                  190, hwnd, reinterpret_cast<HMENU>(kIdBindList), inst, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Rebind", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 430, 172,
+                    28, hwnd, reinterpret_cast<HMENU>(kIdBindOne), inst, nullptr);
+    CreateWindowExW(0, L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 528, 464, 172,
+                    28, hwnd, reinterpret_cast<HMENU>(kIdClearOne), inst, nullptr);
+    const auto button = [&](const wchar_t* text, int x, int id) {
+        CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, 640, 160, 28,
+                        hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), inst, nullptr);
+    };
+    button(L"Open user data folder", 10, kIdOpenUser);
+    button(L"Open mods folder", 180, kIdOpenMods);
+    button(L"Open keys folder", 350, kIdOpenKeys);
+    button(L"Resume", 540, kIdClose);
+
+    const HFONT font = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    EnumChildWindows(
+        hwnd,
+        [](HWND child, LPARAM f) -> BOOL {
+            SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(f), TRUE);
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(font));
+
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    SetWindowTextW(state.status, DevStatusText(system).c_str());
+    DevRefreshMods(state.mods);
+    DevRefreshDevices(state);
+    DevRefreshBinds(state);
+    SetTimer(hwnd, kTimer, 500, nullptr);
+    ShowWindow(hwnd, SW_SHOW);
+
+    // Modal to the game: emulation stays paused-ish while the panel is up, and
+    // the panel gets its own pump so the live status keeps refreshing.
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hwnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+}
+
+} // namespace
+#endif
+
 EmuWindow_SDL2::EmuWindow_SDL2(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
     input_subsystem->Initialize();
@@ -1091,7 +1547,22 @@ void EmuWindow_SDL2::WaitEvent() {
     }
 
     const u64 current_time = SDL_GetTicks();
-    if (current_time > last_time + kStatusRefreshMs) {
+    if (current_time > last_time + 2000) {
+        const auto results = system.GetAndResetPerfStats();
+        std::string game_name;
+        [[maybe_unused]] auto _ = system.GetGameName(game_name);
+        if (g_native_export_mode) {
+            // Standalone game export: plain game title, no emulator branding.
+            if (!game_name.empty()) {
+                SDL_SetWindowTitle(render_window, game_name.c_str());
+            }
+        } else {
+            const auto title =
+                fmt::format("{} | {} | FPS: {:.0f} ({:.0f}%)", game_name.empty() ? "suyu" : game_name,
+                            Common::g_build_fullname, results.average_game_fps,
+                            results.emulation_speed * 100.0);
+            SDL_SetWindowTitle(render_window, title.c_str());
+        }
         last_time = current_time;
         RefreshWindowStatus();
     }

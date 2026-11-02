@@ -259,7 +259,7 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
     } else {
         _wfopen_s(&file, path.c_str(), AccessModeToWStr(mode, type));
     }
-#elif defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#elif __ANDROID__
     if (Android::IsContentUri(path)) {
         ASSERT_MSG(mode == FileAccessMode::Read, "Content URI file access is for read-only!");
         const auto fd = Android::OpenContentUri(path, Android::OpenMode::Read);
@@ -396,7 +396,7 @@ u64 IOFile::GetSize() const {
     // Flush any unwritten buffered data into the file prior to retrieving the file size.
     std::fflush(file);
 
-#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
+#ifdef __ANDROID__
     u64 file_size = 0;
     if (Android::IsContentUri(file_path)) {
         file_size = Android::GetSize(file_path);

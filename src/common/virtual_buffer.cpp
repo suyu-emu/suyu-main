@@ -23,9 +23,7 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
     if (base == MAP_FAILED)
         base = nullptr;
 #endif
-    if (!base) {
-        UNREACHABLE_MSG("Unable to allocate {} bytes of virtual memory", size);
-    }
+    ASSERT(base);
     return base;
 }
 

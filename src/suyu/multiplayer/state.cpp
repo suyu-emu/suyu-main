@@ -91,12 +91,9 @@ QString FindLocalGameByNameRecursive(const QAbstractItemModel* model, const QMod
         const auto index = model->index(row, 0, parent);
         const QString title = index.data(Qt::DisplayRole).toString().trimmed().toLower();
         const QString path = index.data(GameListItemPath::FullPathRole).toString();
-        const bool is_game =
-            index.data(GameListItem::TypeRole).value<GameListItemType>() ==
-            GameListItemType::Game;
         // Compare loosely: room names carry decoration ("Smash Ultimate - EU"),
         // so an exact match would rarely fire.
-        if (is_game && !path.isEmpty() && !title.isEmpty() &&
+        if (!path.isEmpty() && !title.isEmpty() &&
             (title.contains(wanted) || wanted.contains(title))) {
             return path;
         }

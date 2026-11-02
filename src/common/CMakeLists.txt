@@ -169,7 +169,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(common PRIVATE linux/gamemode.cpp linux/gamemode.h)
 endif()
 
-if(ANDROID AND NOT SUYU_ANDROID_LIBRETRO)
+if(ANDROID)
     target_sources(
         common
         PUBLIC fs/fs_android.cpp

@@ -723,8 +723,6 @@ SDLDriver::~SDLDriver() {
     // destructor that ended the process (the libretro core's retro_deinit, where SDL_Init fails)
     if (vibration_thread.joinable()) {
         vibration_thread.join();
-    }
-    if (start_thread) {
         SDL_QuitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD);
     }
 }

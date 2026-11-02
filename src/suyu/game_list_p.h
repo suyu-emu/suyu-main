@@ -38,8 +38,6 @@ enum class GameListItemType {
     AddDir = QStandardItem::UserType + 6,
     Favorites = QStandardItem::UserType + 7,
     NintendoLibrary = QStandardItem::UserType + 8,
-    StaticBuilds = QStandardItem::UserType + 9,
-    StaticBuild = QStandardItem::UserType + 10,
 };
 
 Q_DECLARE_METATYPE(GameListItemType);
@@ -436,44 +434,6 @@ public:
 
     bool operator<(const QStandardItem& other) const override {
         return false;
-    }
-};
-
-class GameListStaticBuildsDir : public GameListItem {
-public:
-    explicit GameListStaticBuildsDir() {
-        setData(type(), TypeRole);
-
-        const int icon_size = UISettings::values.folder_icon_size.GetValue();
-        setData(QIcon::fromTheme(QStringLiteral("applications-development"))
-                    .pixmap(icon_size)
-                    .scaled(icon_size, icon_size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
-                Qt::DecorationRole);
-        setData(QObject::tr("suyu static (Experimental) / Hybrid Builds"), Qt::DisplayRole);
-    }
-
-    int type() const override {
-        return static_cast<int>(GameListItemType::StaticBuilds);
-    }
-
-    bool operator<(const QStandardItem& other) const override {
-        return false;
-    }
-};
-
-class GameListStaticBuildItem : public GameListItemPath {
-public:
-    GameListStaticBuildItem(const QString& executable, const QString& title,
-                            const QString& backend_label)
-        : GameListItemPath(executable, {}, title, backend_label, 0) {
-        setData(type(), TypeRole);
-        const int icon_size = UISettings::values.game_icon_size.GetValue();
-        QFileIconProvider icon_provider;
-        setData(icon_provider.icon(QFileInfo(executable)).pixmap(icon_size), Qt::DecorationRole);
-    }
-
-    int type() const override {
-        return static_cast<int>(GameListItemType::StaticBuild);
     }
 };
 

@@ -278,8 +278,6 @@ add_executable(suyu
     nintendo_account.h
     game_export.cpp
     game_export.h
-    wikipedia_cover.cpp
-    wikipedia_cover.h
     setup_dialog.cpp
     setup_dialog.h
     gamer_environment.cpp
@@ -439,7 +437,7 @@ elseif(WIN32)
     endif()
 endif()
 
-target_link_libraries(suyu PRIVATE common core input_common frontend_common network video_core frozen::frozen-headers)
+target_link_libraries(suyu PRIVATE common core input_common frontend_common network video_core)
 target_link_libraries(suyu PRIVATE Boost::headers glad Qt${QT_MAJOR_VERSION}::Widgets)
 target_link_libraries(suyu PRIVATE Qt${QT_MAJOR_VERSION}::Network)
 target_link_libraries(suyu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
@@ -600,7 +598,6 @@ if (ENABLE_SDL2)
 endif()
 
 if (MSVC)
-    target_link_options(suyu PRIVATE "/FORCE:MULTIPLE")
     if (SUYU_USE_BUNDLED_SDL2)
         include(CopySuyuSDLDeps)
         copy_suyu_SDL_deps(suyu)

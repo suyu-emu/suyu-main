@@ -66,7 +66,6 @@ void EmuWindow_Android::OnTouchReleased(int id) {
 }
 
 void EmuWindow_Android::OnFrameDisplayed() {
-    EmulationSession::GetInstance().GetInputSubsystem().GetTas()->UpdateThread();
     UpdateObservedFrameRate();
     UpdateFrameRateHint();
 

@@ -169,12 +169,9 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage() {
-    const VkResult result = [&] {
-        StallProbe::Accum probe{StallProbe::acquire_ns};
-        return device.GetLogical().AcquireNextImageKHR(
-            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-            VK_NULL_HANDLE, &image_index);
-    }();
+    const VkResult result = device.GetLogical().AcquireNextImageKHR(
+        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+        VK_NULL_HANDLE, &image_index);
     switch (result) {
     case VK_SUCCESS:
         break;

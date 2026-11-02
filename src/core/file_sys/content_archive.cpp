@@ -38,10 +38,7 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca)
 
     reader = std::make_shared<NcaReader>();
     if (Result rc = reader->Initialize(file, GetCryptoConfiguration(), GetNcaCompressionConfiguration()); R_FAILED(rc)) {
-        // An encrypted header cannot be read without the user's header_key.
-        status = keys.HasKey(Core::Crypto::S256KeyType::Header)
-                     ? Loader::ResultStatus::ErrorBadNCAHeader
-                     : Loader::ResultStatus::ErrorMissingHeaderKey;
+        status = Loader::ResultStatus::ErrorBadNCAHeader;
         return;
     }
 

@@ -71,7 +71,6 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
-    StallProbe::Accum probe{StallProbe::sched_wait_ns};
     DispatchWork();
 
     // Ensure the queue is drained.

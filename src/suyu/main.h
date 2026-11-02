@@ -455,17 +455,15 @@ private slots:
     /// Loads every module image under `dir` and installs the dispatcher.
     /// Returns how many were loaded (0 = none found). Never shows a dialog, so
     /// the single-game launcher can call it before booting, unattended.
-    int LoadRecompiledImagesFrom(const QString& dir, bool require_current_abi = false,
-                                 u64 expected_title_id = 0);
+    int LoadRecompiledImagesFrom(const QString& dir);
     void UnloadRecompiledImages();
     bool RecompiledImagesLoaded() const;
     /// Finds the built recompiled images that belong to a game file, if the
     /// game sits inside an export package. Empty when there are none.
-    static QString FindRecompiledImageDirFor(const QString& game_path, u64 title_id = 0);
+    static QString FindRecompiledImageDirFor(const QString& game_path);
     /// Strips the library UI down to the one game this build launches.
     void EnterSingleGameMode();
     void OnLaunchRecompiledBuild(const QString& game_name, const std::string& game_path);
-    void OnLaunchStaticBuild(const QString& executable);
     void OnNintendoAccount();
     void OnSteamIntegration();
     void OnOpenUserManual();
