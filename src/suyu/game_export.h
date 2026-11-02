@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <optional>
+#include <vector>
 #include <QCheckBox>
 #include <QDialog>
 #include <QComboBox>
@@ -12,6 +15,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 namespace Core {
@@ -85,8 +89,9 @@ public:
     };
 
     enum class RecompileBackend {
-        Dynarmic,   ///< Default — mature and stable
-        Ballistic,  ///< WIP — from pound-emu/ballistic
+        SuyuStatic, ///< In-tree AArch64-to-C ahead-of-time recompiler
+        Hybrid,     ///< Static AOT with Dynarmic fallback for uncovered code
+        Dynarmic,   ///< JIT baseline for comparison
     };
 
 signals:
@@ -97,6 +102,23 @@ private slots:
     void OnSelectFromLibrary();
     void OnBrowseOutput();
     void OnExport();
+    void OnInstallUpdate();
+    /// Merge a shared coverage file into this suyu's store for the game.
+    void OnImportCoverage();
+    /// Save the game's recorded coverage as shareable execution metadata: build IDs, code
+    /// offsets and counts. No raw instruction bytes, names or paths are written.
+    void OnExportCoverage();
+
+protected:
+    // An export pumps the event loop for as long as the compilers take (tens of
+    // minutes on a large title) with its whole state on the stack of OnExport().
+    // Closing the dialog in that window - Escape, the title-bar X, or anything
+    // else that reaches reject() - returns from the exec() that owns this
+    // object and destroys it while OnExport() is still running, which takes the
+    // process down with no crash log. Both entry points are refused while an
+    // export is in flight.
+    void closeEvent(QCloseEvent* event) override;
+    void reject() override;
 
 protected:
     // An export pumps the event loop for as long as the compilers take (tens of
@@ -123,10 +145,11 @@ private:
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
                              RecompileBackend backend, const QString& game_name);
 
-    /// Package the translated output into a platform-specific export bundle.
+    /// Package the translated output into a platform-specific export bundle rooted at
+    /// @p package_root, the staging folder that becomes the package once validated.
     bool PackageNativeExport(const QString& rom_path, const QString& cache_dir,
-                             const QString& output_dir, const QString& game_name,
-                             TargetPlatform platform);
+                             const QString& package_root, const QString& game_name,
+                             TargetPlatform platform, RecompileBackend backend);
 
     QLineEdit* rom_path_edit{};
     QLineEdit* output_path_edit{};
@@ -152,7 +175,40 @@ private:
     QProgressBar* progress_bar{};
     QPushButton* export_button{};
     QLabel* status_label{};
+    /// The stages of one export, each weighted by the share of the work it does, so the
+    /// progress bar follows the work rather than a few fixed steps.
+    enum class ExportStage { Extract, Lift, Compile, Link, Package, Count };
+    /// Where each stage starts on the bar (0..1); the last entry is the end, 1.
+    std::array<double, static_cast<std::size_t>(ExportStage::Count) + 1> stage_bounds_{};
+    /// Weights the stages this export actually runs: Source exports skip compiling and
+    /// linking, and the JIT baseline is packaging alone.
+    void SetupExportStages(bool uses_aot, bool compiled);
+    /// Moves the bar to @p fraction of @p stage - never backwards - and, when given, shows
+    /// @p status.
+    void ReportStage(ExportStage stage, double fraction, const QString& status = {});
+    QLabel* keys_status_label{};
+    QLabel* firmware_status_label{};
+    QLabel* game_file_status_label{};
+    /// "Uses your game file" (reference) or "Portable" (sealed game file in the package).
+    QComboBox* package_type_combo{};
+    QLabel* package_note_label{};
+    /// The general note on what an export contains, which depends on the package type.
+    QLabel* content_label{};
+    QLabel* update_status_label{};
+    QLabel* update_source_label{};
+    /// The selected game's installed DLC, which portable exports carry.
+    QLabel* dlc_status_label{};
+    QPushButton* install_update_button{};
+    QLabel* coverage_status_label{};
+    QPushButton* export_coverage_button{};
+    QStringList coverage_build_ids;
+    QString coverage_build_ids_path;
     quint64 rom_program_id{};
+    /// ROM path rom_program_id belongs to; a hand-typed different path invalidates it.
+    QString rom_program_id_path;
+    /// Title ID parsed from a ROM file, and the path it belongs to (SelectedProgramId's cache).
+    mutable quint64 cached_program_id{};
+    mutable QString cached_program_id_path;
     QVector<LibraryEntry> library_entries_;
     Core::System& system_;
     QPixmap game_icon_;

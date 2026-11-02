@@ -34,6 +34,8 @@ struct CipherContext {
     EVP_CIPHER_CTX* encryption_context = nullptr;
     EVP_CIPHER_CTX* decryption_context = nullptr;
     EVP_CIPHER* cipher = nullptr;
+    /// False when no key was supplied; such a cipher never touches data.
+    bool keyed = false;
 };
 
 static inline const std::string GetCipherName(Mode mode, u32 key_size) {
@@ -127,6 +129,11 @@ void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op)
 
     if (size == 0)
         return;
+    if (!ctx->keyed) {
+        LOG_ERROR(Crypto, "Decryption skipped: the required key is not installed");
+        std::memset(dest, 0, size);
+        return;
+    }
 
     // reset
     ASSERT(EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1));
@@ -177,6 +184,9 @@ void AESCipher<Key>::XTSTranscode(const u8* src, std::size_t size, u8* dest, std
 
 template <typename Key>
 void AESCipher<Key>::SetIV(std::span<const u8> data) {
+    if (!ctx->keyed) {
+        return;
+    }
     const int ret_enc = EVP_CipherInit_ex(ctx->encryption_context, nullptr, nullptr, nullptr, data.data(), -1);
     const int ret_dec = EVP_CipherInit_ex(ctx->decryption_context, nullptr, nullptr, nullptr, data.data(), -1);
     ASSERT(ret_enc == 1 && ret_dec == 1 && "Failed to set IV on OpenSSL contexts");

@@ -46,4 +46,13 @@ public:
     static const std::array<std::array<int, 4>, Settings::NativeAnalog::NumAnalogs> default_analogs;
     static const std::array<int, 2> default_stick_mod;
     static const std::array<int, 2> default_ringcon_analogs;
+
+    /// [Controls] auto_assign_controllers: whether a standalone export hands connected
+    /// gamepads to player slots. Cleared once the player picks controls in the F12 panel.
+    inline static bool auto_assign_controllers = true;
+    /// [Controls] auto_assigned_pads: which pad got which slot (SuyuCmd::PadBinding).
+    inline static std::string auto_assigned_pads;
 };
+
+// Persist the native controls panel's current bindings in the active SDL profile.
+void SaveNativeControls();

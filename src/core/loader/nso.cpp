@@ -15,6 +15,7 @@
 #include "common/lz4_compression.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/hle/kernel/code_set.h"

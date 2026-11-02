@@ -182,7 +182,7 @@ void EmulatedController::LoadDevices() {
         nfc_params[0] = Common::ParamPackage{"engine:virtual_amiibo,nfc:1"};
 #ifndef __ANDROID__
         ring_params[1] = Common::ParamPackage{"engine:joycon,axis_x:100,axis_y:101"};
-#else
+#elif !defined(SUYU_ANDROID_LIBRETRO)
         android_params = Common::ParamPackage{"engine:android,port:100"};
 #endif
     }

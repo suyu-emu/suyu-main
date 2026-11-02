@@ -278,6 +278,8 @@ add_executable(suyu
     nintendo_account.h
     game_export.cpp
     game_export.h
+    setup_dialog.cpp
+    setup_dialog.h
     gamer_environment.cpp
     gamer_environment.h
     game_library.cpp
@@ -410,12 +412,11 @@ if (APPLE)
     set_target_properties(suyu PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(suyu PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)
 
-    if (NOT USE_SYSTEM_MOLTENVK)
-        set(MOLTENVK_PLATFORM "macOS")
-        set(MOLTENVK_VERSION "v1.2.8")
-        download_moltenvk_external(${MOLTENVK_PLATFORM} ${MOLTENVK_VERSION})
+    # MOLTENVK_LIBRARY is resolved in externals/CMakeLists.txt, either from the
+    # bundled CPM package (YUZU_USE_BUNDLED_MOLTENVK) or an installed MoltenVK.
+    if (NOT MOLTENVK_LIBRARY)
+        find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
     endif()
-    find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
     message(STATUS "Using MoltenVK at ${MOLTENVK_LIBRARY}.")
     set_source_files_properties(${MOLTENVK_LIBRARY} PROPERTIES MACOSX_PACKAGE_LOCATION Frameworks
                                     XCODE_FILE_ATTRIBUTES "CodeSignOnCopy")
@@ -611,7 +612,7 @@ if (NOT APPLE AND ENABLE_OPENGL)
     target_compile_definitions(suyu PRIVATE HAS_OPENGL)
 endif()
 
-if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT SUYU_NO_JIT)
     target_link_libraries(suyu PRIVATE dynarmic::dynarmic)
     # mcl is a LINK_ONLY dep of dynarmic, so its include path does not
     # propagate to consumers. game_export.cpp includes Dynarmic headers that

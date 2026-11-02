@@ -222,8 +222,12 @@ bool TranslatorVisitor::FCMLA_elt(bool Q, Imm<2> size, Imm<1> L, Imm<1> M, Imm<4
 
     const size_t esize = 8U << size.ZeroExtend();
 
-    // TODO: We don't support the half-precision floating point variant yet.
-    ASSERT(esize != 16);
+    // The half-precision variant needs FEAT_FP16, which the Switch's ARMv8.0
+    // cores lack, so it is UNDEFINED there. Asserting instead let a guest that
+    // strays into data (or decodes it) abort translation with a half-built block.
+    if (esize == 16) {
+        return UnallocatedEncoding();
+    }
 
     const size_t index = [=] {
         if (size == 0b01) {

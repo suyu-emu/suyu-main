@@ -89,8 +89,10 @@ endif()
 # Vulkan stuff
 AddDependentPackages(vulkan-headers vulkan-utility-libraries)
 
-# frozen
-AddJsonPackage(frozen)
+# Frozen is used only by the Qt string lookup, not the CLI/core.
+if(ENABLE_QT)
+    AddJsonPackage(frozen)
+endif()
 
 # DiscordRPC
 if (USE_DISCORD_PRESENCE)
@@ -139,7 +141,7 @@ if(ENABLE_CUBEB)
     endif()
 endif()
 
-if (NOT ANDROID)
+if (ENABLE_SDL3)
     if (NOT YUZU_USE_BUNDLED_SDL3)
         if (NOT WIN32)
             # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
@@ -187,6 +189,9 @@ set(BUILD_SHARED_LIBS OFF)
 
 # SPIRV Headers
 AddJsonPackage(spirv-headers)
+if(TARGET SPIRV-Headers AND NOT TARGET SPIRV-Headers::SPIRV-Headers)
+    add_library(SPIRV-Headers::SPIRV-Headers ALIAS SPIRV-Headers)
+endif()
 
 # Sirit
 if (YUZU_USE_BUNDLED_SIRIT)
@@ -198,6 +203,12 @@ else()
             $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=unused-command-line-argument>
         )
     endif()
+endif()
+
+# Older local Sirit source trees export the unnamespaced target. Alias the
+# actual library, not a replacement implementation; normal packaged targets win.
+if(TARGET sirit AND NOT TARGET sirit::sirit)
+    add_library(sirit::sirit ALIAS sirit)
 endif()
 
 # Catch2

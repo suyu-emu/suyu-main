@@ -171,6 +171,7 @@ private:
     vk::PipelineCache vulkan_pipeline_cache;
 
     Common::ThreadWorker workers;
+    Common::ThreadWorker optimization_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 };

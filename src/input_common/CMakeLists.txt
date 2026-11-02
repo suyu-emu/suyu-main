@@ -47,7 +47,7 @@ else()
     target_compile_options(input_common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=conversion>)
 endif()
 
-if (ANDROID)
+if (ANDROID AND NOT SUYU_ANDROID_LIBRETRO)
     target_sources(input_common PRIVATE
         drivers/android.cpp
         drivers/android.h)

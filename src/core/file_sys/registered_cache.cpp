@@ -547,16 +547,24 @@ VirtualFile RegisteredCache::OpenFileOrDirectoryConcat(const VirtualDir& open_di
 
 VirtualFile RegisteredCache::GetFileAtID(NcaID id) const {
     VirtualFile file;
-    // Try all five relevant modes of file storage:
-    // (bit 2 = uppercase/lower, bit 1 = within a two-digit dir, bit 0 = .cnmt suffix)
-    // 000: /000000**/{:032X}.nca
-    // 010: /{:032X}.nca
-    // 100: /000000**/{:032x}.nca
-    // 110: /{:032x}.nca
-    // 111: /{:032x}.cnmt.nca
+    // All eight combinations of the three layout choices:
+    // (bit 2 = lower/uppercase, bit 1 = not within/within a two-digit dir,
+    //  bit 0 = .cnmt suffix)
+    //
+    // This used to skip every odd index except 7 - i.e. the .cnmt.nca suffix was
+    // only ever tried at the cache root, never inside a two-digit directory.
+    // But that is precisely where meta NCAs are stored:
+    // GetRelativePathFromNcaID's own format string for the cnmt case is
+    // "/000000{:02X}/{}.cnmt.nca", and it is what RegisteredCache::InstallEntry
+    // writes. The result was that every meta NCA in NAND was unreachable, so
+    // ProcessFiles bailed at `file == nullptr` before registering anything and
+    // no installed update or DLC ever appeared in the cache - silently, since
+    // the miss looks identical to nothing being installed.
+    //
+    // Concretely: with a newer update installed to NAND,
+    // the union fell through to the frontend's copy of the cartridge contents
+    // and applied the A32 on-cart update instead, so the title ran 32-bit.
     for (u8 i = 0; i < 8; ++i) {
-        if ((i % 2) == 1 && i != 7)
-            continue;
         const auto path =
             GetRelativePathFromNcaID(id, (i & 0b100) == 0, (i & 0b010) == 0, (i & 0b001) == 0b001);
         file = OpenFileOrDirectoryConcat(dir, path);
@@ -639,6 +647,12 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
         const auto nca = std::make_shared<NCA>(parser(file, id));
         if (nca->GetStatus() != Loader::ResultStatus::Success ||
             nca->GetType() != NCAContentType::Meta || nca->GetSubdirectories().empty()) {
+            // Silently skipping a meta NCA means the title is simply absent from
+            // this cache with no trace in the log, which is indistinguishable
+            // from never having been installed.
+            LOG_DEBUG(Loader, "DIAG meta skipped: id={} status={} type={} subdirs={}",
+                      Common::HexToString(id), static_cast<int>(nca->GetStatus()),
+                      static_cast<int>(nca->GetType()), nca->GetSubdirectories().size());
             continue;
         }
 
@@ -648,7 +662,37 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
             if (section0_file->GetExtension() != "cnmt")
                 continue;
 
-            meta.insert_or_assign(nca->GetTitleId(), CNMT(section0_file));
+            // Keyed by title id, so two installed versions of the same title -
+            // two updates, say - collide here. insert_or_assign alone made that
+            // a race with directory scan order: whichever meta NCA the walk
+            // reached last won, with no comparison of versions.
+            //
+            // A title with two updates installed is the case that exposed it:
+            // the older one's meta happened to be scanned second and replaced
+            // the newer, so the title booted the older build.
+            CNMT cnmt(section0_file);
+            const auto existing = meta.find(nca->GetTitleId());
+            if (existing != meta.end() &&
+                existing->second.GetTitleVersion() > cnmt.GetTitleVersion()) {
+                // Name the superseded meta and everything it points at. A
+                // second copy of a title is dead weight - a whole extra
+                // program NCA - and without this the only way to find which
+                // files belong to it is to delete one and see what breaks.
+                LOG_DEBUG(Loader,
+                          "DIAG meta kept newer: tid={:016X} keeping v{} over v{}; superseded "
+                          "meta nca={}",
+                          nca->GetTitleId(), existing->second.GetTitleVersion(),
+                          cnmt.GetTitleVersion(), Common::HexToString(id));
+                for (const auto& record : cnmt.GetContentRecords()) {
+                    LOG_DEBUG(Loader, "DIAG   superseded content: type={} nca={}",
+                              static_cast<int>(record.type),
+                              Common::HexToString(record.nca_id));
+                }
+                break;
+            }
+            LOG_DEBUG(Loader, "DIAG meta registered: tid={:016X} v{}", nca->GetTitleId(),
+                      cnmt.GetTitleVersion());
+            meta.insert_or_assign(nca->GetTitleId(), std::move(cnmt));
             meta_id.insert_or_assign(nca->GetTitleId(), id);
             break;
         }

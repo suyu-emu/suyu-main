@@ -106,7 +106,14 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
-EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK() = default;
+EmuWindow_SDL2_VK::~EmuWindow_SDL2_VK() {
+#if defined(SDL_PLATFORM_MACOS)
+    if (metal_view) {
+        SDL_Metal_DestroyView(metal_view);
+        metal_view = nullptr;
+    }
+#endif
+}
 
 std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL2_VK::CreateSharedContext() const {
     return std::make_unique<DummyContext>();

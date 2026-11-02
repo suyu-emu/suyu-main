@@ -16,6 +16,7 @@
 #include "common/hex_util.h"
 #include "common/string_util.h"
 #include "core/crypto/aes_util.h"
+#include "core/crypto/hmac_sha256.h"
 #include "core/crypto/key_manager.h"
 #include "core/crypto/xts_encryption_layer.h"
 #include "core/file_sys/content_archive.h"
@@ -98,7 +99,7 @@ Loader::ResultStatus NAX::Parse(std::string_view path) {
         return Loader::ResultStatus::ErrorIncorrectNAXFileSize;
     }
 
-    keys.DeriveSDSeedLazy();
+    // sd_seed must come from the user's key files; it is not extracted from NAND saves.
     std::array<Core::Crypto::Key256, 2> sd_keys{};
     const auto sd_keys_res = Core::Crypto::DeriveSDKeys(sd_keys, keys);
     if (sd_keys_res != Loader::ResultStatus::Success) {

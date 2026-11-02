@@ -94,9 +94,13 @@ else()
         -Wcast-qual
         -pedantic
         -Wno-missing-braces
-        -fno-rtti
         #-fno-exceptions
     )
+    # On macOS, private exception typeinfo emitted by -fno-rtti objects can
+    # override libc++ typeinfo and break base-class exception catches.
+    if (NOT APPLE)
+        list(APPEND DYNARMIC_CXX_FLAGS -fno-rtti)
+    endif()
     if (CXX_GCC)
         # GCC produces bogus -Warray-bounds warnings from xbyak headers for code paths that are not
         # actually reachable.  Specifically, it happens in cases where some code casts an Operand&

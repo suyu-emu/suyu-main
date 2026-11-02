@@ -1,0 +1,195 @@
+# One instruction per line: assembly | operand kind | arity.
+# Kinds: S, D = FP operands of that width; W, X = integer source in w1/x1;
+# VS, VD = integer lanes of that width in v1. Arity counts the varying FP (or
+# integer) operands: FMLA-style accumulators and FMADD addends are the third.
+fadd s0, s1, s2 | S | 2
+fadd d0, d1, d2 | D | 2
+fsub s0, s1, s2 | S | 2
+fsub d0, d1, d2 | D | 2
+fmul s0, s1, s2 | S | 2
+fmul d0, d1, d2 | D | 2
+fnmul s0, s1, s2 | S | 2
+fnmul d0, d1, d2 | D | 2
+fdiv s0, s1, s2 | S | 2
+fdiv d0, d1, d2 | D | 2
+fmadd s0, s1, s2, s3 | S | 3
+fmadd d0, d1, d2, d3 | D | 3
+fmsub s0, s1, s2, s3 | S | 3
+fmsub d0, d1, d2, d3 | D | 3
+fnmadd s0, s1, s2, s3 | S | 3
+fnmadd d0, d1, d2, d3 | D | 3
+fnmsub s0, s1, s2, s3 | S | 3
+fnmsub d0, d1, d2, d3 | D | 3
+fadd v0.4s, v1.4s, v2.4s | S | 2
+fadd v0.2d, v1.2d, v2.2d | D | 2
+fadd v0.2s, v1.2s, v2.2s | S | 2
+fsub v0.4s, v1.4s, v2.4s | S | 2
+fsub v0.2d, v1.2d, v2.2d | D | 2
+fmul v0.4s, v1.4s, v2.4s | S | 2
+fmul v0.2d, v1.2d, v2.2d | D | 2
+fmul v0.2s, v1.2s, v2.2s | S | 2
+fdiv v0.4s, v1.4s, v2.4s | S | 2
+fdiv v0.2d, v1.2d, v2.2d | D | 2
+fmla v0.4s, v1.4s, v2.4s | S | 3
+fmla v0.2d, v1.2d, v2.2d | D | 3
+fmla v0.2s, v1.2s, v2.2s | S | 3
+fmls v0.4s, v1.4s, v2.4s | S | 3
+fmls v0.2d, v1.2d, v2.2d | D | 3
+fmla v0.4s, v1.4s, v2.s[1] | S | 3
+fmls v0.4s, v1.4s, v2.s[1] | S | 3
+fmul v0.4s, v1.4s, v2.s[1] | S | 2
+fmla v0.2d, v1.2d, v2.d[1] | D | 3
+fmul v0.2d, v1.2d, v2.d[1] | D | 2
+fmla s0, s1, v2.s[1] | S | 3
+fmls s0, s1, v2.s[1] | S | 3
+fmul s0, s1, v2.s[1] | S | 2
+fmul d0, d1, v2.d[1] | D | 2
+fabd s0, s1, s2 | S | 2
+fabd d0, d1, d2 | D | 2
+fabd v0.4s, v1.4s, v2.4s | S | 2
+faddp v0.4s, v1.4s, v2.4s | S | 2
+faddp s0, v1.2s | S | 2
+faddp d0, v1.2d | D | 2
+frecps s0, s1, s2 | S | 2
+frecps d0, d1, d2 | D | 2
+frsqrts s0, s1, s2 | S | 2
+frsqrts d0, d1, d2 | D | 2
+frecps v0.4s, v1.4s, v2.4s | S | 2
+frecps v0.2s, v1.2s, v2.2s | S | 2
+frecps v0.2d, v1.2d, v2.2d | D | 2
+frsqrts v0.4s, v1.4s, v2.4s | S | 2
+frsqrts v0.2s, v1.2s, v2.2s | S | 2
+frsqrts v0.2d, v1.2d, v2.2d | D | 2
+fsqrt s0, s1 | S | 1
+fsqrt d0, d1 | D | 1
+fsqrt v0.4s, v1.4s | S | 1
+fsqrt v0.2d, v1.2d | D | 1
+fcmp s1, s2 | S | 2
+fcmp d1, d2 | D | 2
+fcmpe s1, s2 | S | 2
+fcmpe d1, d2 | D | 2
+fcmp s1, #0.0 | S | 1
+fcmpe s1, #0.0 | S | 1
+fcmp d1, #0.0 | D | 1
+fcmpe d1, #0.0 | D | 1
+fccmp s1, s2, #4, ne | S | 2
+fccmpe s1, s2, #2, ge | S | 2
+fccmp d1, d2, #0, eq | D | 2
+fccmpe d1, d2, #9, lt | D | 2
+fcmeq v0.4s, v1.4s, v2.4s | S | 2
+fcmge v0.4s, v1.4s, v2.4s | S | 2
+fcmgt v0.4s, v1.4s, v2.4s | S | 2
+fcmeq v0.2d, v1.2d, v2.2d | D | 2
+fcmge v0.2s, v1.2s, v2.2s | S | 2
+fcmgt v0.2d, v1.2d, v2.2d | D | 2
+fcmeq v0.4s, v1.4s, #0.0 | S | 1
+fcmge v0.4s, v1.4s, #0.0 | S | 1
+fcmgt v0.4s, v1.4s, #0.0 | S | 1
+fcmle v0.4s, v1.4s, #0.0 | S | 1
+fcmlt v0.4s, v1.4s, #0.0 | S | 1
+fcmeq v0.2d, v1.2d, #0.0 | D | 1
+fcmlt v0.2s, v1.2s, #0.0 | S | 1
+fcmeq s0, s1, s2 | S | 2
+fcmge s0, s1, s2 | S | 2
+fcmgt d0, d1, d2 | D | 2
+fcmeq s0, s1, #0.0 | S | 1
+fcmge d0, d1, #0.0 | D | 1
+fcmgt s0, s1, #0.0 | S | 1
+fcmle s0, s1, #0.0 | S | 1
+fcmlt d0, d1, #0.0 | D | 1
+facge s0, s1, s2 | S | 2
+facgt v0.4s, v1.4s, v2.4s | S | 2
+fmax s0, s1, s2 | S | 2
+fmax d0, d1, d2 | D | 2
+fmin s0, s1, s2 | S | 2
+fmin d0, d1, d2 | D | 2
+fmaxnm s0, s1, s2 | S | 2
+fmaxnm d0, d1, d2 | D | 2
+fminnm s0, s1, s2 | S | 2
+fminnm d0, d1, d2 | D | 2
+fmax v0.4s, v1.4s, v2.4s | S | 2
+fmin v0.2d, v1.2d, v2.2d | D | 2
+fmaxnm v0.4s, v1.4s, v2.4s | S | 2
+fminnm v0.4s, v1.4s, v2.4s | S | 2
+fmaxnmv s0, v1.4s | S | 1
+fminv s0, v1.4s | S | 1
+fmaxp v0.4s, v1.4s, v2.4s | S | 2
+fcvt d0, s1 | S | 1
+fcvt s0, d1 | D | 1
+fcvtl v0.2d, v1.2s | S | 1
+fcvtn v0.2s, v1.2d | D | 1
+fcvtzs w0, s1 | S | 1
+fcvtzs x0, s1 | S | 1
+fcvtzu w0, s1 | S | 1
+fcvtzu x0, s1 | S | 1
+fcvtzs w0, d1 | D | 1
+fcvtzs x0, d1 | D | 1
+fcvtzu w0, d1 | D | 1
+fcvtzu x0, d1 | D | 1
+fcvtns w0, s1 | S | 1
+fcvtnu x0, d1 | D | 1
+fcvtps w0, s1 | S | 1
+fcvtps x0, d1 | D | 1
+fcvtms w0, s1 | S | 1
+fcvtms x0, d1 | D | 1
+fcvtas w0, s1 | S | 1
+fcvtau x0, d1 | D | 1
+fcvtau w0, s1 | S | 1
+scvtf s0, w1 | W | 1
+scvtf s0, x1 | X | 1
+ucvtf s0, w1 | W | 1
+ucvtf s0, x1 | X | 1
+scvtf d0, w1 | W | 1
+scvtf d0, x1 | X | 1
+ucvtf d0, w1 | W | 1
+ucvtf d0, x1 | X | 1
+fcvtzs v0.4s, v1.4s | S | 1
+fcvtzu v0.4s, v1.4s | S | 1
+fcvtzs v0.2d, v1.2d | D | 1
+fcvtzu v0.2d, v1.2d | D | 1
+fcvtms v0.4s, v1.4s | S | 1
+fcvtns v0.4s, v1.4s | S | 1
+fcvtas v0.4s, v1.4s | S | 1
+fcvtzs s0, s1 | S | 1
+fcvtzu d0, d1 | D | 1
+scvtf v0.4s, v1.4s | VS | 1
+ucvtf v0.4s, v1.4s | VS | 1
+scvtf v0.2d, v1.2d | VD | 1
+ucvtf v0.2d, v1.2d | VD | 1
+scvtf s0, s1 | VS | 1
+ucvtf d0, d1 | VD | 1
+frintn s0, s1 | S | 1
+frintp s0, s1 | S | 1
+frintm s0, s1 | S | 1
+frintz s0, s1 | S | 1
+frinta s0, s1 | S | 1
+frintx s0, s1 | S | 1
+frinti s0, s1 | S | 1
+frintn d0, d1 | D | 1
+frintx d0, d1 | D | 1
+frinti d0, d1 | D | 1
+frintm d0, d1 | D | 1
+frintn v0.4s, v1.4s | S | 1
+frintx v0.4s, v1.4s | S | 1
+frinti v0.2d, v1.2d | D | 1
+fabs s0, s1 | S | 1
+fneg d0, d1 | D | 1
+fabs v0.4s, v1.4s | S | 1
+frecpe s0, s1 | S | 1
+frsqrte v0.4s, v1.4s | S | 1
+frecpe v0.2d, v1.2d | D | 1
+mrs x0, fpcr | X | 1
+msr fpcr, x1 | X | 1
+fsub v0.2s, v1.2s, v2.2s | S | 2
+fdiv v0.2s, v1.2s, v2.2s | S | 2
+fmls v0.2s, v1.2s, v2.2s | S | 3
+fmla v0.2s, v1.2s, v2.s[3] | S | 3
+fmul v0.2s, v1.2s, v2.s[0] | S | 2
+fmls v0.2d, v1.2d, v2.d[0] | D | 3
+fmla d0, d1, v2.d[1] | D | 3
+fmls d0, d1, v2.d[0] | D | 3
+faddp v0.2s, v1.2s, v2.2s | S | 2
+faddp v0.2d, v1.2d, v2.2d | D | 2
+fabd v0.2s, v1.2s, v2.2s | S | 2
+fabd v0.2d, v1.2d, v2.2d | D | 2
+fsqrt v0.2s, v1.2s | S | 1

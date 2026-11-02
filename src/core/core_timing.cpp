@@ -290,7 +290,6 @@ void CoreTiming::Reset() {
     pause_event.Set();
     event.Set();
     if (timer_thread.joinable()) {
-        timer_thread.request_stop();
         timer_thread.join();
     }
     has_started = false;

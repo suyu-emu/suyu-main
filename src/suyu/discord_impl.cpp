@@ -2,25 +2,54 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <map>
+#include <memory>
+#include <set>
 #include <string>
 
-#include <QEventLoop>
+#include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QNetworkAccessManager>
-#include <QNetworkReply>
+#include <QObject>
+#include <QString>
+#include <QThread>
 
 #include <discord_rpc.h>
-#include <fmt/format.h>
 
 #include "common/common_types.h"
-#include "common/string_util.h"
+#include "common/logging/log.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
+#include "network/room_member.h"
+#include "network/network.h"
 #include "suyu/discord_impl.h"
 #include "suyu/uisettings.h"
+#include "suyu/wikipedia_cover.h"
 
 namespace DiscordRPC {
 
-DiscordImpl::DiscordImpl(Core::System& system_) : system{system_} {
+namespace {
+
+constexpr qint64 kCoverLookupBudgetMs = 6000;
+
+// Session-wide state, touched only on the GUI thread. The cache holds a finished lookup per
+// title, including an empty URL when nothing was found, so each title is looked up once.
+std::map<std::string, std::string>& CoverCache() {
+    static std::map<std::string, std::string> cache;
+    return cache;
+}
+
+// Lookups still running. They are waited for when the application quits, so none is left
+// using the network stack while it is torn down; each is bounded by kCoverLookupBudgetMs.
+std::set<QThread*>& RunningLookups() {
+    static std::set<QThread*> running;
+    return running;
+}
+
+} // namespace
+
+DiscordImpl::DiscordImpl(Core::System& system_)
+    : lookup_receiver{std::make_unique<QObject>()}, system{system_} {
     DiscordEventHandlers handlers{};
     // The number is the client ID for suyu, it's used for images and the
     // application name
@@ -37,48 +66,93 @@ void DiscordImpl::Pause() {
     Discord_ClearPresence();
 }
 
-std::string DiscordImpl::GetGameString(const std::string& title) {
-    // Convert to lowercase
-    std::string icon_name = Common::ToLower(title);
-
-    // Replace spaces with dashes
-    std::replace(icon_name.begin(), icon_name.end(), ' ', '-');
-
-    // Remove non-alphanumeric characters but keep dashes
-    std::erase_if(icon_name, [](char c) { return !std::isalnum(c) && c != '-'; });
-
-    // Remove dashes from the start and end of the string
-    icon_name.erase(icon_name.begin(), std::find_if(icon_name.begin(), icon_name.end(),
-                                                    [](int ch) { return ch != '-'; }));
-    icon_name.erase(
-        std::find_if(icon_name.rbegin(), icon_name.rend(), [](int ch) { return ch != '-'; }).base(),
-        icon_name.end());
-
-    // Remove double dashes
-    icon_name.erase(std::unique(icon_name.begin(), icon_name.end(),
-                                [](char a, char b) { return a == '-' && b == '-'; }),
-                    icon_name.end());
-
-    return icon_name;
-}
-
-void DiscordImpl::UpdateGameStatus(bool use_default) {
+void DiscordImpl::UpdateGameStatus() {
     const std::string default_text = "suyu is an emulator for the Nintendo Switch";
     const std::string default_image = "suyu_logo";
-    const std::string url = use_default ? default_image : game_url;
-    s64 start_time = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
+    const std::string& url = game_url.empty() ? default_image : game_url;
     DiscordRichPresence presence{};
+
+    std::string room_state;
+    if (const auto member = system.GetRoomNetwork().GetRoomMember().lock();
+        member && member->IsConnected()) {
+        const auto room_name = member->GetRoomInformation().name;
+        room_state = room_name.empty() ? "In a NetPlay room" : "NetPlay: " + room_name;
+        // Discord limits activity strings to 128 bytes. Leave room for the
+        // prefix and avoid publishing the room's address or password.
+        if (room_state.size() > 128) {
+            size_t length = 128;
+            while (length > 0 &&
+                   (static_cast<unsigned char>(room_state[length]) & 0xC0) == 0x80) {
+                --length;
+            }
+            room_state.resize(length);
+        }
+    }
 
     presence.largeImageKey = url.c_str();
     presence.largeImageText = game_title.c_str();
     presence.smallImageKey = default_image.c_str();
     presence.smallImageText = default_text.c_str();
-    presence.state = game_title.c_str();
+    presence.state = room_state.empty() ? game_title.c_str() : room_state.c_str();
     presence.details = "Currently in game";
-    presence.startTimestamp = start_time;
+    presence.startTimestamp = game_start_timestamp;
     Discord_UpdatePresence(&presence);
+}
+
+void DiscordImpl::LookUpCover() {
+    if (const auto cached = CoverCache().find(game_title); cached != CoverCache().end()) {
+        game_url = cached->second;
+        return;
+    }
+    static std::set<std::string> in_flight;
+    if (!in_flight.insert(game_title).second) {
+        return;
+    }
+    static bool waits_on_quit = false;
+    if (!waits_on_quit && QCoreApplication::instance()) {
+        waits_on_quit = true;
+        QObject::connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, [] {
+            for (QThread* thread : RunningLookups()) {
+                thread->wait(kCoverLookupBudgetMs + 1000);
+            }
+        });
+    }
+
+    // The lookup blocks in its own event loop, so it runs on a worker thread; the GUI thread
+    // only starts it and later receives the URL.
+    const std::string title = game_title;
+    const auto result = std::make_shared<std::string>();
+    QThread* thread = QThread::create([title, result] {
+        QNetworkAccessManager network;
+        QElapsedTimer clock;
+        clock.start();
+        *result = WikipediaCover::DiscordImageUrl(
+                      WikipediaCover::FindCoverUrls(network, QString::fromStdString(title), clock,
+                                                    kCoverLookupBudgetMs,
+                                                    QStringLiteral("suyu (Discord cover art)")))
+                      .toStdString();
+    });
+    RunningLookups().insert(thread);
+    // Emitted on the worker thread; both receivers live on the GUI thread, so these run there.
+    QObject::connect(thread, &QThread::finished, thread, [thread, title, result] {
+        CoverCache()[title] = *result;
+        in_flight.erase(title);
+        RunningLookups().erase(thread);
+        if (result->empty()) {
+            LOG_INFO(Frontend, "Discord presence: no Wikipedia cover art found for \"{}\"",
+                     title);
+        }
+        thread->deleteLater();
+    });
+    QObject::connect(thread, &QThread::finished, lookup_receiver.get(), [this, title, result] {
+        if (result->empty() || !system.IsPoweredOn() || game_title != title) {
+            return;
+        }
+        game_url = *result;
+        LOG_INFO(Frontend, "Discord presence: updated \"{}\" with image key {}", title, game_url);
+        UpdateGameStatus();
+    });
+    thread->start(QThread::LowPriority);
 }
 
 void DiscordImpl::Update() {
@@ -86,7 +160,20 @@ void DiscordImpl::Update() {
     const std::string default_image = "suyu_logo";
 
     if (system.IsPoweredOn()) {
-        system.GetAppLoader().ReadTitle(game_title);
+        std::string loaded_title;
+        system.GetAppLoader().ReadTitle(loaded_title);
+        if (loaded_title.empty()) {
+            loaded_title = "Nintendo Switch game";
+        }
+        if (loaded_title == game_title) {
+            UpdateGameStatus();
+            return;
+        }
+        game_title = std::move(loaded_title);
+        game_url.clear();
+        game_start_timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
 
         // Used to format Icon URL for suyu website game compatibility page
         std::string icon_name = GetGameString(game_title);
@@ -104,6 +191,9 @@ void DiscordImpl::Update() {
         return;
     }
 
+    game_title.clear();
+    game_url.clear();
+    game_start_timestamp = 0;
     s64 start_time = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();

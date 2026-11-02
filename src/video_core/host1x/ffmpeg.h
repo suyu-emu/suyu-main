@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <queue>
 
@@ -133,7 +134,9 @@ public:
     YUZU_NON_COPYABLE(Decoder);
     YUZU_NON_MOVEABLE(Decoder);
 
-    explicit Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec);
+    /// wrapper names a codec wrapper around a platform decoder (v4l2m2m); empty, or
+    /// when FFmpeg has no such wrapper, the codec's own decoder
+    explicit Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec, std::string_view wrapper = {});
     ~Decoder() = default;
 
     bool SupportsDecodingOnDevice(AVPixelFormat* out_pix_fmt, AVHWDeviceType type) const;
@@ -196,6 +199,7 @@ private:
     AVCodecContext* m_codec_context{};
     std::shared_ptr<Frame> m_final_frame{};
     bool m_decode_order{};
+    bool m_v4l2_m2m{};
 };
 
 struct FrameOffsets {
@@ -235,10 +239,15 @@ public:
     std::optional<DecodedFrame> ReceiveFrame();
 
 private:
+    bool OpenV4L2M2M(std::span<const u8> packet_data, const FrameOffsets& offsets,
+                     std::optional<FrameDimensions> dimensions);
+
+    Tegra::Host1x::NvdecCommon::VideoCodec m_codec{};
     std::optional<FFmpeg::Decoder> m_decoder;
     std::optional<FFmpeg::DecoderContext> m_decoder_context;
     std::optional<FFmpeg::HardwareContext> m_hardware_context;
     bool m_opened{};
+    bool m_v4l2_m2m{};
     bool m_defer_android_mediacodec_open{};
     bool m_needs_h264_extradata{};
     s64 m_next_pts{};

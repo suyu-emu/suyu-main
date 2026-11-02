@@ -29,6 +29,8 @@ set(CPM_SOURCE_CACHE "${CPMUTIL_ROOT}/.cache/cpm"
 option(CPMUTIL_FORCE_BUNDLED
     "Force bundled packages for all CPM depdendencies" ${BUNDLED_DEFAULT})
 
+option(CPMUTIL_OFFLINE "Forbid CPM dependency downloads; use local sources or installed packages" OFF)
+
 option(CPMUTIL_FORCE_SYSTEM
     "Force system packages for all CPM dependencies" OFF)
 
@@ -177,6 +179,10 @@ endfunction()
 # Download a URL to file, with a sha512 hash
 # And retry 5 times
 function(cpm_download url file)
+    if(CPMUTIL_OFFLINE)
+        message(FATAL_ERROR "[CPMUtil] Offline mode forbids downloading ${url}. "
+            "Populate the dependency cache or supply the package's <name>_CUSTOM_DIR.")
+    endif()
     echo("Downloading ${url} to ${file}")
     list(LENGTH ARGN argn_len)
     if(argn_len GREATER 0)
@@ -845,11 +851,18 @@ function(AddPackage)
         find_package(${find_args} QUIET)
 
         if(${PKG_ARGS_NAME}_FOUND)
-            if(DEFINED ${PKG_ARGS_NAME}_VERSION)
-                set(sys_ver ${${PKG_ARGS_NAME}_VERSION})
-            else()
-                set(sys_ver ${PKG_ARGS_VERSION})
-            endif()
+            # Find modules use different version spellings (OpenSSL, for
+            # example). Never report the requested bundled pin as an observed
+            # system version when the find module supplied no version.
+            string(TOUPPER "${PKG_ARGS_NAME}" system_package_upper)
+            set(sys_ver "unknown")
+            foreach(version_var "${PKG_ARGS_NAME}_VERSION" "${PKG_ARGS_NAME}_VERSION_STRING"
+                                "${system_package_upper}_VERSION" "${system_package_upper}_VERSION_STRING")
+                if(DEFINED ${version_var} AND NOT "${${version_var}}" STREQUAL "")
+                    set(sys_ver "${${version_var}}")
+                    break()
+                endif()
+            endforeach()
 
             message(STATUS
                 "[CPMUtil] Using system package ${PKG_ARGS_NAME}@${sys_ver}")
@@ -886,8 +899,16 @@ function(AddPackage)
         list(APPEND EXTRA_ARGS DOWNLOAD_ONLY ON)
     endif()
 
-    cpm_utils_message(STATUS
-        "Using bundled package ${PKG_ARGS_NAME}@${PKG_ARGS_VERSION}")
+    if(NOT "${${PKG_ARGS_NAME}_CUSTOM_DIR}" STREQUAL "")
+        if(NOT IS_DIRECTORY "${${PKG_ARGS_NAME}_CUSTOM_DIR}")
+            message(FATAL_ERROR "[CPMUtil] ${PKG_ARGS_NAME}_CUSTOM_DIR is not a directory: "
+                "${${PKG_ARGS_NAME}_CUSTOM_DIR}")
+        endif()
+        cpm_utils_message(STATUS "Using custom ${PKG_ARGS_NAME} source: "
+            "${${PKG_ARGS_NAME}_CUSTOM_DIR} (requested ${PKG_ARGS_VERSION}; custom revision is not verified)")
+    else()
+        cpm_utils_message(STATUS "Using bundled package ${PKG_ARGS_NAME}@${PKG_ARGS_VERSION}")
+    endif()
 
     # Download/extract package
     if (${PKG_ARGS_NAME}_CUSTOM_DIR STREQUAL "")
@@ -900,6 +921,16 @@ function(AddPackage)
         # cache path
         get_cache_path(${PKG_ARGS_NAME} ${key} cache_path)
 
+        if(CPMUTIL_OFFLINE)
+            compute_patch_key("${PKG_ARGS_PATCHES}" offline_patch_key)
+            needs_refetch("${cache_path}" "${offline_patch_key}" offline_cache_invalid)
+            if(offline_cache_invalid)
+                message(FATAL_ERROR "[CPMUtil] Offline dependency missing: ${PKG_ARGS_NAME}. "
+                    "Set -D${PKG_ARGS_NAME}_CUSTOM_DIR=<source-directory>, install a compatible "
+                    "system development package, or populate ${cache_path} online first. "
+                    "No download was attempted.")
+            endif()
+        endif()
         fetch_package(
             URL "${PKG_ARGS_URL}"
             HASH "${PKG_ARGS_HASH}"
@@ -921,10 +952,14 @@ function(AddPackage)
         ${EXTRA_ARGS}
         ${PKG_ARGS_UNPARSED_ARGUMENTS})
 
+    set(registered_revision "${PKG_ARGS_VERSION}")
+    if(NOT "${${PKG_ARGS_NAME}_CUSTOM_DIR}" STREQUAL "")
+        set(registered_revision "custom source (requested ${PKG_ARGS_VERSION}, revision unverified)")
+    endif()
     cpmutil_register_package(
         ${PKG_ARGS_NAME}
         ${pkg_git_url}
-        ${PKG_ARGS_VERSION})
+        "${registered_revision}")
 
     set(${PKG_ARGS_NAME}_ADDED YES PARENT_SCOPE)
     Propagate(${PKG_ARGS_NAME}_SOURCE_DIR)

@@ -8,8 +8,10 @@
 
 #include <boost/algorithm/string.hpp>
 #include "common/common_types.h"
+#include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
@@ -41,6 +43,10 @@ enum class GameVerificationResult {
  * \param fs_controller [FileSystemController] reference from the Core::System instance
  * \param title_id Unique title ID representing the DLC which will be removed
  * \return 'true' if successful
+ *
+ * Removing content leaves its ticket in the NAND's ticket store (see InstallNSP). Other
+ * installed content may share the ticket's rights ID, which is not tracked here, and a kept
+ * ticket only lets suyu decrypt that content if it is installed again.
  */
 inline bool RemoveDLC(const Service::FileSystem::FileSystemController& fs_controller,
                       const u64 title_id) {
@@ -177,6 +183,18 @@ inline InstallResult InstallNSP(Core::System& system, FileSys::VfsFilesystem& vf
     }
     const auto res =
         system.GetFileSystemController().GetUserNANDContents()->InstallEntry(*nsp, true, copy);
+    if (res == FileSys::InstallResult::Success ||
+        res == FileSys::InstallResult::OverwriteExisting) {
+        // Keep the NSP's tickets with the installed content, as a Switch does, so titlekey-
+        // encrypted DLC and updates still open after a restart. The tickets are copied as
+        // shipped (title keys stay encrypted in them); no key file is written.
+        const auto nand_dir = Common::FS::GetSuyuPath(Common::FS::SuyuPath::NANDDir);
+        for (const auto& entry : nsp->GetFiles()) {
+            if (entry != nullptr && entry->GetExtension() == "tik") {
+                Core::Crypto::StoreInstalledTicket(nand_dir, entry);
+            }
+        }
+    }
     switch (res) {
     case FileSys::InstallResult::Success:
         return InstallResult::Success;

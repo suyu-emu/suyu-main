@@ -25,6 +25,13 @@ constexpr bool IsValidVirtualCoreId(int32_t core_id) {
 /// Creates a new thread
 Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u64 arg,
                     u64 stack_bottom, s32 priority, s32 core_id) {
+    // Logged at WARNING rather than DEBUG so the same line appears under both
+    // CPU backends without a logging-filter change. The static build reaches
+    // ten guest threads where dynarmic reaches forty-three past the same point;
+    // the entry points named here are what turns that count into a list of
+    // which threads the static run never asks for.
+    LOG_WARNING(Kernel_SVC, "svcCreateThread entry={:#x} arg={:#x} prio={} core={}", entry_point,
+                arg, priority, core_id);
     LOG_DEBUG(Kernel_SVC,
               "called entry_point=0x{:08X}, arg=0x{:08X}, stack_bottom=0x{:08X}, "
               "priority=0x{:08X}, core_id=0x{:08X}",
@@ -79,6 +86,11 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
 
     // Pass the thread handle to the thread local region.
     process.GetMemory().Write32(GetInteger(thread->GetTlsAddress()) + 0x110, *out_handle);
+
+    // Paired with the request line above: a request with no matching ok line
+    // failed one of the checks in between, which a count of created threads
+    // alone would not distinguish from a request never made.
+    LOG_WARNING(Kernel_SVC, "svcCreateThread ok entry={:#x} tid={}", entry_point, thread->GetId());
 
     R_SUCCEED();
 }

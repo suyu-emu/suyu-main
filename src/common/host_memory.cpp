@@ -27,7 +27,6 @@
 #include <sys/random.h>
 #elif defined(__APPLE__)
 #include <sys/types.h>
-#include <sys/random.h>
 #include <mach/vm_map.h>
 #include <mach/mach.h>
 #elif defined(__FreeBSD__)
@@ -412,6 +411,19 @@ static void* ChooseVirtualBase(size_t virtual_size) {
     // For Qualcomm devices, we must also allocate memory above 36 bits.
     const size_t lower = Map36BitSize / HugePageSize;
     const size_t upper = (Map39BitSize - virtual_size) / HugePageSize;
+
+    // A reservation that is itself 39 bits wide leaves nothing inside the 36..39 bit
+    // window, so `upper` lands at or below `lower` and the subtraction below wraps.
+    // Every hint derived from the wrapped range is garbage, all 64 attempts miss, and
+    // the caller reports a bogus "mmap failed" with errno untouched. Only arm64 without
+    // NCE reserves 39 bits -- Android and Linux arm64 set HAS_NCE and reserve 38 -- so
+    // macOS is the one configuration that reaches this. The low-address requirement is
+    // a Qualcomm driver quirk that does not apply there, so let the kernel place it.
+    if (upper <= lower) {
+        return mmap(nullptr, virtual_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    }
+
     const size_t range = upper - lower;
 
     // Try up to 64 times to allocate memory at random addresses in the range.
@@ -436,7 +448,10 @@ static void* ChooseVirtualBase(size_t virtual_size) {
         }
     }
 
-    return MAP_FAILED;
+    // The window exists but nothing in it was free. An address the kernel picks is still
+    // a working arena -- it has to be stable, not low -- which beats losing fastmem.
+    return mmap(nullptr, virtual_size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
 #else
@@ -508,7 +523,12 @@ public:
 
     bool Init() {
         long page_size = sysconf(_SC_PAGESIZE);
-        ASSERT_MSG(page_size == 0x1000, "page size {:#x} is incompatible with 4K paging", page_size);
+        if (page_size != 0x1000) {
+            LOG_WARNING(HW_Memory,
+                        "Host page size {} cannot support 4K fastmem mappings; using software page-table backing",
+                        page_size);
+            return false;
+        }
         // Backing memory initialization
 #if defined(__sun__) || defined(__HAIKU__) || defined(__NetBSD__) || defined(__DragonFly__)
         fd = shm_open_anon(O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
@@ -584,7 +604,7 @@ public:
             prot_flags |= PROT_READ;
         if (True(perms & MemoryPermission::Write))
             prot_flags |= PROT_WRITE;
-#ifdef ARCHITECTURE_arm64
+#if defined(ARCHITECTURE_arm64) && !defined(SUYU_NO_JIT)
         if (True(perms & MemoryPermission::Execute))
             prot_flags |= PROT_EXEC;
 #endif
@@ -619,7 +639,7 @@ public:
         if (write) {
             flags |= PROT_WRITE;
         }
-#ifdef HAS_NCE
+#if defined(HAS_NCE) && !defined(SUYU_NO_JIT)
         if (execute) {
             flags |= PROT_EXEC;
         }

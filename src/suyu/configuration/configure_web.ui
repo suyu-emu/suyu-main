@@ -175,6 +175,9 @@
         <property name="text">
          <string>Show Current Game in your Discord Status</string>
         </property>
+        <property name="toolTip">
+         <string>Shows the running game in your Discord activity. To find its box art, suyu looks the game's title up on English Wikipedia while this is on.</string>
+        </property>
        </widget>
       </item>
      </layout>

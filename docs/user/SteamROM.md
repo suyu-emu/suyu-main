@@ -1,5 +1,34 @@
 # User Handbook - Configuring Steam ROM Manager
 
+## Adding an exported game to Steam (no Steam ROM Manager needed)
+
+On Windows, suyu can add an exported game to Steam by itself. Steam ROM Manager is
+not required for this.
+
+1. Open **File > Export Game...** and pick the game.
+2. Use a Windows export with a program: **Build**, or the **suyu Dynarmic JIT (Baseline)**
+   backend.
+3. Tick **Add to Steam library when the export finishes**.
+4. Optional: tick **...and replace an existing shortcut for the same game** to remove
+   suyu's older shortcut for this game. Other shortcuts are not touched.
+5. Optional: tick **...and fetch cover art from Wikipedia**. This sends the game's
+   title to English Wikipedia. Without it, artwork is made from the game's icon.
+6. Export, then **restart Steam**.
+
+The shortcut runs the export's own program and is named after the game and backend:
+`<Game> (suyu Dynarmic JIT)`, `<Game> (suyu Hybrid JIT + AOT)` or
+`<Game> (suyu static AOT)`. Steam gets a cover, banner, hero, logo and icon.
+
+Good to know:
+
+- Your other Steam shortcuts are kept exactly as they were. If suyu can't fully read
+  Steam's shortcut file, it leaves the file untouched.
+- The shortcut goes to the first Steam account found on the computer.
+- A game that isn't in your suyu library is named after its file name.
+- Steam shows no description for non-Steam games; that is a Steam limitation.
+
+See [Exporting a Game](./GameExport.md) for the full export guide.
+
 ## Importing Eden into Steam with Steam Rom Manager
 
 Use this when you want to import the Eden AppImage into your Steam Library along with artwork using *Steam ROM Manager.*

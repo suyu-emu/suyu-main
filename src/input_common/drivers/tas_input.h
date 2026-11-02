@@ -4,7 +4,10 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -80,6 +83,12 @@ enum class TasState {
     Stopped,
 };
 
+enum class TasBootMode {
+    None,
+    Playback,
+    Recording,
+};
+
 class Tas final : public InputEngine {
 public:
     explicit Tas(std::string input_engine_);
@@ -95,6 +104,11 @@ public:
 
     // Main loop that records or executes input
     void UpdateThread();
+
+    // Reset TAS state and select the mode that will consume frame zero on the
+    // first renderer callback of a newly booted title. This must run before the
+    // emulation thread starts.
+    void BeginBootSession(TasBootMode mode);
 
     // Sets the flag to start or stop the TAS command execution and swaps controllers profiles
     void StartStop();
@@ -125,6 +139,11 @@ public:
      * Total length of script file currently loaded or being recorded
      */
     std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> GetStatus() const;
+
+    /// Monotonic natural-EOF count, exact command count, and whether the
+    /// completed playback restarted because looping was enabled. Manual
+    /// stop/reset does not advance the generation.
+    std::tuple<u64, size_t, bool> GetCompletionStatus() const;
 
 private:
     enum class TasAxis : u8;
@@ -195,6 +214,11 @@ private:
     std::array<std::vector<TASCommand>, PLAYER_NUMBER> commands{};
     std::vector<TASCommand> record_commands{};
     size_t current_command{0};
+    mutable std::mutex completion_status_mutex;
+    u64 completion_generation{0};
+    size_t last_completed_commands{0};
+    bool last_completion_looping{false};
     TASCommand last_input{}; // only used for recording
+    mutable std::mutex input_snapshot_mutex;
 };
 } // namespace InputCommon::TasInput

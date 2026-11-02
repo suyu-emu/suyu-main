@@ -49,6 +49,14 @@ void ServiceFrameworkBase::RegisterHandlersBase(const FunctionInfoBase* function
         handlers.emplace_hint(handlers.cend(), functions[i].expected_header, functions[i]);
 }
 
+void ServiceFrameworkBase::RegisterHandlerBase(const FunctionInfoBase& function) {
+    handlers.emplace(function.expected_header, function);
+}
+
+void ServiceFrameworkBase::RegisterHandlerBaseTipc(const FunctionInfoBase& function) {
+    handlers_tipc.emplace(function.expected_header, function);
+}
+
 void ServiceFrameworkBase::RegisterHandlersBaseTipc(const FunctionInfoBase* functions, std::size_t n) {
     // Usually this array is sorted by id already, so hint to insert at the end
     handlers_tipc.reserve(handlers_tipc.size() + n);

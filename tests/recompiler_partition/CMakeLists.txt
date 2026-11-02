@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22)
+project(recompiler_partition LANGUAGES CXX)
+add_executable(partition_export export.cpp)
+target_compile_features(partition_export PRIVATE cxx_std_20)
+target_include_directories(partition_export PRIVATE "${SUYU_SOURCE}/src")

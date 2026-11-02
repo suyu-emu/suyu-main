@@ -7,6 +7,8 @@
 
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <filesystem>
 #include <QMainWindow>
@@ -318,9 +320,13 @@ private:
     void PreventOSSleep();
     void AllowOSSleep();
 
-    bool LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params);
+    bool LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params,
+                 u64 title_id, bool allow_auto_recomp, bool require_auto_recomp);
     void BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
-                  StartGameType with_config = StartGameType::Normal);
+                  StartGameType with_config = StartGameType::Normal,
+                  bool require_auto_recomp = false,
+                  InputCommon::TasInput::TasBootMode tas_boot_mode =
+                      InputCommon::TasInput::TasBootMode::None);
     void BootGameFromList(const QString& filename, StartGameType with_config);
     void ShutdownGame();
 
@@ -439,6 +445,7 @@ private slots:
     void OnToggleStatusBar();
     void OnToggleFoldersInList();
     void OnExportGame();
+    void OnSetup();
     /// Switch-style first-boot setup. Chains the dialogs that already exist
     /// rather than duplicating them; runs once, then never again.
     void RunFirstRunSetupIfNeeded();
@@ -472,6 +479,10 @@ private slots:
     void ResetWindowSize800();
     void ResetWindowSize900();
     void ResetWindowSize1080();
+    void SetupResolutionScaleMenu();
+    void UpdateResolutionScaleMenu();
+    void OnResolutionScaleSelected(Settings::ResolutionSetup setup);
+    void RestartForResolutionScale(Settings::ResolutionSetup setup);
     void UpdateUITheme();
     void OnAlbum();
     void OnCabinet(Service::NFP::CabinetMode mode);
@@ -576,7 +587,20 @@ private:
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
+
+    // Last perf sample, kept so the MCP state tool can report it.
+    // GetAndResetPerfStats() clears the counters, so whoever calls it takes the
+    // numbers away from everyone else - the status bar and a poller cannot both
+    // call it. Cached here on the status bar's tick instead.
+    std::atomic<double> last_game_fps_{0.0};
+    std::atomic<double> last_system_fps_{0.0};
+    std::atomic<double> last_frame_ms_{0.0};
+    std::atomic<double> last_emu_speed_{0.0};
     QLabel* emu_frametime_label = nullptr;
+    /// Says which CPU is running the game, and whether it has left the
+    /// recompiled image. Otherwise that is only knowable from a file
+    /// written after the run.
+    QLabel* cpu_backend_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
     QLabel* ssl_status_label = nullptr;
@@ -594,6 +618,7 @@ private:
 
     // Whether emulation is currently running in suyu.
     bool emulation_running = false;
+    u64 auto_loaded_recompiled_title_id = 0;
     std::unique_ptr<EmuThread> emu_thread;
     // The path to the game currently running
     QString current_game_path;
@@ -620,10 +645,13 @@ private:
     std::unique_ptr<FileSys::ManualContentProvider> provider;
 
     // Debugger panes
-    ProfilerWidget* profilerWidget;
-    MicroProfileDialog* microProfileDialog;
-    WaitTreeWidget* waitTreeWidget;
-    ControllerDialog* controller_dialog;
+    ProfilerWidget* profilerWidget{};
+    // Only assigned under #if MICROPROFILE_ENABLED, which is off on Linux. Without
+    // the initializer the null guards in ApplyAppMode test uninitialized memory and
+    // the setVisible call through the garbage pointer segfaults at startup.
+    MicroProfileDialog* microProfileDialog{};
+    WaitTreeWidget* waitTreeWidget{};
+    ControllerDialog* controller_dialog{};
 
     // Feature widgets
     ProgrammerEnvironment* programmer_env_{};
@@ -640,6 +668,9 @@ private:
     AppMode current_mode_{AppMode::Gamer};
 
     QAction* actions_recent_files[max_recent_files_item];
+
+    // Resolution scale entries in View -> Resolution Scale, keyed by the value they select
+    std::vector<std::pair<Settings::ResolutionSetup, QAction*>> resolution_scale_actions;
 
     // stores default icon theme search paths for the platform
     QStringList default_theme_paths;

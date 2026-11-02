@@ -29,6 +29,33 @@ Loader::ResultStatus ProgramMetadata::Load(VirtualFile file) {
         return Loader::ResultStatus::ErrorBadNPDMHeader;
     }
 
+    // Log the process ISA up front. The static recompiler is AArch64-only, so
+    // whether a title is A32 or A64 decides whether it can be targeted at all -
+    // and nothing else in the boot log says so until BootGame prints the window
+    // title.
+    //
+    // The hash is here because size alone is not an identity. Two updates of
+    // one title can share a main.npdm size while differing in architecture, so a
+    // log line that prints only the size cannot say which of the two a given
+    // code path actually loaded - and that ambiguity is exactly what stalled the
+    // investigation into which update suyu applies.
+    //
+    // FNV-1a rather than SHA256: this only has to distinguish two files in a
+    // log, and it keeps the loader free of a crypto dependency.
+    const auto bytes = file->ReadAllBytes();
+    u64 fnv = 0xCBF29CE484222325ULL;
+    for (const u8 b : bytes) {
+        fnv = (fnv ^ b) * 0x100000001B3ULL;
+    }
+
+    LOG_INFO(Loader,
+                 "DIAG NPDM name='{}' size={} hash={:016x} flags={:#04x} is64={} addr_space={} "
+                 "prio={}",
+                 file->GetName(), total_size, fnv, npdm_header.flags,
+                 npdm_header.has_64_bit_instructions.Value(),
+                 static_cast<u32>(npdm_header.address_space_type.Value()),
+                 npdm_header.main_thread_priority);
+
     if (sizeof(AcidHeader) != file->ReadObject(&acid_header, npdm_header.acid_offset)) {
         return Loader::ResultStatus::ErrorBadACIDHeader;
     }
@@ -36,6 +63,10 @@ Loader::ResultStatus ProgramMetadata::Load(VirtualFile file) {
     if (sizeof(AciHeader) != file->ReadObject(&aci_header, npdm_header.aci_offset)) {
         return Loader::ResultStatus::ErrorBadACIHeader;
     }
+
+    // The title id names which program this NPDM belongs to, which is the other
+    // half of identifying it - a base and its update carry different ids.
+    LOG_INFO(Loader, "DIAG NPDM   title_id={:016X}", aci_header.title_id);
 
     // Load acid_file_access per-component instead of the entire struct, since this struct does not
     // reflect the layout of the real data.

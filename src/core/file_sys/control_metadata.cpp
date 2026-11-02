@@ -15,8 +15,12 @@
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "common/swap.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/loader/loader.h"
 
 namespace FileSys {
 

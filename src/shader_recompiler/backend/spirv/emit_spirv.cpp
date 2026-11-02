@@ -474,32 +474,40 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     }
 }
 
-void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
-            // Flatten all leading PHIs from each block into a vector
-            std::vector<IR::Inst*> phi_instructions;
-            for (IR::Block* block : program.blocks) {
-                for (auto it = block->begin(); it != block->end(); ++it) {
-                    if (it->GetOpcode() != IR::Opcode::Phi)
-                        break;
-                    phi_instructions.push_back(&*it);
-                }
-            }
+// Accept both Sirit's original value-only callback and its newer value/parent
+// callback. This pass changes only incoming values; existing parent labels must
+// be preserved with either API. No SPIR-V operation is dropped or substituted.
+struct DeferredPhiPatch {
+    EmitContext& ctx;
+    const std::vector<IR::Inst*>& instructions;
+    size_t index = static_cast<size_t>(-1);
 
-            if (phi_instructions.empty()) {
-                return; // nothing to patch
-            }
-
-            // Start "before" first PHI; advance on phi_arg == 0
-            size_t phi_index = static_cast<size_t>(-1);
-
-            ctx.PatchDeferredPhi([&](size_t phi_arg, Id parent) -> std::pair<Id, Id> {
-                if (phi_arg == 0) {
-                    ++phi_index;
-                }
-                IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
-            });
+    Id operator()(size_t argument) {
+        if (argument == 0) {
+            ++index;
         }
+        return ctx.Def(instructions.at(index)->Arg(argument));
+    }
+
+    std::pair<Id, Id> operator()(size_t argument, Id parent) {
+        return {(*this)(argument), parent};
+    }
+};
+
+void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
+    std::vector<IR::Inst*> phi_instructions;
+    for (IR::Block* block : program.blocks) {
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            if (it->GetOpcode() != IR::Opcode::Phi) {
+                break;
+            }
+            phi_instructions.push_back(&*it);
+        }
+    }
+    if (!phi_instructions.empty()) {
+        ctx.PatchDeferredPhi(DeferredPhiPatch{ctx, phi_instructions});
+    }
+}
 } // Anonymous namespace
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {

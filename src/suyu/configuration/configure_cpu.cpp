@@ -46,6 +46,7 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
     auto* backend_layout = ui->widget_backend->layout();
     auto* unsafe_layout = ui->unsafe_widget->layout();
     std::map<u32, QWidget*> unsafe_hold{};
+    QWidget* cache_affinity_widget = nullptr;
 
     std::vector<Settings::BasicSetting*> settings;
     const auto push = [&](Settings::Category category) {
@@ -75,6 +76,8 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.cpu_backend.Id()) {
             backend_layout->addWidget(widget);
             backend_combobox = widget->combobox;
+        } else if (setting->Id() == Settings::values.cache_affinity.Id()) {
+            cache_affinity_widget = widget;
         } else {
             // Presently, all other settings here are unsafe checkboxes
             unsafe_hold.insert({setting->Id(), widget});
@@ -88,6 +91,9 @@ void ConfigureCpu::Setup(const ConfigurationShared::Builder& builder) {
     backend_status_label = new QLabel(this);
     backend_status_label->setWordWrap(true);
     backend_layout->addWidget(backend_status_label);
+    if (cache_affinity_widget != nullptr) {
+        backend_layout->addWidget(cache_affinity_widget);
+    }
 
     UpdateGroup(accuracy_combobox->currentIndex());
 }

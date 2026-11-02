@@ -6,6 +6,7 @@
 
 #include "core/core.h"
 #include "core/hle/kernel/k_hardware_timer.h"
+#include "core/hle/kernel/k_lock_trace.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
@@ -67,8 +68,18 @@ Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_typ
         timeout = timeout_ns;
     }
 
-    R_RETURN(
-        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout));
+    if (!LockTrace::Enabled()) {
+        R_RETURN(GetCurrentProcess(system.Kernel())
+                     .WaitAddressArbiter(address, arb_type, value, timeout));
+    }
+    const u32 tid = static_cast<u32>(GetCurrentThreadPointer(system.Kernel())->GetId());
+    LockTrace::Record(LockTrace::Ev::Await, tid, address, static_cast<u32>(arb_type),
+                      static_cast<u32>(value),
+                      GetCurrentProcess(system.Kernel()).GetMemory().Read32(address));
+    const Result r =
+        GetCurrentProcess(system.Kernel()).WaitAddressArbiter(address, arb_type, value, timeout);
+    LockTrace::Record(LockTrace::Ev::AwaitExit, tid, address, r.raw);
+    R_RETURN(r);
 }
 
 // Signals to an address (via Address Arbiter)
@@ -82,6 +93,10 @@ Result SignalToAddress(Core::System& system, u64 address, SignalType signal_type
     R_UNLESS(Common::IsAligned(address, sizeof(s32)), ResultInvalidAddress);
     R_UNLESS(IsValidSignalType(signal_type), ResultInvalidEnumValue);
 
+    LockTrace::Record(LockTrace::Ev::Signal,
+                      static_cast<u32>(GetCurrentThreadPointer(system.Kernel())->GetId()), address,
+                      static_cast<u32>(signal_type), static_cast<u32>(value),
+                      static_cast<u32>(count));
     R_RETURN(GetCurrentProcess(system.Kernel())
                  .SignalAddressArbiter(address, signal_type, value, count));
 }

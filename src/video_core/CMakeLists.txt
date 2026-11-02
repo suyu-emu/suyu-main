@@ -201,6 +201,8 @@ add_library(video_core STATIC
     vulkan_common/vulkan_device.h
     vulkan_common/vulkan_instance.cpp
     vulkan_common/vulkan_instance.h
+    vulkan_common/vulkan_external.cpp
+    vulkan_common/vulkan_external.h
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
     vulkan_common/vulkan_memory_allocator.cpp
@@ -394,7 +396,7 @@ if (ARCHITECTURE_x86_64)
     target_link_libraries(video_core PUBLIC xbyak::xbyak)
 endif()
 
-if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
+if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT SUYU_NO_JIT)
     target_link_libraries(video_core PRIVATE dynarmic::dynarmic)
 endif()
 

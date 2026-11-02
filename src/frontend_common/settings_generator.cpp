@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <random>
-#include <frozen/string.h>
+#include <string_view>
 #include "common/settings.h"
 #include "common/random.h"
 #include "settings_generator.h"
@@ -14,7 +14,7 @@ void GenerateSettings() {
     // Web Token
     if (Settings::values.suyu_token.GetValue().empty()) {
         static constexpr const size_t token_length = 48;
-        static constexpr const frozen::string token_set = "abcdefghijklmnopqrstuvwxyz";
+        static constexpr std::string_view token_set = "abcdefghijklmnopqrstuvwxyz";
         static std::uniform_int_distribution<int> token_dist(0, token_set.size() - 1);
         std::string result;
         for (size_t i = 0; i < token_length; ++i) {

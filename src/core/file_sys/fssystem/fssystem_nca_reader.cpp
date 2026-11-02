@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
 #include "core/file_sys/fssystem/fssystem_nca_file_system_driver.h"
 #include "core/file_sys/vfs/vfs_offset.h"
@@ -69,18 +71,30 @@ Result NcaReader::Initialize(VirtualFile base_storage, const NcaCryptoConfigurat
                                 AesXtsStorageForNcaHeader::KeySize, HeaderKeyTypeValues[i]);
     }
 
+    // Without the user's header key there is nothing to decrypt with: only a plaintext
+    // header can be read, and the caller reports the missing key for anything else.
+    const auto key_missing = [](const auto& key) {
+        return std::all_of(key.begin(), key.end(), [](u8 b) { return b == 0; });
+    };
+    const bool have_header_key =
+        !key_missing(header_decryption_keys[0]) && !key_missing(header_decryption_keys[1]);
+
     // Create the header storage.
     std::array<u8, AesXtsStorageForNcaHeader::IvSize> header_iv = {};
-    work_header_storage = std::make_unique<AesXtsStorageForNcaHeader>(
-        base_storage, header_decryption_keys[0].data(), header_decryption_keys[1].data(),
-        AesXtsStorageForNcaHeader::KeySize, header_iv.data(), AesXtsStorageForNcaHeader::IvSize,
-        NcaHeader::XtsBlockSize);
+    if (have_header_key) {
+        work_header_storage = std::make_unique<AesXtsStorageForNcaHeader>(
+            base_storage, header_decryption_keys[0].data(), header_decryption_keys[1].data(),
+            AesXtsStorageForNcaHeader::KeySize, header_iv.data(),
+            AesXtsStorageForNcaHeader::IvSize, NcaHeader::XtsBlockSize);
 
-    // Check that we successfully created the storage.
-    R_UNLESS(work_header_storage != nullptr, ResultAllocationMemoryFailedInNcaReaderA);
+        // Check that we successfully created the storage.
+        R_UNLESS(work_header_storage != nullptr, ResultAllocationMemoryFailedInNcaReaderA);
 
-    // Read the header.
-    work_header_storage->ReadObject(std::addressof(m_header), 0);
+        // Read the header.
+        work_header_storage->ReadObject(std::addressof(m_header), 0);
+    } else {
+        m_header.magic = 0;
+    }
 
     // Validate the magic.
     if (const Result magic_result = CheckNcaMagic(m_header.magic); R_FAILED(magic_result)) {

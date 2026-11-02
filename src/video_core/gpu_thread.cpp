@@ -14,6 +14,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -35,7 +36,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto current_context = context.Acquire();
         CommandDataContainer next;
         while (!stop_token.stop_requested()) {
-            state.queue.PopWait(next, stop_token);
+            {
+                ::Vulkan::StallProbe::Accum probe{::Vulkan::StallProbe::gpu_idle_ns};
+                state.queue.PopWait(next, stop_token);
+            }
             if (stop_token.stop_requested()) {
                 break;
             }
@@ -59,6 +63,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
         }
     });
+}
+
+void ThreadManager::ShutdownThread() {
+    if (!thread.joinable()) {
+        return;
+    }
+    {
+        // Under write_lock so no producer can pass the stop check in PushCommand and then
+        // block in EmplaceWait on a queue whose consumer has already exited.
+        std::scoped_lock lk{state.write_lock};
+        thread.request_stop();
+    }
+    thread.join();
 }
 
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
@@ -101,6 +118,10 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     }
 
     std::unique_lock lk(state.write_lock);
+    if (thread.get_stop_token().stop_requested()) {
+        // No consumer is left; queueing would only fill the queue and block the caller.
+        return state.last_fence;
+    }
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
 

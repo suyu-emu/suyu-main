@@ -35,7 +35,14 @@ class PlaceholderCache;
 /// registered caches.
 class BISFactory {
 public:
-    explicit BISFactory(VirtualDir nand_root, VirtualDir load_root, VirtualDir dump_root);
+    /// `system_registered` overrides where installed system content is read from. When null,
+    /// it is nand_root/system/Contents/registered. Placeholders and the content directory
+    /// stay under nand_root either way, so installs still go to this NAND.
+    /// `system_registered` / `user_registered` replace this NAND's own registered content
+    /// folders when given (read-only content borrowed from another installation).
+    explicit BISFactory(VirtualDir nand_root, VirtualDir load_root, VirtualDir dump_root,
+                        VirtualDir system_registered = nullptr,
+                        VirtualDir user_registered = nullptr);
     ~BISFactory();
 
     VirtualDir GetSystemNANDContentDirectory() const;

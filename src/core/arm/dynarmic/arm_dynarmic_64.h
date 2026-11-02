@@ -65,6 +65,9 @@ public:
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
+    // External invalidation may originate on another core. Only the callback
+    // thread touches last_code_addr or the cached instruction bytes.
+    std::atomic<bool> code_read_dirty{false};
     u64 last_code_addr = u64(-1);
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;

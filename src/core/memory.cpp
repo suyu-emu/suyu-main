@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -22,6 +23,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -62,6 +64,9 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+        // A new process and table: recompiled blocks re-verify, and GG1 starts
+        // tracking this table's mappings (ABI 6 GG1).
+        Core::RecompGuardGen::OnPageTableSwap(current_page_table->entries.data());
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -73,6 +78,13 @@ struct Memory::Impl {
                    GetInteger(target));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
+        // ABI 6 GG1: a mapping over recompiled code, or of its physical pages
+        // anywhere else, ends that module's generation skipping.
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnMap(page_table.entries.data(), GetInteger(base), size,
+                                        GetInteger(target),
+                                        True(perms & Common::MemoryPermission::Write));
+        }
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
@@ -85,6 +97,9 @@ struct Memory::Impl {
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
                  Common::PageType::Unmapped);
+        if (Core::RecompGuardGen::Watching()) {
+            Core::RecompGuardGen::OnUnmap(page_table.entries.data(), GetInteger(base), size);
+        }
 
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
@@ -303,7 +318,45 @@ struct Memory::Impl {
         return (current_page_table->entries[addr >> YUZU_PAGEBITS].block == current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].block) ? GetPointerSilent(addr) : nullptr;
     }
 
+    // ABI 6 generation code guard (core/arm/recomp/recomp_guard_gen.h). The
+    // recompiler marks the code pages of modules that skip their per-entry
+    // check; every write this class performs is reported after it lands, and
+    // every writable raw pointer it hands out is reported before.
+    bool RecompWatched(u64 vaddr, u64 size) const {
+        const auto& pt = *current_page_table;
+        return Core::RecompGuardGen::AnyWatched(
+            pt.entries.data(), sizeof(Common::PageTable::PageEntryData), YUZU_PAGEBITS,
+            u64{1} << pt.GetAddressSpaceBits(), vaddr, size);
+    }
+
+    void NoteRecompWrite(u64 vaddr, u64 size) const {
+        if (!Core::RecompGuardGen::Watching()) [[likely]] {
+            return;
+        }
+        // Orders the write before the watch-word read, against the recompiler
+        // setting the word and then moving the generation: either this sees the
+        // word, or a block verified after that sees the written bytes.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (RecompWatched(vaddr, size)) {
+            Core::RecompGuardGen::OnWatchedWrite(current_page_table->entries.data(),
+                                                 vaddr & 0xffffffffffffULL, size);
+        }
+    }
+
+    void NoteRecompPointer(u64 vaddr, u64 size) const {
+        if (!Core::RecompGuardGen::Watching()) [[likely]] {
+            return;
+        }
+        if (Core::RecompGuardGen::Prelogging() || RecompWatched(vaddr, size)) {
+            Core::RecompGuardGen::OnPointerExposed(current_page_table->entries.data(),
+                                                   vaddr & 0xffffffffffffULL, size);
+        }
+    }
+
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
+        SCOPE_EXIT {
+            NoteRecompWrite(GetInteger(addr), size);
+        };
         return WalkBlock(addr, size,
         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ 0x{:016X} (start address = 0x{:016X}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
@@ -320,6 +373,9 @@ struct Memory::Impl {
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
+        SCOPE_EXIT {
+            NoteRecompWrite(GetInteger(addr), size);
+        };
         return WalkBlock(addr, size,
         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016X} (start address = {:#016X}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
@@ -334,7 +390,7 @@ struct Memory::Impl {
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
-        return WalkBlock(dest_addr, size,
+        return WalkBlock(src_addr, size,
         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016X} (start address = {:#016X}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
             ZeroBlock(dest_addr + offset, copy_amount);
@@ -643,7 +699,7 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ 0x{:016X} = 0x{:016X}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
+        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
     }
 
@@ -657,7 +713,9 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
+            NoteRecompWrite(GetInteger(vaddr), sizeof(T));
+            return stored;
         }
         return true;
     }
@@ -671,7 +729,9 @@ struct Memory::Impl {
             },
             [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
         if (ptr) {
-            return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
+            NoteRecompWrite(GetInteger(vaddr), sizeof(u128));
+            return stored;
         }
         return true;
     }
@@ -805,6 +865,23 @@ void Memory::ProtectRegion(Common::PageTable& page_table, Common::ProcessAddress
     impl->ProtectRegion(page_table, GetInteger(vaddr), size, perms);
 }
 
+Memory::PageTableView Memory::GetPageTableView() const {
+    if (!impl->current_page_table) {
+        return {};
+    }
+    const auto& pt = *impl->current_page_table;
+    return {
+        .entries = pt.entries.data(),
+        .entry_stride = sizeof(Common::PageTable::PageEntryData),
+        .page_bits = YUZU_PAGEBITS,
+        // PageInfo::ExtractPointer. Kept here rather than duplicated as a
+        // literal on the C side so the two cannot drift apart.
+        .pointer_mask =
+            static_cast<u64>(~uintptr_t{0} << Common::PageTable::ATTRIBUTE_BITS),
+        .address_space_max = u64{1} << pt.GetAddressSpaceBits(),
+    };
+}
+
 bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
     const auto& page_table = *impl->current_page_table;
     const size_t page = vaddr >> YUZU_PAGEBITS;
@@ -829,11 +906,16 @@ bool Memory::IsValidVirtualAddressRange(Common::ProcessAddress base, u64 size) c
     return true;
 }
 
+// A writable raw pointer covers, as far as this class can tell, the rest of its
+// page: pages need not be contiguous in host memory, which is why WalkBlock and
+// GetSpan exist for anything longer.
 u8* Memory::GetPointer(Common::ProcessAddress vaddr) {
+    impl->NoteRecompPointer(GetInteger(vaddr), YUZU_PAGESIZE - (GetInteger(vaddr) & YUZU_PAGEMASK));
     return impl->GetPointer(vaddr);
 }
 
 u8* Memory::GetPointerSilent(Common::ProcessAddress vaddr) {
+    impl->NoteRecompPointer(GetInteger(vaddr), YUZU_PAGESIZE - (GetInteger(vaddr) & YUZU_PAGEMASK));
     return impl->GetPointerSilent(vaddr);
 }
 
@@ -912,6 +994,7 @@ const u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) const {
 }
 
 u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) {
+    impl->NoteRecompPointer(src_addr, size);
     return impl->GetSpan(src_addr, size);
 }
 

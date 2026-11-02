@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <span>
 
@@ -67,9 +68,16 @@ private:
     /// Returns a raw motion value from a buffer
     s16 GetRawIMUValues(size_t sensor, size_t axis, const InputReportActive& input) const;
 
-    /// Returns motion data from a buffer
-    MotionData GetMotionInput(const InputReportActive& input,
-                              const MotionStatus& motion_status) const;
+    /// Returns the number of IMU samples available in the current active report
+    std::size_t GetMotionSampleCount() const;
+
+    /// Returns one IMU sample of the current active report as motion data
+    MotionData GetMotionInput(const InputReportActive& input, const MotionStatus& motion_status,
+                              std::size_t sample) const;
+
+    /// Hands every IMU sample of the report to `deliver`, paced at the sensor's 5ms interval
+    void DeliverMotion(const InputReportActive& input, const MotionStatus& motion_status,
+                       const std::function<void(MotionData&)>& deliver) const;
 
     ControllerType device_type{};
 
@@ -77,6 +85,11 @@ private:
     JoyStickCalibration left_stick_calibration{};
     JoyStickCalibration right_stick_calibration{};
     MotionCalibration motion_calibration{};
+
+    // Third IMU sample of the current active report. InputReportActive only holds two; the third
+    // shares its bytes with the Ring-Con data, so it is only valid while the Ring-Con is off.
+    std::array<s16, 6> third_motion_sample{};
+    bool has_third_motion_sample{};
 
     JoyconCallbacks callbacks{};
 };

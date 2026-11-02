@@ -17,14 +17,31 @@ static constexpr size_t BACKING_SIZE = 4_GiB;
 static constexpr auto PERMS = Common::MemoryPermission::ReadWrite;
 static constexpr auto HEAP = false;
 
+static void RequireFastmemArena(HostMemory& mem) {
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    if (mem.VirtualBasePointer() == nullptr) {
+        SKIP("Fastmem arena unavailable; software page-table backing is tested separately");
+    }
+}
+
 TEST_CASE("HostMemory: Initialize and deinitialize", "[common]") {
     {
         HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
         REQUIRE(mem.BackingBasePointer() != nullptr);
+        volatile u8* const backing = mem.BackingBasePointer();
+        backing[0] = 17;
+        backing[BACKING_SIZE - 1] = 29;
+        REQUIRE(backing[0] == 17);
+        REQUIRE(backing[BACKING_SIZE - 1] == 29);
     }
     {
         HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
         REQUIRE(mem.BackingBasePointer() != nullptr);
+        volatile u8* const backing = mem.BackingBasePointer();
+        backing[0] = 17;
+        backing[BACKING_SIZE - 1] = 29;
+        REQUIRE(backing[0] == 17);
+        REQUIRE(backing[BACKING_SIZE - 1] == 29);
     }
 }
 

@@ -86,7 +86,8 @@ class InstallableFragment : Fragment() {
                 R.string.user_data,
                 R.string.user_data_description,
                 install = { importUserDataLauncher.launch(arrayOf("application/zip")) },
-                export = { exportUserDataLauncher.launch("export.zip") }
+                export = { exportUserDataLauncher.launch("export.zip") },
+                installLabelId = R.string.import_user_data
             ),
             Installable(
                 R.string.manage_save_data,
@@ -123,17 +124,20 @@ class InstallableFragment : Fragment() {
                                 )
                         )
                     }
-                }
+                },
+                installLabelId = R.string.import_save_warning
             ),
             Installable(
                 R.string.install_game_content,
                 R.string.install_game_content_description,
-                install = { installGameUpdateLauncher.launch(arrayOf("*/*")) }
+                install = { installGameUpdateLauncher.launch(arrayOf("*/*")) },
+                installLabelId = R.string.install_game_content
             ),
             Installable(
                 R.string.install_firmware,
                 R.string.install_firmware_description,
-                install = { getFirmwareLauncher.launch(arrayOf("application/zip")) }
+                install = { getFirmwareLauncher.launch(arrayOf("application/zip")) },
+                installLabelId = R.string.install_firmware
             ),
             Installable(
                 R.string.uninstall_firmware,
@@ -144,17 +148,21 @@ class InstallableFragment : Fragment() {
                         fragmentManager = parentFragmentManager,
                         homeViewModel = homeViewModel
                     )
-                }
+                },
+                installIconId = R.drawable.ic_delete,
+                installLabelId = R.string.uninstall_firmware
             ),
             Installable(
                 R.string.install_prod_keys,
                 R.string.install_prod_keys_description,
-                install = { getProdKeyLauncher.launch(arrayOf("*/*")) }
+                install = { getProdKeyLauncher.launch(arrayOf("*/*")) },
+                installLabelId = R.string.install_prod_keys
             ),
             Installable(
                 R.string.install_amiibo_keys,
                 R.string.install_amiibo_keys_description,
-                install = { getAmiiboKeyLauncher.launch(arrayOf("*/*")) }
+                install = { getAmiiboKeyLauncher.launch(arrayOf("*/*")) },
+                installLabelId = R.string.install_amiibo_keys
             )
         )
 

@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QFileIconProvider>
 #include <QPainter>
 #include <QPainterPath>
 #include <QObject>

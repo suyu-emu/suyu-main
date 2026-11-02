@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QImage>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -38,6 +39,21 @@ public:
 
     /// Remove a previously added shortcut.
     bool RemoveGameShortcut(const QString& game_title);
+
+    /// Add, or repoint, a shortcut that runs a standalone launcher directly - an exported game -
+    /// rather than suyu with a ROM. An existing shortcut for the same launcher is updated in
+    /// place, so exporting again does not duplicate it. When @p replace_title is not empty,
+    /// shortcuts with that title that launch anything else (suyu with the ROM) are removed so
+    /// the launcher takes their place.
+    bool AddLauncherShortcut(const QString& app_name, const QString& launcher_path,
+                             const QString& replace_title = {});
+
+    /// Write library artwork for a shortcut added by AddLauncherShortcut into the grid folder
+    /// of the same Steam account: portrait and wide capsules, hero, logo and icon, named by
+    /// the shortcut's appid. @p cover, when not null, is used for the capsules and hero in
+    /// place of @p icon. Only this shortcut's files are touched, each replaced atomically.
+    bool WriteLauncherArtwork(const QString& app_name, const QString& launcher_path,
+                              const QImage& icon, const QImage& cover = {});
 
     enum class ArtworkType {
         Grid,

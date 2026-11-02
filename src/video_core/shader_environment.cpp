@@ -66,6 +66,15 @@ static Shader::TextureType ConvertTextureType(const Tegra::Texture::TICEntry& en
 }
 
 static Shader::TexturePixelFormat ConvertTexturePixelFormat(const Tegra::Texture::TICEntry& entry) {
+    // Texture cache rejects this exact zero-address TIC as unbound. Shader
+    // specialization may still query it while translating an IR instruction.
+    // Return the same noninteger fallback used by the unsupported-format path;
+    // malformed nonzero descriptors still reach that diagnostic.
+    if (entry.Address() == 0 &&
+        std::ranges::all_of(entry.raw, [](u64 word) { return word == 0; })) {
+        return static_cast<Shader::TexturePixelFormat>(
+            VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM);
+    }
     return static_cast<Shader::TexturePixelFormat>(
         PixelFormatFromTextureInfo(entry.format, entry.r_type, entry.g_type, entry.b_type,
                                    entry.a_type, entry.srgb_conversion));
@@ -458,7 +467,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::ifstream& file) {
+void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -478,8 +487,23 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    const auto require_bytes = [&](u64 count, u64 item_size) {
+        const auto position = file.tellg();
+        if (position < std::streampos{} || position > end ||
+            count > static_cast<u64>(end - position) / item_size) {
+            throw std::ios_base::failure("Invalid pipeline cache environment length");
+        }
+    };
+    // GenericEnvironment scans at most 1 MiB and serializes one extra instruction.
+    if (code_size > 0x100000 + INST_SIZE || read_highest < read_lowest ||
+        read_lowest != start_address ||
+        code_size != static_cast<u64>(read_highest) - read_lowest + INST_SIZE) {
+        throw std::ios_base::failure("Invalid pipeline cache shader size");
+    }
+    require_bytes(code_size, 1);
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
+    require_bytes(num_texture_types, sizeof(u32) + sizeof(Shader::TextureType));
     for (size_t i = 0; i < num_texture_types; ++i) {
         u32 key;
         Shader::TextureType type;
@@ -487,6 +511,8 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
             .read(reinterpret_cast<char*>(&type), sizeof(type));
         texture_types.emplace(key, type);
     }
+    require_bytes(num_texture_pixel_formats,
+                  sizeof(u32) + sizeof(Shader::TexturePixelFormat));
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
         u32 key;
         Shader::TexturePixelFormat format;
@@ -494,6 +520,7 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
             .read(reinterpret_cast<char*>(&format), sizeof(format));
         texture_pixel_formats.emplace(key, format);
     }
+    require_bytes(num_cbuf_values, sizeof(u64) + sizeof(u32));
     for (size_t i = 0; i < num_cbuf_values; ++i) {
         u64 key;
         u32 value;
@@ -501,6 +528,8 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
             .read(reinterpret_cast<char*>(&value), sizeof(value));
         cbuf_values.emplace(key, value);
     }
+    require_bytes(num_cbuf_replacement_values,
+                  sizeof(u64) + sizeof(Shader::ReplaceConstant));
     for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
         u64 key;
         Shader::ReplaceConstant value;
@@ -518,6 +547,9 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         if (stage == Shader::Stage::Geometry) {
             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
         }
+    }
+    if (initial_offset > code_size) {
+        throw std::ios_base::failure("Invalid pipeline cache shader header");
     }
     is_proprietary_driver = texture_bound == 2;
 }
@@ -627,7 +659,7 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -636,48 +668,87 @@ void LoadPipelines(
     const auto end{file.tellg()};
     file.seekg(0, std::ios::beg);
 
-    std::array<char, 8> magic_number;
-    u32 cache_version;
-    file.read(magic_number.data(), magic_number.size())
-        .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
-    if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
-        file.close();
-        if (Common::FS::RemoveFile(filename)) {
-            if (magic_number != MAGIC_NUMBER) {
-                LOG_ERROR(Common_Filesystem, "Invalid pipeline cache file");
+    // Tracks the end of the last complete, successfully-parsed record (starting right
+    // after the header), so a corrupt tail can be trimmed instead of the whole file - an
+    // exported package's cache can pick up a torn last entry (e.g. an export that copies
+    // the file while it is still being appended to, or an unclean previous shutdown), and
+    // that used to cost every pipeline that parsed cleanly before it, not just the bad one.
+    std::streampos last_good_pos{-1};
+    try {
+        std::array<char, 8> magic_number;
+        u32 cache_version;
+        file.read(magic_number.data(), magic_number.size())
+            .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
+        if (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version) {
+            file.close();
+            if (Common::FS::RemoveFile(filename)) {
+                if (magic_number != MAGIC_NUMBER) {
+                    LOG_ERROR(Common_Filesystem, "Invalid pipeline cache file");
+                }
+                if (cache_version != expected_cache_version) {
+                    LOG_INFO(Common_Filesystem, "Deleting old pipeline cache");
+                }
+            } else {
+                LOG_ERROR(Common_Filesystem,
+                          "Invalid pipeline cache file and failed to delete it in \"{}\"",
+                          Common::FS::PathToUTF8String(filename));
             }
-            if (cache_version != expected_cache_version) {
-                LOG_INFO(Common_Filesystem, "Deleting old pipeline cache");
-            }
-        } else {
-            LOG_ERROR(Common_Filesystem,
-                      "Invalid pipeline cache file and failed to delete it in \"{}\"",
-                      Common::FS::PathToUTF8String(filename));
-        }
-        return;
-    }
-    while (file.tellg() != end) {
-        if (stop_loading.stop_requested()) {
             return;
         }
-        u32 num_envs{};
-        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-        std::vector<FileEnvironment> envs(num_envs);
-        for (FileEnvironment& env : envs) {
-            env.Deserialize(file);
-        }
-        if (envs.front().ShaderStage() == Shader::Stage::Compute) {
-            load_compute(file, std::move(envs.front()));
-        } else {
-            load_graphics(file, std::move(envs));
-        }
-    }
+        last_good_pos = file.tellg();
 
-} catch (const std::ios_base::failure& e) {
-    LOG_ERROR(Common_Filesystem, "{}", e.what());
-    if (!Common::FS::RemoveFile(filename)) {
-        LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
-                  Common::FS::PathToUTF8String(filename));
+        while (file.tellg() != end) {
+            if (stop_loading.stop_requested()) {
+                return;
+            }
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs == 0 || num_envs > Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram) {
+                throw std::ios_base::failure("Invalid pipeline cache environment count");
+            }
+            std::vector<FileEnvironment> envs(num_envs);
+            for (FileEnvironment& env : envs) {
+                env.Deserialize(file, end);
+            }
+            if (envs.front().ShaderStage() == Shader::Stage::Compute) {
+                if (num_envs != 1) {
+                    throw std::ios_base::failure("Invalid compute pipeline cache record");
+                }
+                load_compute(file, std::move(envs.front()));
+            } else {
+                load_graphics(file, std::move(envs));
+            }
+            last_good_pos = file.tellg();
+        }
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "{}", e.what());
+        if (last_good_pos <= std::streampos{0}) {
+            // Nothing usable was ever read (the corruption starts right at/before the
+            // header), so there is no good prefix worth keeping.
+            file.close();
+            if (!Common::FS::RemoveFile(filename)) {
+                LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
+                          Common::FS::PathToUTF8String(filename));
+            }
+            return;
+        }
+        // Keep every pipeline that parsed cleanly: truncate to the last full record
+        // instead of discarding the entire cache over a single corrupt tail entry.
+        // Future compiles still append after this point via SerializePipeline.
+        file.close();
+        std::error_code ec;
+        std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(last_good_pos), ec);
+        if (ec) {
+            LOG_ERROR(Common_Filesystem,
+                      "Failed to truncate corrupt pipeline cache tail in \"{}\": {}",
+                      Common::FS::PathToUTF8String(filename), ec.message());
+        } else {
+            LOG_WARNING(Common_Filesystem,
+                        "Pipeline cache file \"{}\" had a corrupt tail; kept {} bytes of "
+                        "valid entries instead of discarding the whole cache",
+                        Common::FS::PathToUTF8String(filename),
+                        static_cast<std::uintmax_t>(last_good_pos));
+        }
     }
 }
 

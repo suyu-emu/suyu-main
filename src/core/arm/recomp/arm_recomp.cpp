@@ -5,16 +5,23 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <mutex>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "common/logging/log.h"
+#include "common/string_util.h"
+#include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/arm/debug.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -47,6 +54,15 @@ struct GuestContextView {
     // thread pointer) because the two have different owners and different
     // lifetimes; see the note on GuestContext in core/recompiler/arm64_to_c.h.
     u64 tpidrro_el0;
+    // FP control and status. Modelled here so they survive the marshal to and
+    // from the fallback JIT - without these fields the guest's rounding mode
+    // was silently reset to the host default on every engine transition.
+    u64 fpcr;
+    u64 fpsr;
+    // Must sit here rather than at the end: the emitted struct continues with
+    // heap bookkeeping this view does not model, so a field appended after that
+    // point would be at a different offset on each side.
+    int chain_budget;
 };
 
 // Matches RecompHostMem in the generated runtime. The recompiled code calls
@@ -58,7 +74,46 @@ struct RecompHostMem {
     void* user;
     u64 (*load)(void* user, u64 va, u32 size);
     void (*store)(void* user, u64 va, u32 size, u64 value);
+    // Exclusive access, routed at the kernel's own monitor so recompiled code
+    // and the fallback JIT contend correctly against each other.
+    u64 (*excl_load)(void* user, u64 va, u32 size);
+    u32 (*excl_store)(void* user, u64 va, u32 size, u64 value);
+    void (*clear_excl)(void* user);
+    // The physical counter, read from the emulator's timing source so the
+    // recompiled code and the JIT agree about time.
+    u64 (*read_cntpct)(void* user);
+    // Exclusive pair forms; `size` is the width of one register, 4 or 8.
+    void (*excl_load_pair)(void* user, u64 va, u32 size, u64* lo, u64* hi);
+    // Page table, so generated code can resolve a mapped address inline instead
+    // of calling out for every load and store. Mirrors GetPointerImpl's fast
+    // path; a null backing pointer (unmapped, debug, or GPU-tracked memory)
+    // falls through to `load`/`store` so rasterizer invalidation still happens.
+    u32 (*excl_store_pair)(void* user, u64 va, u32 size, u64 lo, u64 hi);
+    const void* page_entries;
+    u64 page_entry_stride;
+    u64 page_bits;
+    u64 pointer_mask;
+    u64 address_space_max;
 };
+
+// This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
+// RecompHostMem) because the generated project is plain C and shares no headers
+// with the emulator. Nothing links the two, so a field added in the middle of
+// one and at the end of the other compiles cleanly on both sides and hands the
+// generated code a function pointer where it expects data.
+//
+// That is not hypothetical: inserting the page-table fields after
+// excl_load_pair here, while the emitter appended them after excl_store_pair,
+// made recompiled code dereference excl_store_pair's code pointer as a page
+// table. suyu died during boot with no diagnostic. Hence these.
+static_assert(offsetof(RecompHostMem, excl_load_pair) == 56);
+static_assert(offsetof(RecompHostMem, excl_store_pair) == 64);
+static_assert(offsetof(RecompHostMem, page_entries) == 72);
+static_assert(offsetof(RecompHostMem, page_entry_stride) == 80);
+static_assert(offsetof(RecompHostMem, page_bits) == 88);
+static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
+static_assert(offsetof(RecompHostMem, address_space_max) == 104);
+static_assert(sizeof(RecompHostMem) == 112);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -69,8 +124,23 @@ static_assert(offsetof(GuestContextView, pc) == 256);
 static_assert(offsetof(GuestContextView, pending_svc) == 304);
 static_assert(offsetof(GuestContextView, vreg) == 312);
 static_assert(offsetof(GuestContextView, tpidr_el0) == 824);
+static_assert(offsetof(GuestContextView, chain_budget) == 864);
+
+// Blocks a chain of direct calls may run before returning here. Only this side
+// sets it - the generated code just decrements - so the emitter does not need
+// to agree on the value.
+//
+// It bounds two things. How long a guest loop can run without the interrupt and
+// SVC checks below getting a look in; and, because the generated calls are not
+// guaranteed to be tail calls, how deep the host stack goes. Guest threads run
+// on 512 KB fibers (common/fiber.cpp) and a block frame carrying SIMD locals is
+// not small, so this has to stay well under what that stack can hold. 256
+// overflowed it and crashed on boot.
+constexpr int kChainBudget = 32;
 static_assert(offsetof(GuestContextView, host_mem) == 832);
 static_assert(offsetof(GuestContextView, tpidrro_el0) == 840);
+static_assert(offsetof(GuestContextView, fpcr) == 848);
+static_assert(offsetof(GuestContextView, fpsr) == 856);
 
 // The generated code signals an SVC by parking with this set. Kept in sync
 // with the emitted recomp_svc contract in core/recompiler/arm64_to_c.h.
@@ -101,6 +171,198 @@ constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
+
+/// Execution coverage for the AOT path (mk8-recomp #13).
+///
+/// The exporter's static coverage says what fraction of the *image* translates.
+/// It cannot say what fraction of *execution* stays on the recompiled path,
+/// and those differ by orders of magnitude: one untranslated instruction inside
+/// a hot loop costs a full engine transition on every iteration, while a
+/// thousand untranslated instructions in code that never runs cost nothing.
+///
+/// Only this decides whether the AOT path is worth anything, and only this can
+/// rank the missing opcodes by what actually executes.
+struct RecompCounters {
+    std::atomic<u64> static_blocks{0};
+    std::atomic<u64> svc_calls{0};
+    std::atomic<u64> fallback_from_miss{0};
+    std::atomic<u64> fallback_from_unhandled{0};
+    std::atomic<u64> jit_to_static{0};
+    std::atomic<u64> unresolved_import_traps{0};
+    std::atomic<u64> no_fallback_available{0};
+
+    // Guarded rather than atomic: these are touched only on a transition, which
+    // is by definition already the slow path.
+    std::mutex hist_lock;
+    std::map<u32, u64> unhandled_insn;  ///< guest encoding -> times it forced a fallback
+    std::map<u64, u64> miss_pc;         ///< PC with no block -> times it forced a fallback
+    std::map<u32, u64> svc_numbers;     ///< SVC imm -> times the guest issued it
+    /// Load address -> module name, so a PC in this report can be resolved to
+    /// module+offset. Without it the addresses mean nothing except beside the
+    /// matching boot log, and a report read against another run's log resolves
+    /// to the wrong place without saying so.
+    std::map<u64, std::string> modules;
+
+    void RecordModules(const std::map<u64, std::string>& m) {
+        std::scoped_lock lk{hist_lock};
+        modules = m;
+    }
+
+    void RecordSvc(u32 num) {
+        std::scoped_lock lk{hist_lock};
+        ++svc_numbers[num];
+    }
+
+    void RecordUnhandled(u32 insn) {
+        std::scoped_lock lk{hist_lock};
+        ++unhandled_insn[insn];
+    }
+    void RecordMiss(u64 pc) {
+        std::scoped_lock lk{hist_lock};
+        ++miss_pc[pc];
+    }
+};
+
+RecompCounters g_counters;
+std::atomic<int> g_live_instances{0};
+
+template <typename Map>
+auto TopN(const Map& m, size_t n) {
+    // Not Map::value_type: that has a const key and so is not assignable, which
+    // partial_sort requires.
+    using Entry = std::pair<typename Map::key_type, typename Map::mapped_type>;
+    std::vector<Entry> v(m.begin(), m.end());
+    std::partial_sort(v.begin(), v.begin() + std::min(n, v.size()), v.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (v.size() > n) {
+        v.resize(n);
+    }
+    return v;
+}
+
+/// Formats the run's execution-coverage report.
+///
+/// Built as a string rather than logged line by line so the same text can go to
+/// both the log and a file. The file matters: the emulated process is not
+/// always torn down at shutdown, so ~ArmRecomp may never run and the whole
+/// run's measurement is lost with it. Writing periodically means a report
+/// always exists for the last completed interval however the process ends.
+std::string FormatRecompCoverage() {
+    const u64 blocks = g_counters.static_blocks.load();
+    const u64 miss = g_counters.fallback_from_miss.load();
+    const u64 unh = g_counters.fallback_from_unhandled.load();
+    const u64 transitions = miss + unh;
+
+    if (blocks == 0 && transitions == 0) {
+        return {};  // backend never ran; saying nothing is better than printing zeros
+    }
+
+    std::string o = "=== RECOMP EXECUTION COVERAGE ===\n";
+    o += fmt::format("  static blocks executed : {}\n", blocks);
+    o += fmt::format("  SVCs to HLE            : {}\n", g_counters.svc_calls.load());
+    o += fmt::format("  static -> JIT          : {} ({} lookup miss, {} unimplemented opcode)\n",
+                     transitions, miss, unh);
+    o += fmt::format("  JIT -> static          : {}\n", g_counters.jit_to_static.load());
+    o += fmt::format("  unresolved import traps: {}\n", g_counters.unresolved_import_traps.load());
+    if (const u64 nofb = g_counters.no_fallback_available.load(); nofb) {
+        o += fmt::format("  threads killed with no JIT fallback: {}\n", nofb);
+    }
+
+    // Blocks per transition is the number that matters. Each transition costs a
+    // 32-GPR + 32-vector marshal in each direction, so a high static block count
+    // next to a comparable transition count is worse than it looks.
+    if (transitions) {
+        o += fmt::format("  blocks per transition  : {:.1f}\n",
+                         double(blocks) / double(transitions));
+    } else {
+        o += fmt::format("  blocks per transition  : no transitions - fully static\n");
+    }
+
+    std::scoped_lock lk{g_counters.hist_lock};
+
+    if (!g_counters.unhandled_insn.empty()) {
+        o += "  --- unimplemented opcodes by execution count ---\n";
+        for (const auto& [insn, count] : TopN(g_counters.unhandled_insn, 24)) {
+            o += fmt::format("    {:08X}  {:>10}  {:5.2f}%  (sig {:08X})\n", insn, count,
+                             unh ? 100.0 * double(count) / double(unh) : 0.0, insn & 0xFFC00000u);
+        }
+        o += fmt::format("    {} distinct encodings\n", g_counters.unhandled_insn.size());
+    }
+
+    if (!g_counters.svc_numbers.empty()) {
+        // What the guest actually asks the kernel for. A boot that stops making
+        // system calls while still executing millions of blocks is spinning on
+        // something, and this says on what.
+        o += "  --- SVCs by call count ---\n";
+        for (const auto& [num, count] : TopN(g_counters.svc_numbers, 16)) {
+            o += fmt::format("    svc 0x{:02X}  {:>10}\n", num, count);
+        }
+        o += fmt::format("    {} distinct SVCs\n", g_counters.svc_numbers.size());
+    }
+
+    if (!g_counters.modules.empty()) {
+        o += "  --- loaded modules ---\n";
+        for (const auto& [base, name] : g_counters.modules) {
+            o += fmt::format("    {:#018x}  {}\n", base, name);
+        }
+    }
+
+    if (!g_counters.miss_pc.empty()) {
+        // Resolved here rather than left to the reader: a bare guest PC
+        // needs this run's load addresses to mean anything, and pairing a
+        // report with another run's log gives a confident wrong answer.
+        const auto resolve = [](u64 pc) -> std::string {
+            u64 best = 0;
+            const std::string* name = nullptr;
+            for (const auto& [base, module_name] : g_counters.modules) {
+                if (pc >= base && base >= best) {
+                    best = base;
+                    name = &module_name;
+                }
+            }
+            return name ? fmt::format("  {}+{:#x}", *name, pc - best) : std::string{};
+        };
+        o += "  --- uncovered PCs by execution count ---\n";
+        for (const auto& [pc, count] : TopN(g_counters.miss_pc, 16)) {
+            o += fmt::format("    {:#018x}  {:>10}{}\n", pc, count, resolve(pc));
+        }
+        o += fmt::format("    {} distinct PCs\n", g_counters.miss_pc.size());
+    }
+    o += "=== END RECOMP EXECUTION COVERAGE ===\n";
+    return o;
+}
+
+void WriteRecompCoverageFile(const std::string& text) {
+    const auto path = Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_coverage.txt";
+    std::ofstream out(path, std::ios::trunc);
+    if (out) {
+        out << text;
+    }
+}
+
+void ReportRecompCoverage() {
+    const std::string report = FormatRecompCoverage();
+    if (report.empty()) {
+        return;
+    }
+    WriteRecompCoverageFile(report);
+    // Split by hand: the report is already newline-delimited and the logger
+    // takes one line at a time.
+    size_t pos = 0;
+    while (pos < report.size()) {
+        const size_t nl = report.find('\n', pos);
+        const std::string_view line{report.data() + pos,
+                                    (nl == std::string::npos ? report.size() : nl) - pos};
+        if (!line.empty()) {
+            LOG_INFO(Core_ARM, "{}", line);
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        pos = nl + 1;
+    }
+}
+
 } // namespace
 
 void SetRecompLookup(RecompLookupFn lookup) {
@@ -123,7 +385,125 @@ struct ArmRecomp::Impl {
         bridge.user = this;
         bridge.load = &Impl::HostLoad;
         bridge.store = &Impl::HostStore;
+        bridge.excl_load = &Impl::HostExclusiveLoad;
+        bridge.excl_store = &Impl::HostExclusiveStore;
+        bridge.clear_excl = &Impl::HostClearExclusive;
+        bridge.read_cntpct = &Impl::HostReadCntpct;
+        bridge.excl_load_pair = &Impl::HostExclusiveLoadPair;
+        bridge.excl_store_pair = &Impl::HostExclusiveStorePair;
+        // Filled in by RefreshPageTable once a process exists; until then the
+        // fields stay null and every access takes the callback path.
+        bridge.page_entries = nullptr;
         ctx.host_mem = &bridge;
+    }
+
+    // The monitor is per-core, and core_index is what distinguishes one guest
+    // thread's reservation from another's. Without a monitor (no owning process,
+    // so no fallback either) these degrade to plain accesses with STXR always
+    // succeeding - the old behaviour, and wrong under threads, but that
+    // configuration cannot run a real title anyway.
+    static u64 HostExclusiveLoad(void* user, u64 va, u32 size) {
+        auto* self = static_cast<Impl*>(user);
+        if (!self->exclusive_monitor) {
+            return HostLoad(user, va, size);
+        }
+        const auto core = self->core_index;
+        switch (size) {
+        case 1: return self->exclusive_monitor->ExclusiveRead8(core, va);
+        case 2: return self->exclusive_monitor->ExclusiveRead16(core, va);
+        case 4: return self->exclusive_monitor->ExclusiveRead32(core, va);
+        case 8: return self->exclusive_monitor->ExclusiveRead64(core, va);
+        default: return HostLoad(user, va, size);
+        }
+    }
+
+    /// Returns 0 on success, 1 when the reservation was lost - the sense of the
+    /// status register STXR writes.
+    static u32 HostExclusiveStore(void* user, u64 va, u32 size, u64 value) {
+        auto* self = static_cast<Impl*>(user);
+        if (!self->exclusive_monitor) {
+            HostStore(user, va, size, value);
+            return 0;
+        }
+        const auto core = self->core_index;
+        bool ok = false;
+        switch (size) {
+        case 1: ok = self->exclusive_monitor->ExclusiveWrite8(core, va, static_cast<u8>(value)); break;
+        case 2: ok = self->exclusive_monitor->ExclusiveWrite16(core, va, static_cast<u16>(value)); break;
+        case 4: ok = self->exclusive_monitor->ExclusiveWrite32(core, va, static_cast<u32>(value)); break;
+        case 8: ok = self->exclusive_monitor->ExclusiveWrite64(core, va, value); break;
+        default: HostStore(user, va, size, value); return 0;
+        }
+        return ok ? 0u : 1u;
+    }
+
+    /// LDXP/LDAXP. The 64-bit pair takes a real 128-bit reservation; the
+    /// 32-bit pair is a 64-bit reservation whose two words are the registers,
+    /// which is what the architecture specifies rather than a shortcut.
+    static void HostExclusiveLoadPair(void* user, u64 va, u32 size, u64* lo, u64* hi) {
+        auto* self = static_cast<Impl*>(user);
+        if (!self->exclusive_monitor) {
+            *lo = HostLoad(user, va, size);
+            *hi = HostLoad(user, va + size, size);
+            return;
+        }
+        const auto core = self->core_index;
+        if (size == 8) {
+            const u128 v = self->exclusive_monitor->ExclusiveRead128(core, va);
+            *lo = v[0];
+            *hi = v[1];
+        } else {
+            const u64 v = self->exclusive_monitor->ExclusiveRead64(core, va);
+            *lo = static_cast<u32>(v);
+            *hi = static_cast<u32>(v >> 32);
+        }
+    }
+
+    /// STXP/STLXP. Returns 0 on success, matching STXR's status sense.
+    static u32 HostExclusiveStorePair(void* user, u64 va, u32 size, u64 lo, u64 hi) {
+        auto* self = static_cast<Impl*>(user);
+        if (!self->exclusive_monitor) {
+            HostStore(user, va, size, lo);
+            HostStore(user, va + size, size, hi);
+            return 0;
+        }
+        const auto core = self->core_index;
+        bool ok = false;
+        if (size == 8) {
+            ok = self->exclusive_monitor->ExclusiveWrite128(core, va, u128{lo, hi});
+        } else {
+            ok = self->exclusive_monitor->ExclusiveWrite64(
+                core, va, static_cast<u32>(lo) | (static_cast<u64>(static_cast<u32>(hi)) << 32));
+        }
+        return ok ? 0u : 1u;
+    }
+
+    /// Re-read the page table description into the bridge.
+    ///
+    /// Called on entry to a run rather than once at construction: the table
+    /// belongs to the process, and the pointer is not valid until one exists.
+    /// A stale pointer here would have generated code reading another address
+    /// space, so it is refreshed rather than cached forever.
+    void RefreshPageTable() {
+        const auto view = system.ApplicationMemory().GetPageTableView();
+        bridge.page_entries = view.entries;
+        bridge.page_entry_stride = view.entry_stride;
+        bridge.page_bits = view.page_bits;
+        bridge.pointer_mask = view.pointer_mask;
+        bridge.address_space_max = view.address_space_max;
+    }
+
+    /// The same source DynarmicCallbacks64::GetCNTPCT uses, so a guest thread
+    /// that migrates between engines sees one monotonic clock.
+    static u64 HostReadCntpct(void* user) {
+        return static_cast<Impl*>(user)->system.CoreTiming().GetClockTicks();
+    }
+
+    static void HostClearExclusive(void* user) {
+        auto* self = static_cast<Impl*>(user);
+        if (self->exclusive_monitor) {
+            self->exclusive_monitor->ClearExclusive(self->core_index);
+        }
     }
 
     static u64 HostLoad(void* user, u64 va, u32 size) {
@@ -154,6 +534,7 @@ struct ArmRecomp::Impl {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
+                g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
                 if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
@@ -510,9 +891,21 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
+    // One instance is built per core; the last one torn down prints the run's
+    // execution-coverage report.
+    g_live_instances.fetch_add(1, std::memory_order_relaxed);
 }
 
-ArmRecomp::~ArmRecomp() = default;
+ArmRecomp::~ArmRecomp() {
+    // Report on the *first* instance torn down, not the last. Waiting for the
+    // last one means the report is lost whenever anything still holds a
+    // reference at shutdown - which happens, and silently costs the whole run's
+    // measurement. All per-core instances go down together, so the first is
+    // just as complete.
+    g_live_instances.fetch_sub(1, std::memory_order_acq_rel);
+    static std::once_flag reported;
+    std::call_once(reported, [] { ReportRecompCoverage(); });
+}
 
 bool ArmRecomp::EnterFallback() {
     if (impl->fallback_unavailable) {
@@ -554,10 +947,15 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
     }
 
+    if (True(hr & HaltReason::SupervisorCall)) {
+        g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Return to recompiled execution as soon as the PC is covered again, so a
     // single uncovered function costs only the time spent inside it.
     if (impl->lookup && impl->lookup(impl->ctx.pc)) {
         impl->in_fallback = false;
+        g_counters.jit_to_static.fetch_add(1, std::memory_order_relaxed);
     }
     return hr;
 }
@@ -575,6 +973,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         LOG_ERROR(Core_ARM, "No recompiled code registered; cannot run thread");
         return HaltReason::BreakLoop;
     }
+
+    impl->RefreshPageTable();
 
     // Registering every loaded image's base with the host dispatcher is a
     // side effect of this call, not something its return value is used for
@@ -647,6 +1047,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             // exactly as if this were a real function that did nothing.
             static std::atomic<int> trap_count{0};
             if (trap_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+                g_counters.unresolved_import_traps.fetch_add(1, std::memory_order_relaxed);
                 LOG_ERROR(Core_ARM, "recomp: called through unresolved import (returning to caller {:#x})",
                           impl->ctx.x[30]);
             }
@@ -693,8 +1094,42 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                       impl->ctx.x[16], impl->ctx.x[17], impl->ctx.x[30], impl->ctx.x[31]);
             LOG_ERROR(Core_ARM, "recomp regs x0={:#x} x15={:#x} x18={:#x} x19={:#x}",
                       impl->ctx.x[0], impl->ctx.x[15], impl->ctx.x[18], impl->ctx.x[19]);
+            // The whole file, four per line. A miss is almost always a bad value
+            // in some register the previous block computed, and guessing which
+            // one to print in advance costs a rebuild per guess.
+            for (size_t r = 0; r < 32; r += 4) {
+                LOG_ERROR(Core_ARM, "recomp regs x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x} x{:<2}={:#018x}",
+                          r, impl->ctx.x[r], r + 1, impl->ctx.x[r + 1], r + 2, impl->ctx.x[r + 2],
+                          r + 3, impl->ctx.x[r + 3]);
+            }
+            // Dump guest memory around the registers that look like pointers.
+            // A miss caused by a bad *value* and one caused by the wrong data
+            // being mapped at the right address look identical from the
+            // register file alone.
+            for (u32 r : {8u, 22u, 25u}) {
+                const u64 p = impl->ctx.x[r];
+                if (p < 0x1000 || p > 0x0000'FFFF'FFFF'FFFFULL) {
+                    continue;
+                }
+                std::string dump;
+                for (s64 d = -0x20; d < 0x30; d += 4) {
+                    dump += fmt::format("{:08x} ", (u32)Impl::HostLoad(impl.get(), p + d, 4));
+                }
+                LOG_ERROR(Core_ARM, "recomp mem @x{} ({:#x}) [-0x20..+0x30): {}", r, p, dump);
+            }
             {
                 const u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
+                // A wide window through .rodata, to diff against the exporter's
+                // extracted copy: if the two disagree, the recompiled code is
+                // computing correct addresses into memory that holds something
+                // other than what was recompiled against.
+                for (u64 w = 0x3c00; w < 0x3d80; w += 0x40) {
+                    std::string dump;
+                    for (u64 i = 0; i < 0x40; i += 4) {
+                        dump += fmt::format("{:08x} ", (u32)Impl::HostLoad(impl.get(), mbase + w + i, 4));
+                    }
+                    LOG_ERROR(Core_ARM, "recomp rodata mod+{:#x}: {}", w, dump);
+                }
                 for (u64 seg : {0x0ULL, 0x2000ULL, 0x3000ULL}) {
                     std::string dump;
                     for (u64 i = 0; i < 0x40; i += 4) {
@@ -718,7 +1153,10 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 LOG_DEBUG(Core_ARM, "No recompiled block at PC {:#x}; falling back to JIT",
                           impl->ctx.pc);
             }
+            g_counters.fallback_from_miss.fetch_add(1, std::memory_order_relaxed);
+            g_counters.RecordMiss(impl->ctx.pc);
             if (!EnterFallback()) {
+                g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
                 LOG_CRITICAL(Core_ARM,
                              "recomp: no JIT fallback available at PC {:#x}; thread cannot "
                              "continue",
@@ -728,7 +1166,27 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             return RunFallback(thread);
         }
 
+        // Dump periodically: teardown is not guaranteed to run (the emulated
+        // process can outlive shutdown), and a run with no report is a run with
+        // no measurement. One compare per block against a power-of-two mask.
+        if ((g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed) &
+             0x3FFFFULL) == 0x3FFFFULL) {
+            WriteRecompCoverageFile(FormatRecompCoverage());
+        }
+        // Generated code calls a direct branch's target itself rather than
+        // coming back here, so one call below can run a whole chain of blocks.
+        // The budget bounds that chain, and what is left of it afterwards says
+        // how many blocks actually ran - without which every count here would
+        // report chains rather than blocks.
+        impl->ctx.chain_budget = kChainBudget;
         block(&impl->ctx);
+        {
+            const int spent = kChainBudget - impl->ctx.chain_budget;
+            if (spent > 1) {
+                g_counters.static_blocks.fetch_add(static_cast<u64>(spent - 1),
+                                                   std::memory_order_relaxed);
+            }
+        }
 
         // The block stopped on an instruction the decoder has no translation
         // for, having parked the PC on that instruction. Running it on the JIT
@@ -738,12 +1196,21 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // whatever code eventually dereferenced it.
         if (impl->ctx.halted == kHaltUnhandled) {
             impl->ctx.halted = 0;
+            // The generated code knows the encoding but cannot pass it back
+            // through the halt contract, so read it out of guest memory - the
+            // PC is parked exactly on the offending instruction. This is what
+            // ranks the missing opcodes by execution rather than by how often
+            // they appear in the image.
+            g_counters.fallback_from_unhandled.fetch_add(1, std::memory_order_relaxed);
+            g_counters.RecordUnhandled(
+                static_cast<u32>(Impl::HostLoad(impl.get(), impl->ctx.pc, 4)));
             static std::atomic<int> unhandled_count{0};
             if (unhandled_count.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_WARNING(Core_ARM, "recomp: unimplemented opcode at {:#x}; running on JIT",
                             impl->ctx.pc);
             }
             if (!EnterFallback()) {
+                g_counters.no_fallback_available.fetch_add(1, std::memory_order_relaxed);
                 LOG_CRITICAL(Core_ARM, "recomp: unimplemented opcode at {:#x} and no JIT fallback",
                              impl->ctx.pc);
                 return HaltReason::PrefetchAbort;
@@ -756,6 +1223,8 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             LOG_TRACE(Core_ARM, "recomp SVC {} at pc={:#x} x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
                       impl->ctx.pending_svc, impl->ctx.pc, impl->ctx.x[0], impl->ctx.x[1],
                       impl->ctx.x[2], impl->ctx.x[3]);
+            g_counters.svc_calls.fetch_add(1, std::memory_order_relaxed);
+            g_counters.RecordSvc(static_cast<u32>(impl->ctx.pending_svc));
             return HaltReason::SupervisorCall;
         }
     }
@@ -809,6 +1278,8 @@ void ArmRecomp::GetContext(Kernel::Svc::ThreadContext& ctx) const {
         ctx.v[i][0] = impl->ctx.vreg[i][0];
         ctx.v[i][1] = impl->ctx.vreg[i][1];
     }
+    ctx.fpcr = static_cast<u32>(impl->ctx.fpcr);
+    ctx.fpsr = static_cast<u32>(impl->ctx.fpsr);
     ctx.tpidr = impl->ctx.tpidr_el0;
 }
 
@@ -828,6 +1299,8 @@ void ArmRecomp::SetContext(const Kernel::Svc::ThreadContext& ctx) {
         impl->ctx.vreg[i][0] = ctx.v[i][0];
         impl->ctx.vreg[i][1] = ctx.v[i][1];
     }
+    impl->ctx.fpcr = ctx.fpcr;
+    impl->ctx.fpsr = ctx.fpsr;
     // Only the guest-owned thread pointer travels in ThreadContext. The
     // read-only one is republished separately by PhysicalCore::LoadContext
     // on every switch-in, so writing it from here would overwrite the

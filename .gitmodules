@@ -11,7 +11,8 @@
 	url = https://github.com/mozilla/cubeb.git
 [submodule "dynarmic"]
 	path = externals/dynarmic
-	url = https://github.com/suyu-emu/dynarmic.git
+	url = https://github.com/dougchansan/dynarmic.git
+	branch = mk8-recomp
 [submodule "libusb"]
 	path = externals/libusb/libusb
 	url = https://github.com/libusb/libusb.git
@@ -78,9 +79,6 @@
 [submodule "externals/nx-optimizer"]
 	path = externals/nx-optimizer
 	url = https://github.com/MaxLastBreath/nx-optimizer.git
-[submodule "externals/ownfoil"]
-	path = externals/ownfoil
-	url = https://github.com/a1ex4/ownfoil.git
 [submodule "externals/nxapi"]
 	path = externals/nxapi
 	url = https://github.com/samuelthomas2774/nxapi.git

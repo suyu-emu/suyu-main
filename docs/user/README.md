@@ -1,10 +1,8 @@
-# User Handbook
-
-The "FAQ".
+# suyu User Handbook
 
 This handbook is primarily aimed at the end-user - baking useful knowledge for enhancing their emulation experience.
 
-A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md).
+A copy of the public documentation is available from the [suyu docs site](https://suyu-emu.github.io/website/docs).
 
 ## Basics
 
@@ -26,6 +24,7 @@ A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/
 - **[Installing Atmosphere Mods](./InstallingAtmosphereMods.md)**
 - **[Installing Updates & DLCs](./InstallingUpdatesDLC.md)**
 - **[Multiplayer](./Multiplayer.md)**
+- **[Exporting a game](./GameExport.md)**
 
 ## 3rd-party Integration
 

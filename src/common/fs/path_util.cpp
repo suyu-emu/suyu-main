@@ -182,7 +182,9 @@ public:
 
 private:
     PathManagerImpl() {
+#ifndef SUYU_ANDROID_LIBRETRO
         Reinitialize();
+#endif
     }
 
     ~PathManagerImpl() = default;
@@ -324,12 +326,19 @@ fs::path GetExeDirectory() {
 }
 
 fs::path GetAppDataRoamingDirectory() {
+    // Match Qt and the launch environment, including redirected user profiles.
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata) {
+        const fs::path configured{appdata};
+        std::error_code ec;
+        if (fs::is_directory(configured, ec)) {
+            return configured;
+        }
+    }
     PWSTR appdata_roaming_path = nullptr;
-
-    SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
-
-    auto fs_appdata_roaming_path = fs::path{appdata_roaming_path};
-
+    const HRESULT result =
+        SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
+    const fs::path fs_appdata_roaming_path = SUCCEEDED(result) && appdata_roaming_path
+                                               ? fs::path{appdata_roaming_path} : fs::path{};
     CoTaskMemFree(appdata_roaming_path);
 
     if (fs_appdata_roaming_path.empty()) {

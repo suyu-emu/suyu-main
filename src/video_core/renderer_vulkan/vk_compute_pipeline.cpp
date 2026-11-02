@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -89,17 +90,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
-        } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
-                         exception.what());
-            std::scoped_lock lock{build_mutex};
-            is_built = true;
-            build_condvar.notify_one();
-            if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+
+            // Log compute pipeline creation
+            if (GPU::Logging::IsActive()) {
+                GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(
+                    "ComputePipeline created"
+                );
             }
-            return;
-        }
 
         // Log compute pipeline creation
         if (GPU::Logging::IsActive()) {
@@ -117,6 +114,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }
+        publish();
     }};
     if (thread_worker) {
         thread_worker->QueueWork(std::move(func));
@@ -238,6 +236,8 @@ void ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            StallProbe::Accum build_probe{StallProbe::build_wait_ns,
+                                               &StallProbe::build_wait_count};
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });

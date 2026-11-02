@@ -16,6 +16,14 @@
 
 #include <dynarmic/common/spin_lock.h>
 
+// On arm64 hosts every guest load-exclusive is an out-of-line callback. Taking the
+// global lock there lets guest spin-wait loops saturate it and starve other cores.
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#    define DYNARMIC_LOCKFREE_EXCLUSIVE_MARK 1
+#else
+#    define DYNARMIC_LOCKFREE_EXCLUSIVE_MARK 0
+#endif
+
 namespace Dynarmic {
 
 using VAddr = std::uint64_t;
@@ -37,12 +45,25 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
+#if DYNARMIC_LOCKFREE_EXCLUSIVE_MARK
+        // Publish the reservation before reading. Exclusive stores still serialize
+        // on the lock and compare against the saved value, so a racing store makes
+        // the later store-exclusive fail instead of succeeding on stale data. Every
+        // store-exclusive path MUST keep that compare-and-swap: without it this path
+        // loses updates that the locked path does not.
+        __atomic_store_n(&exclusive_addresses[processor_id], masked_address, __ATOMIC_SEQ_CST);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        const T value = op();
+        std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+        return value;
+#else
         Lock();
         exclusive_addresses[processor_id] = masked_address;
         const T value = op();
         std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
         Unlock();
         return value;
+#endif
     }
 
     /// Checks to see if processor processor_id has exclusive access to the
@@ -84,6 +105,8 @@ private:
     static constexpr VAddr INVALID_EXCLUSIVE_ADDRESS = 0xDEAD'DEAD'DEAD'DEADull;
     static constexpr size_t MAX_NUM_CPU_CORES = 4; // Sync with src/core/hardware_properties
     boost::container::static_vector<VAddr, MAX_NUM_CPU_CORES> exclusive_addresses;
+    // Entry i is read and written only by the thread running processor i. The lock-free
+    // ReadAndMark path depends on that; sharing a processor id across threads races here.
     boost::container::static_vector<Vector, MAX_NUM_CPU_CORES> exclusive_values;
     SpinLock lock;
 };

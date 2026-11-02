@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <array>
 #include <tuple>
 #include <stdint.h>
@@ -119,12 +120,19 @@ void Vic::Execute() noexcept {
 
     if (Settings::values.nvdec_emulation.GetValue() != Settings::NvdecEmulation::Off) {
         bool decoded_frame = false;
+        bool written_directly = false;
         for (size_t i = 0; i < config.slot_structs.size(); i++) {
             if (auto& slot_config = config.slot_structs[i]; slot_config.config.slot_enable) {
                 auto const luma_offset = regs.surfaces[i][SurfaceIndex::Current].luma.Address();
                 if (nvdec_id == -1)
                     nvdec_id = host1x.frame_queue.VicFindNvdecFdFromOffset(luma_offset);
                 if (auto frame = host1x.frame_queue.GetFrame(nvdec_id, luma_offset); frame.get()) {
+                    if (CanWriteDirect(config, slot_config, *frame)) {
+                        WriteDirectY8__V8U8_N420(config.output_surface_config, *frame);
+                        written_directly = true;
+                        decoded_frame = true;
+                        continue;
+                    }
                     switch (frame->GetPixelFormat()) {
                     case AV_PIX_FMT_YUV420P:
                         ReadY8__V8U8_N420(slot_config, regs.surfaces[i], std::move(frame), true);
@@ -142,6 +150,10 @@ void Vic::Execute() noexcept {
                     LOG_TRACE(HW_GPU, "Vic {} failed to get frame with offset {:#X}", id, luma_offset);
                 }
             }
+        }
+        if (written_directly) {
+            has_decoded_frame = true;
+            return;
         }
         if (decoded_frame) {
             has_decoded_frame = true;
@@ -689,6 +701,93 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
             std::memcpy(&output_surface[dst_line + rect_left], &slot_surface[src_line + source_left], copy_width * sizeof(Pixel));
         }
     }
+}
+
+bool Vic::CanWriteDirect(const ConfigStruct& config, const SlotStruct& slot, const FFmpeg::Frame& frame) const noexcept {
+    const auto& out = config.output_surface_config;
+    if (out.out_pixel_format.Value() != VideoPixelFormat::Y8__V8U8_N420 || out.out_block_kind.Value() != BlkKind::Pitch) {
+        return false;
+    }
+    if (frame.GetPixelFormat() != AV_PIX_FMT_NV12 && frame.GetPixelFormat() != AV_PIX_FMT_YUV420P) {
+        return false;
+    }
+    if (slot.config.frame_format.Value() != DxvhadFrameFormat::Progressive || slot.color_matrix.matrix_enable) {
+        return false;
+    }
+    size_t enabled = 0;
+    for (const auto& other : config.slot_structs) {
+        enabled += other.config.slot_enable ? 1 : 0;
+    }
+    if (enabled != 1) {
+        return false;
+    }
+    // The whole frame, at its own size, onto the whole output surface (whose luma plane may
+    // be wider, its rows padded)
+    const u32 width = out.out_surface_width + 1;
+    const u32 height = out.out_surface_height + 1;
+    if (u32(frame.GetWidth()) != width || u32(frame.GetHeight()) != height ||
+        out.out_luma_width + 1 < width || out.out_luma_height + 1 < height) {
+        return false;
+    }
+    if (slot.config.source_rect_left != 0 || slot.config.source_rect_top != 0 ||
+        slot.config.dest_rect_left != 0 || slot.config.dest_rect_top != 0 ||
+        config.output_config.target_rect_left != 0 || config.output_config.target_rect_top != 0) {
+        return false;
+    }
+    const auto reaches = [](u64 last, u32 size) {
+        return last + 1 >= size;
+    };
+    // The source rectangle is in 16.16 fixed point
+    const auto fixed = [](u64 value) {
+        return value >> 16;
+    };
+    return reaches(fixed(slot.config.source_rect_right), width) &&
+           reaches(fixed(slot.config.source_rect_bottom), height) &&
+           reaches(slot.config.dest_rect_right, width) && reaches(slot.config.dest_rect_bottom, height) &&
+           reaches(config.output_config.target_rect_right, width) &&
+           reaches(config.output_config.target_rect_bottom, height);
+}
+
+void Vic::WriteDirectY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config, const FFmpeg::Frame& frame) noexcept {
+    const u32 width = output_surface_config.out_surface_width + 1;
+    const u32 height = output_surface_config.out_luma_height + 1;
+    const u32 rows = (std::min)(height, u32(frame.GetHeight()));
+    const u32 luma_stride = Common::AlignUp(output_surface_config.out_luma_width + 1, 0x10);
+    const u32 chroma_height = output_surface_config.out_chroma_height + 1;
+    const u32 chroma_stride = Common::AlignUp((output_surface_config.out_chroma_width + 1) * 2, 0x10);
+
+    luma_scratch.resize_destructive(luma_stride * height);
+    const u8* const luma = frame.GetPlane(0);
+    const auto luma_in_stride = static_cast<size_t>(frame.GetStride(0));
+    for (u32 y = 0; y < rows; ++y) {
+        std::memcpy(&luma_scratch[y * luma_stride], luma + y * luma_in_stride, width);
+    }
+
+    chroma_scratch.resize_destructive(chroma_stride * chroma_height);
+    const u32 chroma_rows = (std::min)(chroma_height, (rows + 1) / 2);
+    if (frame.GetPixelFormat() == AV_PIX_FMT_NV12) {
+        const u8* const uv = frame.GetPlane(1);
+        const auto uv_stride = static_cast<size_t>(frame.GetStride(1));
+        for (u32 y = 0; y < chroma_rows; ++y) {
+            std::memcpy(&chroma_scratch[y * chroma_stride], uv + y * uv_stride, width);
+        }
+    } else {
+        const u8* const u = frame.GetPlane(1);
+        const u8* const v = frame.GetPlane(2);
+        const auto u_stride = static_cast<size_t>(frame.GetStride(1));
+        const auto v_stride = static_cast<size_t>(frame.GetStride(2));
+        for (u32 y = 0; y < chroma_rows; ++y) {
+            u8* const row = &chroma_scratch[y * chroma_stride];
+            for (u32 x = 0; x < width / 2; ++x) {
+                row[x * 2 + 0] = u[y * u_stride + x];
+                row[x * 2 + 1] = v[y * v_stride + x];
+            }
+        }
+    }
+
+    // Luma first, then chroma, as the converting path writes them (see there)
+    host1x.gmmu_manager.WriteBlock(regs.output_surface.luma.Address(), luma_scratch.data(), size_t{luma_stride} * height);
+    host1x.gmmu_manager.WriteBlock(regs.output_surface.chroma_u.Address(), chroma_scratch.data(), size_t{chroma_stride} * chroma_height);
 }
 
 void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) noexcept {

@@ -34,6 +34,8 @@ MultiplayerState::MultiplayerState(QWidget* parent, QStandardItemModel* game_lis
         error_callback_handle = member->BindOnError(
             [this](const Network::RoomMember::Error& error) { emit NetworkError(error); });
         connect(this, &MultiplayerState::NetworkError, this, &MultiplayerState::OnNetworkError);
+        room_information_callback_handle = member->BindOnRoomInformationChanged(
+            [this](const Network::RoomInformation&) { emit RoomInformationChanged(); });
     }
 
     qRegisterMetaType<Network::RoomMember::State>();
@@ -155,6 +157,11 @@ void MultiplayerState::Close() {
     if (error_callback_handle) {
         if (auto member = room_network.GetRoomMember().lock()) {
             member->Unbind(error_callback_handle);
+        }
+    }
+    if (room_information_callback_handle) {
+        if (auto member = room_network.GetRoomMember().lock()) {
+            member->Unbind(room_information_callback_handle);
         }
     }
     if (host_room) {

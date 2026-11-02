@@ -23,6 +23,12 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 > **This is the final public release of suyu — v0.04. This repository is a public archive.**
 >
 > No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
+>
+> **Note:** a small number of fixes were later pulled in from a community
+> continuation of this codebase, after users reported that installed
+> updates/DLC, service handler registration, and RomFS registration were all
+> broken in the archived build. Those fixes are folded in here as bug fixes to
+> suyu itself; this remains the same final v0.04 release, not new development.
 
 ## About
 

@@ -27,6 +27,9 @@ class InstallableAdapter(installables: List<Installable>) :
             binding.description.setText(model.descriptionId)
 
             binding.buttonInstall.setVisible(model.install != null)
+            binding.buttonInstall.setIconResource(model.installIconId)
+            binding.buttonInstall.contentDescription = binding.root.context.getString(model.installLabelId)
+            binding.buttonInstall.tooltipText = binding.root.context.getString(model.installLabelId)
             binding.buttonInstall.setOnClickListener { model.install?.invoke() }
             binding.buttonExport.setVisible(model.export != null)
             binding.buttonExport.setOnClickListener { model.export?.invoke() }

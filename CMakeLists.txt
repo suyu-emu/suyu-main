@@ -3,13 +3,16 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(yuzu)
+project(suyu)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")
 
-set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm)
+# Keep an explicit -DCPM_SOURCE_CACHE authoritative, including for read-only
+# source checkouts. A normal variable here would hide the caller's cache entry.
+set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cache/cpm" CACHE PATH
+    "Directory to download CPM dependencies")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 
@@ -22,6 +25,10 @@ include(UseCcache)
 include(CMakeDependentOption)
 include(CTest)
 include(CPMUtil)
+option(SUYU_USE_LOCAL_EXTERNALS "Use locally populated dependency trees (custom revisions)" OFF)
+if(SUYU_USE_LOCAL_EXTERNALS)
+    include(LocalDependencies)
+endif()
 
 if (NOT DEFINED ARCHITECTURE)
     message(FATAL_ERROR "Architecture didn't make it out of scope, did you delete DetectArchitecture.cmake?")
@@ -199,7 +206,8 @@ if(MSVC)
 endif()
 
 # TODO(crueter): Cleanup, each dep that has a bundled option should allow to choose between bundled, external, system
-cmake_dependent_option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" "${MSVC}" "NOT ANDROID" OFF)
+cmake_dependent_option(ENABLE_SDL3 "Enable SDL3 audio and input backends" ON "NOT ANDROID AND NOT IOS" OFF)
+cmake_dependent_option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" "${MSVC}" "ENABLE_SDL3" OFF)
 
 option(ENABLE_CUBEB "Enables the cubeb audio backend" ON)
 
@@ -227,13 +235,22 @@ cmake_dependent_option(ENABLE_OPENGL "Enable OpenGL" ON "NOT (WIN32 AND ARCHITEC
 mark_as_advanced(FORCE ENABLE_OPENGL)
 
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
+# A build with no dynamic recompiler in it at all. The CPU then comes
+# entirely from statically recompiled images, and an address none of them
+# covers is a hard failure rather than a fallback - which is the point.
+# Titles without a complete static image, and AArch32 titles, cannot run in
+# such a build. The guest-facing jit:u service goes with it.
+option(SUYU_NO_JIT "Build without dynarmic: statically recompiled code only" "${IOS}")
+if(IOS AND NOT SUYU_NO_JIT)
+    message(FATAL_ERROR "iOS requires SUYU_NO_JIT=ON")
+endif()
 option(SUYU_BUILD_LIBRETRO_CORE "Build suyu as a libretro core (suyu_libretro.dll)" OFF)
 if (SUYU_BUILD_LIBRETRO_CORE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
-cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
+cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" ON "NOT ANDROID" OFF)
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 
@@ -257,7 +274,7 @@ cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" 
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
 set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")
 
-cmake_dependent_option(YUZU_USE_BUNDLED_MOLTENVK "Download bundled MoltenVK lib" ON "APPLE" OFF)
+cmake_dependent_option(YUZU_USE_BUNDLED_MOLTENVK "Download bundled MoltenVK lib" ON "APPLE AND NOT IOS" OFF)
 
 option(YUZU_DISABLE_LLVM "Disable LLVM (useful for CI)" OFF)
 
@@ -378,7 +395,11 @@ else()
     set(OPENSSL_CONFIGURE_VERBOSE ON)
 
     if (OpenSSL_ADDED)
-        AddJsonPackage(openssl-cmake)
+        if (SUYU_ANDROID_LIBRETRO)
+            AddJsonPackage(NAME openssl-cmake OPTIONS "OPENSSL_CONFIGURE_OPTIONS no-asm")
+        else()
+            AddJsonPackage(openssl-cmake)
+        endif()
     endif()
 endif()
 
@@ -393,7 +414,10 @@ set(BUILD_TESTING OFF)
 set(ENABLE_TESTING OFF)
 
 # boost
-set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem crc variant)
+set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem context crc variant)
+if(IOS)
+    list(REMOVE_ITEM BOOST_INCLUDE_LIBRARIES process)
+endif()
 
 AddJsonPackage(boost)
 
@@ -431,6 +455,10 @@ endif()
 
 # fmt
 AddJsonPackage(fmt)
+# Third-party headers must not inherit first-party warnings-as-errors.
+if(fmt_ADDED AND TARGET fmt)
+    set_property(TARGET fmt PROPERTY SYSTEM TRUE)
+endif()
 
 # lz4
 AddJsonPackage(lz4)
@@ -508,7 +536,12 @@ endfunction()
 # =============================================
 
 if (APPLE)
-    foreach(fw Carbon Metal Cocoa IOKit CoreVideo CoreMedia Security UniformTypeIdentifiers)
+    if(IOS)
+        set(apple_frameworks Foundation CoreFoundation CFNetwork UIKit Metal QuartzCore IOSurface CoreGraphics CoreVideo CoreMedia Security UniformTypeIdentifiers GameController)
+    else()
+        set(apple_frameworks Carbon Metal Cocoa IOKit CoreVideo CoreMedia Security UniformTypeIdentifiers)
+    endif()
+    foreach(fw IN LISTS apple_frameworks)
         find_library(${fw}_LIBRARY ${fw} REQUIRED)
         list(APPEND PLATFORM_LIBRARIES ${${fw}_LIBRARY})
     endforeach()
@@ -543,13 +576,17 @@ if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
 endif()
 
 if (NOT YUZU_STATIC_ROOM)
-    find_package(libusb)
+    if(ENABLE_LIBUSB)
+        find_package(libusb)
+    endif()
     find_package(VulkanMemoryAllocator)
     find_package(VulkanUtilityLibraries)
     find_package(SimpleIni)
     find_package(sirit)
     find_package(gamemode)
-    find_package(frozen)
+    if(ENABLE_QT)
+        find_package(frozen)
+    endif()
 
     if (ARCHITECTURE_riscv64)
         find_package(biscuit)
@@ -563,7 +600,7 @@ if (NOT YUZU_STATIC_ROOM)
         find_package(oaknut)
     endif()
 
-    if (NOT ANDROID)
+    if (ENABLE_SDL3)
         find_package(SDL3)
     endif()
 
@@ -615,7 +652,12 @@ if (ENABLE_QT)
     ## Components ##
 
     # Best practice is to ask for all components at once, so they are from the same version
-    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network Svg)
+    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui Network)
+
+    # Svg is optional: nothing links Qt6::Svg or includes its headers, it is only wanted so the
+    # svg image format plugin is available for the icon themes. Some prebuilt Qt packages (the
+    # bundled Windows one included) ship without it, and requiring it fails configure outright.
+    list(APPEND YUZU_QT_OPTIONAL Svg)
     if (PLATFORM_LINUX OR PLATFORM_FREEBSD)
         list(APPEND YUZU_QT_COMPONENTS DBus)
         # yes Qt, we get it
@@ -709,11 +751,11 @@ if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-ir)
 endif()
 
-# Set yuzu project or yuzu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
+# Set suyu project or suyu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
 if(ENABLE_QT)
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu)
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT suyu)
 else()
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu-cmd)
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT suyu-cmd)
 endif()
 
 # Installation instructions

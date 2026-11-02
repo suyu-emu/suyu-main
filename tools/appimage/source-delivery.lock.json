@@ -1,0 +1,718 @@
+{
+  "schema": "suyu-source-delivery-v1",
+  "projections": {
+    "aports.tar.gz": {
+      "name": "aports.tar.gz",
+      "original_sha256": "3aee28308c8c5fbf0d26904bbfba85725bcafe7a11a61822adaf6181966a3625",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/cd6654787807de07f60d0355d092b9b0ffb80b74",
+      "snapshot_commit": "cd6654787807de07f60d0355d092b9b0ffb80b74",
+      "recipe_root": null,
+      "metadata_only": true,
+      "members": [
+        {
+          "name": "aports-cd6654787807de07f60d0355d092b9b0ffb80b74/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6883,
+          "mode": 436,
+          "sha256": "aa26a8f34ccd2c46d20a73674480051ebfbae001b72e68ecd8c970c7b5c37087"
+        },
+        {
+          "name": "aports-cd6654787807de07f60d0355d092b9b0ffb80b74/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-cd6654787807de07f60d0355d092b9b0ffb80b74/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        }
+      ],
+      "output_sha256": "434db84d3167d7ffbacd1c16025eadfb454c906154ece963d1ad33c3ff5ba381",
+      "output_size": 20503
+    },
+    "aports-musl-21cafa1183cf7501d3f1744994d221c038436e45.tar.gz": {
+      "name": "aports-musl-21cafa1183cf7501d3f1744994d221c038436e45.tar.gz",
+      "original_sha256": "611ec6addf20348e89ffcbe583a52420fce72efcca972c61696c91c6d565e53d",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/21cafa1183cf7501d3f1744994d221c038436e45",
+      "snapshot_commit": "21cafa1183cf7501d3f1744994d221c038436e45",
+      "recipe_root": "main/musl",
+      "metadata_only": false,
+      "members": [
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6883,
+          "mode": 436,
+          "sha256": "aa26a8f34ccd2c46d20a73674480051ebfbae001b72e68ecd8c970c7b5c37087"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/APKBUILD",
+          "occurrence": 1,
+          "type": "file",
+          "size": 7039,
+          "mode": 436,
+          "sha256": "366ce96968b1923e4df867b24b434cac635f3013723231107feb0217d7430bb2"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/CVE-2025-26519.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2832,
+          "mode": 436,
+          "sha256": "ab382da2bb5e1cc32d8904be28fb13f8ad3ce813967bd4bf7f5b1c6baee33e17"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/CVE-2026-40200.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 5594,
+          "mode": 436,
+          "sha256": "1ee29f64f9ca8e8ad7c349779d661ff6b52126a27575d3586981357a52c406fb"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/__stack_chk_fail_local.c",
+          "occurrence": 1,
+          "type": "file",
+          "size": 133,
+          "mode": 436,
+          "sha256": "299a7d75a09de3e2e11e7fb4acc3182e4a14e868093d2f30938fce9bfcff13da"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/getconf.c",
+          "occurrence": 1,
+          "type": "file",
+          "size": 11614,
+          "mode": 436,
+          "sha256": "d87d0cbb3690ae2c5d8cc218349fd8278b93855dd625deaf7ae50e320aad247c"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/getent.c",
+          "occurrence": 1,
+          "type": "file",
+          "size": 11656,
+          "mode": 436,
+          "sha256": "b25f32d306d542246e9358ef65cd67c12b3e3a77656bc467853d3b0c76b5fbbd"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/handle-aux-at_base.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1214,
+          "mode": 436,
+          "sha256": "2a65e03b94217063d72fe998e5fb2e25cd01716078a3ba1b0ab574ab205111e6"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/iconv-gb18030-fix.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 7506,
+          "mode": 436,
+          "sha256": "1d0be2e72b9d5bd16546b923aa8af861d271322f01644716a81823bec4065c99"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/iconv.c",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2577,
+          "mode": 436,
+          "sha256": "f79a2930a2e5bb0624321589edf8b889d1e9b603e01e6b7ae214616605b3fdd7"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/isatty-glibc-align.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 456,
+          "mode": 436,
+          "sha256": "1321d542b40921a4c248bb2d15dbd03fcbbf008c8725eb2043d3cab62faeba48"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/ldconfig",
+          "occurrence": 1,
+          "type": "file",
+          "size": 393,
+          "mode": 436,
+          "sha256": "b4a2c06db38742e8c42c3c9838b285a7d8cdac6c091ff3df5ff9a15f1e41b9c7"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/ldso-fix-non-functional-fix-to-early-dynamic-PAGE_SI.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1486,
+          "mode": 436,
+          "sha256": "7f5806124d4a89536e53a07bfe95fcd0a8f1b7a27fc0dfc89c78c724dea1c924"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-Add-lsx-and-lasx-vector-structure-defini.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 907,
+          "mode": 436,
+          "sha256": "28efacd507c01b89e1725ed33723f3f9fdfe6cb83eb78ffea1e2acb7fda8a52c"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-TLSDESC-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2527,
+          "mode": 436,
+          "sha256": "1efb4604e0b28b84e10faf37d17bad448510e73f6a3db89c8be47d38b9e85138"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-bits-hwcap.h.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1406,
+          "mode": 436,
+          "sha256": "8849080b49dff046b1f29db24e54ffe6262b5884078091994db77efdafca2505"
+        },
+        {
+          "name": "aports-21cafa1183cf7501d3f1744994d221c038436e45/main/musl/loongarch64-add-fpu-and-simd-context-to-signal.h.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2142,
+          "mode": 436,
+          "sha256": "d73f85a90fe52930dd8b5d16cb7f3369a994918c0e41ae3c3dc9a25df4b45099"
+        }
+      ],
+      "output_sha256": "e395a791add369bb29c7f31b122c701378932b792ded6a259c793e413bacc860",
+      "output_size": 102428
+    },
+    "aports-zlib-c973d294927355eac1d2a6e97d86e41fbab8ffda.tar.gz": {
+      "name": "aports-zlib-c973d294927355eac1d2a6e97d86e41fbab8ffda.tar.gz",
+      "original_sha256": "b67b83152e134ae32f713e6a8867572848a8115e6d88960e86aaa077c779400a",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/c973d294927355eac1d2a6e97d86e41fbab8ffda",
+      "snapshot_commit": "c973d294927355eac1d2a6e97d86e41fbab8ffda",
+      "recipe_root": "main/zlib",
+      "metadata_only": false,
+      "members": [
+        {
+          "name": "aports-c973d294927355eac1d2a6e97d86e41fbab8ffda/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6883,
+          "mode": 436,
+          "sha256": "aa26a8f34ccd2c46d20a73674480051ebfbae001b72e68ecd8c970c7b5c37087"
+        },
+        {
+          "name": "aports-c973d294927355eac1d2a6e97d86e41fbab8ffda/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-c973d294927355eac1d2a6e97d86e41fbab8ffda/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        },
+        {
+          "name": "aports-c973d294927355eac1d2a6e97d86e41fbab8ffda/main/zlib/APKBUILD",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1111,
+          "mode": 436,
+          "sha256": "6a3c1cfd5f3670a84b1ad522d0007be2282b4fa2441b29273a12d32a86693ec3"
+        },
+        {
+          "name": "aports-c973d294927355eac1d2a6e97d86e41fbab8ffda/main/zlib/CVE-2026-85091.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 854,
+          "mode": 436,
+          "sha256": "110ff14375733173d8aa54574473424fbd7dfe4b81f1ca34a759c6fe14b15b14"
+        }
+      ],
+      "output_sha256": "d559faea956567807410d5d242e7c6e281ce1895f48c4f6912b06a9d0f5c2938",
+      "output_size": 30743
+    },
+    "aports-zstd-5c2ddf18f193dafdd25ae7391d96c7e30766eecd.tar.gz": {
+      "name": "aports-zstd-5c2ddf18f193dafdd25ae7391d96c7e30766eecd.tar.gz",
+      "original_sha256": "cdc49cb68d5358eefcc83955bf285ce50fbcf6b223b271ef71e1008402c201f0",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "snapshot_commit": "5c2ddf18f193dafdd25ae7391d96c7e30766eecd",
+      "recipe_root": "main/zstd",
+      "metadata_only": false,
+      "members": [
+        {
+          "name": "aports-5c2ddf18f193dafdd25ae7391d96c7e30766eecd/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6883,
+          "mode": 436,
+          "sha256": "aa26a8f34ccd2c46d20a73674480051ebfbae001b72e68ecd8c970c7b5c37087"
+        },
+        {
+          "name": "aports-5c2ddf18f193dafdd25ae7391d96c7e30766eecd/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-5c2ddf18f193dafdd25ae7391d96c7e30766eecd/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        },
+        {
+          "name": "aports-5c2ddf18f193dafdd25ae7391d96c7e30766eecd/main/zstd/APKBUILD",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2419,
+          "mode": 436,
+          "sha256": "7344ccab938fb86eb3eb437f1caa11c99ceca58c475b31458d3ab04cce2e2388"
+        }
+      ],
+      "output_sha256": "6907ee4287a10998f5f7c95df606e7488c9377a260fd024e80ad6b95f6786eb6",
+      "output_size": 30743
+    },
+    "aports-mimalloc-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39.tar.gz": {
+      "name": "aports-mimalloc-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39.tar.gz",
+      "original_sha256": "6f4f50fca873868e754053c828d8336a531dbca365c678dc75db8111873d87e1",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "snapshot_commit": "5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39",
+      "recipe_root": "community/mimalloc2",
+      "metadata_only": false,
+      "members": [
+        {
+          "name": "aports-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6071,
+          "mode": 436,
+          "sha256": "f301646f69a754f5a10491e2d093d70247a6906195b755bdd0612827277d678a"
+        },
+        {
+          "name": "aports-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        },
+        {
+          "name": "aports-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/community/mimalloc2/APKBUILD",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3003,
+          "mode": 436,
+          "sha256": "bb2618381e98ef508b41697d9177b7d1fef6f61bf38543aa055b9e0002c3c54b"
+        },
+        {
+          "name": "aports-5a1a5dc3216a69e3cd66a57ee07cb5ef01b8be39/community/mimalloc2/cmake-add-insecure-suffix.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1359,
+          "mode": 436,
+          "sha256": "bbf09f82b9a187399f33f6cc4136bd088f475d769f385aa1f08d0850473b04ae"
+        }
+      ],
+      "output_sha256": "f31f82ff7782832e1830dbbd154071ed4976a736dc4113359543058fe3afb17d",
+      "output_size": 30743
+    },
+    "aports-gcc-startup-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f.tar.gz": {
+      "name": "aports-gcc-startup-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f.tar.gz",
+      "original_sha256": "fa78002197d55fe1c360efcbba9d6e914ec171987648f388b04a161740d15f22",
+      "original_url": "https://codeload.github.com/alpinelinux/aports/tar.gz/1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "snapshot_commit": "1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f",
+      "recipe_root": "main/gcc",
+      "metadata_only": false,
+      "members": [
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/CODINGSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6071,
+          "mode": 436,
+          "sha256": "f301646f69a754f5a10491e2d093d70247a6906195b755bdd0612827277d678a"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/COMMITSTYLE.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6518,
+          "mode": 436,
+          "sha256": "503625bc91c9db2b226d6a22004e975bcdbce98304990760b2aea2dc95c3f2c8"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/README.md",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3514,
+          "mode": 436,
+          "sha256": "ae4b731c5ec54ab44908c161fe2a54b7cd51b0273a447e7d961dbb7157818d5a"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0001-posix_memalign.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1441,
+          "mode": 436,
+          "sha256": "e4abd0642017dbab30be8f575117b82f2a2d8affbb8e468ef3f321d8cc524976"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0002-gcc-poison-system-directories.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 7393,
+          "mode": 436,
+          "sha256": "43d027c0a99365901e68f684cb9f705ef363cde6de7b818fa23ddf208943461b"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0003-specs-turn-on-Wl-z-now-by-default.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1650,
+          "mode": 436,
+          "sha256": "aaad89287bcde018ad5d5b108bafe53b0034fd6356fd23b85c106801123ce88b"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0004-Turn-on-D_FORTIFY_SOURCE-2-by-default-for-C-C-ObjC-O.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1780,
+          "mode": 436,
+          "sha256": "de0d50d51cd9c2e2f9eca26e0e9091934124f30fdaa415bb6adb5079d687ea21"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0005-On-linux-targets-pass-as-needed-by-default-to-the-li.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 11481,
+          "mode": 436,
+          "sha256": "4bb964a92ca1571dc32e53553e4f652a51003fd0cb8031c070acef08c5f14030"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0006-Enable-Wformat-and-Wformat-security-by-default.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1476,
+          "mode": 436,
+          "sha256": "0d5d62c8b68dbb70eebc9bf6e16f125856ce0587da7dc837d5a7db2644bbdde0"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0007-Enable-Wtrampolines-by-default.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 701,
+          "mode": 436,
+          "sha256": "2b6db1110bf5e00654e182b3d44255bbce4cc87781709ff62cc72e813b149384"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0008-Disable-ssp-on-nostdlib-nodefaultlibs-and-ffreestand.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1931,
+          "mode": 436,
+          "sha256": "50451f9b34149c772581b3eb25f9879986121502a1bbb611c038cb386b51d5d9"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0009-Ensure-that-msgfmt-doesn-t-encounter-problems-during.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1777,
+          "mode": 436,
+          "sha256": "1279982303b39d76a6c7ebfe8ff2cbda1b7b4120f8e25917805bf0ec48f44614"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0010-Don-t-declare-asprintf-if-defined-as-a-macro.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 901,
+          "mode": 436,
+          "sha256": "698b54c0b0c61777cebc2b81651c822df1d39d28919ce7e0e7d68aba309f6aa9"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0011-libiberty-copy-PIC-objects-during-build-process.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 722,
+          "mode": 436,
+          "sha256": "c515c30970dd344e6f3d79d672200216fba3536269346ea7cc8113b7b93bb236"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0012-libgcc_s.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2149,
+          "mode": 436,
+          "sha256": "eaf9dbc66c80b63249d6783d71526002538cc9687aace059733c54cc7d41475b"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0013-nopie.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2457,
+          "mode": 436,
+          "sha256": "e456cb56c8ad5943883706b112507f64e0a673ab2f01f57ba62bf49b1ab4c7db"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0014-ada-fix-shared-linking.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1620,
+          "mode": 436,
+          "sha256": "40c67dc4e22a86929d2afbf9a4d02e82530e0d417321287dc2b710572cf8487e"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0015-build-fix-CXXFLAGS_FOR_BUILD-passing.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 702,
+          "mode": 436,
+          "sha256": "2a723323bef815010a0a606fcdeb6c1c758b3caad4bd8682490b1e3108ce0a6f"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0016-add-fortify-headers-paths.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 827,
+          "mode": 436,
+          "sha256": "84303a2e23f2821b42d5aff199a32e7a1e9aee551b7b79c8b2eeb52e0a0602a3"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0017-Alpine-musl-package-provides-libssp_nonshared.a.-We-.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1208,
+          "mode": 436,
+          "sha256": "cb434c7ce1fc7d7f4686ba20be20fbba940f0d752d64c84cbb435a7279a3dec2"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0018-DP-Use-push-state-pop-state-for-gold-as-well-when-li.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3030,
+          "mode": 436,
+          "sha256": "bb85ab16bb18918b4c83c21ce40c9596bdadebf16cd3973d25a9f210b5c05942"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0019-aarch64-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1050,
+          "mode": 436,
+          "sha256": "9aa8cbb2c87e815526dfbf844b59a65abe84cb07d706d34d4dc43bdeaf2b7dd0"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0020-s390x-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 891,
+          "mode": 436,
+          "sha256": "4d6a7af9247cb25117f3d35db2a3006afe5ef7e448e0f31722f3451b714a5256"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0021-ppc64-le-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3473,
+          "mode": 436,
+          "sha256": "1956a82758b92fa67769f6b7f18019ee2bc37b7d78e8a93c6a51f91970594de9"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0022-x86_64-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1072,
+          "mode": 436,
+          "sha256": "3a24fc520091e713f7427a2bc141a3240fd9d37ed61fdb7489860894a146eb54"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0023-riscv-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 3421,
+          "mode": 436,
+          "sha256": "bbc0117b9cde1c865560ab1688a3e4a667f0c72f7a6f658248dd3a47859379bb"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0024-always-build-libgcc_eh.a.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1622,
+          "mode": 436,
+          "sha256": "0be247abeff911e64038fefeedcf6a45768596392f94faf09591dd04fe80e95b"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0025-ada-libgnarl-compatibility-for-musl.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 5477,
+          "mode": 436,
+          "sha256": "303a7429d2346697677183195150ac3a216753b1c55ec05999bbe85f6c1e8795"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0026-ada-musl-support-fixes.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 8542,
+          "mode": 436,
+          "sha256": "c7149e3265991c3ae5832db9eaac22b0f1d07a9b359ab2316a23cc48552500be"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0027-configure-Add-enable-autolink-libatomic-use-in-LINK_.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 9255,
+          "mode": 436,
+          "sha256": "7753b1843137d6f2f8c9a750c18b6df48b966544f4aee05f2b55a8ec22e2623b"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0028-configure-fix-detection-of-atomic-builtins-in-libato.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2156,
+          "mode": 436,
+          "sha256": "5c1c56db71278695f79d8944ecdc0f821340f9ef7d03a8915b3f0ce85a2ffde5"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0029-libstdc-do-not-throw-exceptions-for-non-C-locales-on.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 947,
+          "mode": 436,
+          "sha256": "e6c0064c7e5efcb1175ceed4d254b0c0af37fb9480e000f7bc1b638dca2265a9"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0030-gdc-unconditionally-link-libgphobos-against-libucont.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 834,
+          "mode": 436,
+          "sha256": "53ad635f7f07b72c925bc318ffec7ae3af30e2c7018c421c62b9829672bbd466"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0031-druntime-link-against-libucontext-on-all-platforms.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2062,
+          "mode": 436,
+          "sha256": "5ea55661dc3ec7503a6896088274e772055d01f10499b0d8ed83a5f2314ca02c"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0032-libgnat-time_t-is-always-64-bit-on-musl-libc.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 857,
+          "mode": 436,
+          "sha256": "5523da5ff59a2a1fa5812c96da6049f87f48c563300adcd50ae4a1f81a4e4b16"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0033-libphobos-do-not-use-LFS64-symbols.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1792,
+          "mode": 436,
+          "sha256": "eda5e03520d68e22d385081c1be92cd98a99752ecb3b692072d0ab911bc2fc69"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0034-libgo-fix-lfs64-use.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 6730,
+          "mode": 436,
+          "sha256": "84b5e6687713fd3535df478a32c640f3baaa6a5be546d4badd1b7b3d6d20ce49"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0035-loongarch-disable-multilib-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 1226,
+          "mode": 436,
+          "sha256": "0c4990e30cbea690ca32a5ea6a437221237cbdb03fbe37c7bc2cf49f41471c1e"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/0036-libphobos-add-riscv64-and-loongarch64-support.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2485,
+          "mode": 436,
+          "sha256": "d24568a2bf6fe757f4edb339f90159665e6479a420d49a323a003a5d2c0c2d1a"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/APKBUILD",
+          "occurrence": 1,
+          "type": "file",
+          "size": 29554,
+          "mode": 436,
+          "sha256": "392e19a434cd12e8eb6d3ef2b941fdc6a170d4e2e4f74d6014125fe0852660cb"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/fix-arm64.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 21534,
+          "mode": 436,
+          "sha256": "7b1bcc80f0d50ae8a247018af3413ecfa1f684955b43a08279a80b14bc522968"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/gcc-go.post-install",
+          "occurrence": 1,
+          "type": "file",
+          "size": 143,
+          "mode": 436,
+          "sha256": "b0f2e5f07b00a2338c29a0c352b832d2b1c7ec5874cfb3d1f193d698eaad4593"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/ppc64le-quadmath.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 2098,
+          "mode": 436,
+          "sha256": "5962083479c79e63d01330f54bf3a9a8807faba063de1446d38c0efc5c19e406"
+        },
+        {
+          "name": "aports-1a03a2a9c9e77f1a07d48b6f6805e72c8c63c03f/main/gcc/riscv64-improve-build-time.patch",
+          "occurrence": 1,
+          "type": "file",
+          "size": 5824,
+          "mode": 436,
+          "sha256": "2e391dc1c5c68f9ca07e89948d3088a2065e2ae12b2fc8c11f21bb1c1fd66300"
+        }
+      ],
+      "output_sha256": "c7fc4944c26d07013a3e1a372dfb089cd386276d14d3e6d424bc8e90e2c37adc",
+      "output_size": 235558
+    }
+  },
+  "scope": "Delivery-only complete package-local recipes plus upstream context; original runtime inputs unchanged"
+}

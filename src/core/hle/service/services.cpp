@@ -30,6 +30,7 @@
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/i2c/i2c.h"
 #include "core/hle/service/jit/jit.h"
+#endif
 #include "core/hle/service/lbl/lbl.h"
 #include "core/hle/service/ldn/ldn.h"
 #include "core/hle/service/ldr/ldr.h"
@@ -89,7 +90,12 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
     for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
         {"audio",      &Audio::LoopProcess},
         {"FS",         &FileSystem::LoopProcess},
+#ifndef SUYU_NO_JIT
+        // The guest-facing jit:u plugin service is dynarmic's other consumer, so
+        // it goes with it. A title that asks for it gets "no such service",
+        // which is the honest answer for a build that cannot provide one.
         {"jit",        &JIT::LoopProcess},
+#endif
         {"ldn",        &LDN::LoopProcess},
         {"Loader",     &LDR::LoopProcess},
         {"nvservices", &Nvidia::LoopProcess},

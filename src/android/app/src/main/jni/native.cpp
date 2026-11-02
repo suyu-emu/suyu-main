@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 #include <dlfcn.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -88,6 +89,7 @@ extern "C" {
 #include "hid_core/hid_core.h"
 #include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_amiibo.h"
+#include "input_common/drivers/tas_input.h"
 #include "jni/native.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
@@ -395,6 +397,24 @@ void EmulationSession::RunEmulation() {
         m_system.Renderer().ReadRasterizer()->LoadDiskResources(
             m_system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+    }
+
+    // Arm playback before the first presented frame, matching the desktop TAS clock.
+    // Opt in with `adb shell setprop debug.suyu.tas playback` before launching a title.
+    char tas_mode[PROP_VALUE_MAX]{};
+    __system_property_get("debug.suyu.tas", tas_mode);
+    const bool tas_playback_requested = std::string_view{tas_mode} == "playback";
+    auto* const tas = m_input_subsystem.GetTas();
+    tas->BeginBootSession(tas_playback_requested ? InputCommon::TasInput::TasBootMode::Playback
+                                               : InputCommon::TasInput::TasBootMode::None);
+    if (tas_playback_requested) {
+        if (Settings::values.tas_enable.GetValue()) {
+            const auto [state, frame, lengths] = tas->GetStatus();
+            LOG_INFO(Frontend, "Android boot TAS playback armed: player 1 has {} frames",
+                     lengths[0]);
+        } else {
+            LOG_WARNING(Frontend, "Android boot TAS playback requires tas_enable in Controls");
+        }
     }
 
     void(m_system.Run());

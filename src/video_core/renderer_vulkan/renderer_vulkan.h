@@ -75,6 +75,9 @@ private:
                               const Layout::FramebufferLayout& layout, VkFormat format,
                               VkDeviceSize buffer_size);
     void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
+    /// Headless inside a frontend's Vulkan context (External::IsActive()): the frame drawn
+    /// into an image of a small ring and handed over as it is, nothing read back.
+    void PresentExternal(std::span<const Tegra::FramebufferConfig> framebuffers);
     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;

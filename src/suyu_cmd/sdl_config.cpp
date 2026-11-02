@@ -86,6 +86,11 @@ void SdlConfig::ReadSdlControlValues() {
     }
     ReadDebugControlValues();
     ReadHidbusValues();
+    // auto_assign_player1 is this setting's earlier name.
+    auto_assign_controllers = ReadBooleanSetting(
+        "auto_assign_controllers",
+        std::make_optional(ReadBooleanSetting("auto_assign_player1", std::make_optional(true))));
+    auto_assigned_pads = ReadStringSetting("auto_assigned_pads", std::string{});
 
     EndGroup();
 }
@@ -198,6 +203,13 @@ void SdlConfig::SaveSdlControlValues() {
     }
     SaveDebugControlValues();
     SaveHidbusValues();
+    WriteBooleanSetting("auto_assign_controllers", auto_assign_controllers,
+                        std::make_optional(true));
+    WriteStringSetting("auto_assigned_pads", auto_assigned_pads, std::string{});
+    // Superseded by auto_assign_controllers, which was read from it above.
+    for (const char* legacy : {"auto_assign_player1", "auto_assign_player1\\default"}) {
+        config->Delete(GetSection().c_str(), legacy);
+    }
 
     EndGroup();
 }

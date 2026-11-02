@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
 #include "suyu/discord.h"
+
+class QObject;
 
 namespace Core {
 class System;
@@ -20,11 +26,18 @@ public:
     void Update() override;
 
 private:
-    std::string GetGameString(const std::string& title);
-    void UpdateGameStatus(bool use_default);
+    void UpdateGameStatus();
+    /// Starts a background Wikipedia lookup of the running game's cover art, unless one is
+    /// cached or already running. The result arrives on the GUI thread.
+    void LookUpCover();
 
     std::string game_url{};
     std::string game_title{};
+    std::int64_t game_start_timestamp = 0;
+
+    /// Lives on the GUI thread and receives lookup results; destroying it drops any that
+    /// are still pending.
+    std::unique_ptr<QObject> lookup_receiver;
 
     Core::System& system;
 };

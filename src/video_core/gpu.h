@@ -228,6 +228,10 @@ public:
     /// Performs any additional necessary steps to shutdown GPU emulation.
     void NotifyShutdown();
 
+    /// Stops and joins the GPU thread. Must run before anything it reads (guest/device
+    /// memory mappings, channels) is torn down.
+    void ShutdownThread();
+
     /// Obtain the CPU Context
     void ObtainContext();
 

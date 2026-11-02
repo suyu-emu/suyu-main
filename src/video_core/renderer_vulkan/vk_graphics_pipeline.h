@@ -10,8 +10,10 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
@@ -61,6 +63,103 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 
 namespace Vulkan {
 
+struct GraphicsPipelineLibraryKey {
+    GraphicsPipelineCacheKey pipeline;
+    u32 part{};
+    u32 variant{};
+    u64 layout_signature{};
+
+    bool operator==(const GraphicsPipelineLibraryKey& rhs) const noexcept {
+        return part == rhs.part && variant == rhs.variant &&
+               layout_signature == rhs.layout_signature && pipeline == rhs.pipeline;
+    }
+};
+
+class GraphicsPipelineLibraryCache {
+public:
+    struct Stats {
+        std::array<u64, 4> hits{};
+        std::array<u64, 4> compile_attempts{};
+        std::array<u64, 4> unique{};
+        std::array<u64, 2> link_count{};
+        std::array<u64, 2> link_total_ns{};
+        std::array<u64, 2> link_max_ns{};
+    };
+
+    template <typename Create>
+    std::shared_ptr<vk::Pipeline> GetOrCreate(const GraphicsPipelineLibraryKey& key,
+                                              Create&& create, bool* cache_hit = nullptr) {
+        {
+            std::scoped_lock lock{mutex};
+            if (const auto it = libraries.find(key); it != libraries.end()) {
+                hits[key.part].fetch_add(1, std::memory_order_relaxed);
+                if (cache_hit) {
+                    *cache_hit = true;
+                }
+                return it->second;
+            }
+        }
+        // Compile outside the lock so unrelated boot-time shader workers can proceed.
+        compile_attempts[key.part].fetch_add(1, std::memory_order_relaxed);
+        auto library = std::make_shared<vk::Pipeline>(create());
+        if (!static_cast<bool>(*library)) {
+            return library;
+        }
+        std::scoped_lock lock{mutex};
+        const auto [it, inserted] = libraries.emplace(key, library);
+        if (cache_hit) {
+            *cache_hit = !inserted;
+        }
+        return it->second;
+    }
+
+    void RecordLink(bool optimized, u64 elapsed_ns) {
+        const size_t index = optimized ? 1 : 0;
+        link_count[index].fetch_add(1, std::memory_order_relaxed);
+        link_total_ns[index].fetch_add(elapsed_ns, std::memory_order_relaxed);
+        auto previous = link_max_ns[index].load(std::memory_order_relaxed);
+        while (previous < elapsed_ns &&
+               !link_max_ns[index].compare_exchange_weak(previous, elapsed_ns,
+                                                           std::memory_order_relaxed)) {
+        }
+    }
+
+    Stats GetStats() {
+        std::scoped_lock lock{mutex};
+        Stats stats;
+        for (size_t part = 0; part < stats.hits.size(); ++part) {
+            stats.hits[part] = hits[part].load(std::memory_order_relaxed);
+            stats.compile_attempts[part] =
+                compile_attempts[part].load(std::memory_order_relaxed);
+        }
+        for (const auto& entry : libraries) {
+            ++stats.unique[entry.first.part];
+        }
+        for (size_t index = 0; index < stats.link_count.size(); ++index) {
+            stats.link_count[index] = link_count[index].load(std::memory_order_relaxed);
+            stats.link_total_ns[index] = link_total_ns[index].load(std::memory_order_relaxed);
+            stats.link_max_ns[index] = link_max_ns[index].load(std::memory_order_relaxed);
+        }
+        return stats;
+    }
+
+private:
+    struct Hash {
+        size_t operator()(const GraphicsPipelineLibraryKey& key) const noexcept {
+            return key.pipeline.Hash() ^ (static_cast<size_t>(key.part) << 1) ^
+                   (static_cast<size_t>(key.variant) << 9) ^
+                   static_cast<size_t>(key.layout_signature);
+        }
+    };
+    std::mutex mutex;
+    std::unordered_map<GraphicsPipelineLibraryKey, std::shared_ptr<vk::Pipeline>, Hash> libraries;
+    std::array<std::atomic<u64>, 4> hits{};
+    std::array<std::atomic<u64>, 4> compile_attempts{};
+    std::array<std::atomic<u64>, 2> link_count{};
+    std::array<std::atomic<u64>, 2> link_total_ns{};
+    std::array<std::atomic<u64>, 2> link_max_ns{};
+};
+
 class Device;
 class PipelineStatistics;
 class RenderPassCache;
@@ -78,7 +177,10 @@ public:
         const Device& device, DescriptorPool& descriptor_pool,
         GuestDescriptorQueue& guest_descriptor_queue, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        GraphicsPipelineLibraryCache& library_cache, Common::ThreadWorker& optimization_worker,
+        const GraphicsPipelineCacheKey& key, bool precompile_only,
+        std::array<vk::ShaderModule, NUM_STAGES> stages,
+        std::array<u64, NUM_STAGES> code_hashes,
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
@@ -115,7 +217,7 @@ public:
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
-        return is_built.load(std::memory_order::relaxed);
+        return is_built.load(std::memory_order::acquire);
     }
 
     template <typename Spec>
@@ -132,10 +234,12 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
-    void ConfigureDraw(const RescalingPushConstant& rescaling,
+    bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
     void MakePipeline(VkRenderPass render_pass);
+
+    void OptimizePipeline();
 
     void Validate();
 
@@ -146,6 +250,8 @@ private:
     TextureCache& texture_cache;
     BufferCache& buffer_cache;
     vk::PipelineCache& pipeline_cache;
+    GraphicsPipelineLibraryCache& library_cache;
+    Common::ThreadWorker& optimization_worker;
     Scheduler& scheduler;
     GuestDescriptorQueue& guest_descriptor_queue;
 
@@ -155,6 +261,7 @@ private:
     std::vector<GraphicsPipeline*> transitions;
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    std::array<u64, NUM_STAGES> code_hashes;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
@@ -169,10 +276,20 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    std::array<std::shared_ptr<vk::Pipeline>, 4> pipeline_libraries;
+    vk::Pipeline optimized_pipeline;
+    VkRenderPass optimized_render_pass{};
+    VkPipelineCreateFlags optimized_flags{};
+    std::atomic_bool optimization_queued{false};
+    std::atomic_bool optimized_ready{false};
+    bool bound_optimized{};
 
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
+    // Set when the worker could not produce a pipeline. is_built still becomes
+    // true so nobody waits forever; draws using this pipeline are dropped.
+    std::atomic_bool build_failed{false};
     bool uses_push_descriptor{false};
 };
 

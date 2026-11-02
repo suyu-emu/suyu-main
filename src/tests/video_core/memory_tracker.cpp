@@ -45,9 +45,16 @@ public:
     }
 
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
-        // TODO: for now assume fine?
+        if (ranges.empty()) {
+            return;
+        }
+        ++batch_calls;
+        for (const auto& [addr, size] : ranges) {
+            UpdatePagesCachedCount(addr, size, delta);
+        }
     }
 
+    [[nodiscard]] size_t BatchCalls() const noexcept { return batch_calls; }
     [[nodiscard]] size_t UpdateCalls() const noexcept { return update_calls; }
     [[nodiscard]] const std::vector<std::tuple<DAddr, u64, int>>& UpdateCallsList() const noexcept { return calls; }
 
@@ -68,6 +75,7 @@ private:
     ankerl::unordered_dense::map<u64, int> page_table;
     std::vector<std::tuple<DAddr, u64, int>> calls;
     size_t update_calls = 0;
+    size_t batch_calls = 0;
 };
 
 } // Anonymous namespace
@@ -564,18 +572,34 @@ TEST_CASE("MemoryTracker: FlushCachedWrites batching") {
     memory_track->CachedCpuWrite(c + PAGE, PAGE);
     memory_track->CachedCpuWrite(c + PAGE * 2, PAGE);
     memory_track->CachedCpuWrite(c + PAGE * 4, PAGE);
-    REQUIRE(rasterizer.UpdateCalls() == 0);
+    REQUIRE(rasterizer.Count() == 125);
+    // Re-track the pages while the cached CPU writes are still pending.
+    memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
+    REQUIRE(rasterizer.Count() == 128);
+    const auto previous_batches = rasterizer.BatchCalls();
+    const auto previous_updates = rasterizer.UpdateCalls();
     memory_track->FlushCachedWrites();
-    // Now we expect a single batch call (coalesced ranges) to the device memory manager
-    REQUIRE(rasterizer.UpdateCalls() == 1);
+    REQUIRE(rasterizer.BatchCalls() == previous_batches + 1);
+    REQUIRE(rasterizer.UpdateCalls() == previous_updates + 2);
     const auto& calls = rasterizer.UpdateCallsList();
-    REQUIRE(std::get<0>(calls[0]) == c + PAGE);
-    REQUIRE(std::get<1>(calls[0]) == PAGE * 3);
+    REQUIRE(calls[previous_updates] == std::tuple<DAddr, u64, int>{c + PAGE, PAGE * 2, -1});
+    REQUIRE(calls[previous_updates + 1] == std::tuple<DAddr, u64, int>{c + PAGE * 4, PAGE, -1});
+    REQUIRE(rasterizer.Count() == 125);
+    REQUIRE(rasterizer.Count(c + PAGE * 3) == 1);
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE, PAGE * 2));
+    REQUIRE(memory_track->IsRegionCpuModified(c + PAGE * 4, PAGE));
+    REQUIRE(!memory_track->IsRegionCpuModified(c + PAGE * 3, PAGE));
+    memory_track->FlushCachedWrites();
+    REQUIRE(rasterizer.BatchCalls() == previous_batches + 1);
 }
 
 TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     Core::DeviceMemory device_memory;
     Tegra::MaxwellDeviceMemoryManager manager(device_memory);
+    // Unmapped entries resolve to ASID 0, which must have a process slot even
+    // though no memory interface is needed for these unmapped ranges.
+    const auto asid = manager.RegisterProcess(nullptr);
+    REQUIRE(asid.id == 0);
     // empty should be a no-op
     std::vector<std::pair<DAddr, size_t>> empty;
     manager.UpdatePagesCachedBatch(empty, 1);
@@ -585,5 +609,8 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     ranges.emplace_back(0, Core::Memory::YUZU_PAGESIZE);
     ranges.emplace_back(Core::Memory::YUZU_PAGESIZE, Core::Memory::YUZU_PAGESIZE);
     manager.UpdatePagesCachedBatch(ranges, 1);
+    REQUIRE(manager.GetPointer<u8>(0) == nullptr);
+    REQUIRE(manager.GetPointer<u8>(Core::Memory::YUZU_PAGESIZE) == nullptr);
+    manager.UnregisterProcess(asid);
     SUCCEED("UpdatePagesCachedBatch executed without error");
 }

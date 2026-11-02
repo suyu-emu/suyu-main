@@ -84,9 +84,9 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
         "  background-color: rgba(255,255,255,0.08);"
         "  border: 1px solid rgba(255,255,255,0.14);"
         "  border-radius: 32px;"
-        "  min-width: 260px;"
-        "  min-height: 340px;"
-        "  padding: 26px;"
+        "  min-width: 0px;"
+        "  min-height: 235px;"
+        "  padding: 0px;"
         "  text-align: left;"
         "}"
         "QPushButton#ModeCard:hover {"
@@ -102,8 +102,8 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
         "  border: 1px solid rgba(255,255,255,0.14);"
         "  border-radius: 22px;"
         "  min-width: 92px;"
-        "  min-height: 92px;"
-        "  padding: 10px;"
+        "  min-height: 72px;"
+        "  padding: 0px;"
         "  font-size: 9pt;"
         "  text-align: center;"
         "}"
@@ -120,8 +120,8 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
     auto* frame = new QFrame(this);
     frame->setObjectName(QStringLiteral("ModeSelectorFrame"));
     auto* frame_layout = new QVBoxLayout(frame);
-    frame_layout->setContentsMargins(36, 30, 36, 26);
-    frame_layout->setSpacing(28);
+    frame_layout->setContentsMargins(28, 20, 28, 20);
+    frame_layout->setSpacing(12);
 
     auto* brand_block = new QWidget(this);
     auto* brand_layout = new QVBoxLayout(brand_block);
@@ -130,7 +130,7 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
 
     auto* brand_logo = new QLabel(this);
     brand_logo->setAlignment(Qt::AlignCenter);
-    const QPixmap logo_px = LoadBrandLogo(220, 96);
+    const QPixmap logo_px = LoadBrandLogo(180, 62);
     if (!logo_px.isNull()) {
         brand_logo->setPixmap(logo_px);
     } else {
@@ -152,38 +152,19 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
 
     frame_layout->addWidget(brand_block);
 
-    const QString card_style = QStringLiteral(
-        "QPushButton#ModeCard {"
-        "  color: white;"
-        "  background-color: rgba(255,255,255,0.08);"
-        "  border: 1px solid rgba(255,255,255,0.14);"
-        "  border-radius: 32px;"
-        "  min-width: 260px;"
-        "  min-height: 340px;"
-        "  padding: 24px;"
-        "  text-align: left;"
-        "}"
-        "QPushButton#ModeCard:hover {"
-        "  border-color: rgba(156, 77, 216, 0.75);"
-        "  background-color: rgba(255,255,255,0.12);"
-        "}"
-        "QPushButton#ModeCard:pressed {"
-        "  background-color: rgba(255,255,255,0.06);"
-        "}"
-    );
-
     auto* btn_layout = new QHBoxLayout();
-    btn_layout->setSpacing(24);
+    btn_layout->setSpacing(12);
     btn_layout->setAlignment(Qt::AlignHCenter);
 
     // Helper: QPushButton does not render rich text in its text property.
     // We place a QLabel child with Qt::RichText inside each button instead.
     auto setupCardLabel = [](QPushButton* btn, const QString& html) {
         auto* lay = new QVBoxLayout(btn);
-        lay->setContentsMargins(0, 0, 0, 0);
+        lay->setContentsMargins(16, 12, 16, 12);
         auto* lbl = new QLabel(html, btn);
         lbl->setTextFormat(Qt::RichText);
         lbl->setWordWrap(true);
+        lbl->setAlignment(Qt::AlignCenter);
         lbl->setAttribute(Qt::WA_TransparentForMouseEvents);
         lbl->setStyleSheet(QStringLiteral("background: transparent; border: none; padding: 0;"));
         lay->addWidget(lbl);
@@ -192,48 +173,45 @@ ModeSelector::ModeSelector(QWidget* parent) : QDialog(parent) {
     btn_gamer_ = new QPushButton(this);
     btn_gamer_->setObjectName(QStringLiteral("ModeCard"));
     btn_gamer_->setCursor(Qt::PointingHandCursor);
-    btn_gamer_->setStyleSheet(card_style);
     setupCardLabel(btn_gamer_,
-        QStringLiteral("<div style='text-align:left;'>"
-                       "<span style='font-size:48pt;'>\xF0\x9F\x8E\xAE</span><br>"
-                       "<span style='font-size:24pt; font-weight:700; color:white;'>Gamer</span><br>"
-                       "<span style='color:#d4d4e6; font-size:11pt;'>Optimized for Gameplay</span>"
+        QStringLiteral("<div style='text-align:center;'>"
+                       "<span style='font-size:32pt; font-weight:700; color:#aa75f0;'>G</span><br>"
+                       "<span style='font-size:20pt; font-weight:700; color:white;'>Gamer</span><br>"
+                       "<span style='color:#d4d4e6; font-size:10pt;'>Optimized for Gameplay</span>"
                        "</div>"));
     connect(btn_gamer_, &QPushButton::clicked, this, &ModeSelector::OnGamerClicked);
-    btn_layout->addWidget(btn_gamer_);
+    btn_layout->addWidget(btn_gamer_, 1);
 
     btn_programmer_ = new QPushButton(this);
     btn_programmer_->setObjectName(QStringLiteral("ModeCard"));
     btn_programmer_->setCursor(Qt::PointingHandCursor);
-    btn_programmer_->setStyleSheet(card_style);
     setupCardLabel(btn_programmer_,
-        QStringLiteral("<div style='text-align:left;'>"
-                       "<span style='font-size:48pt;'>\xF0\x9F\x92\xBB</span><br>"
-                       "<span style='font-size:24pt; font-weight:700; color:white;'>Programmer</span><br>"
-                       "<span style='color:#d4d4e6; font-size:11pt;'>Developer tools &amp; debugging</span>"
+        QStringLiteral("<div style='text-align:center;'>"
+                       "<span style='font-size:32pt; font-weight:700; color:#aa75f0;'>&lt;/&gt;</span><br>"
+                       "<span style='font-size:20pt; font-weight:700; color:white;'>Programmer</span><br>"
+                       "<span style='color:#d4d4e6; font-size:10pt;'>Developer tools &amp; debugging</span>"
                        "</div>"));
     connect(btn_programmer_, &QPushButton::clicked, this, &ModeSelector::OnProgrammerClicked);
-    btn_layout->addWidget(btn_programmer_);
+    btn_layout->addWidget(btn_programmer_, 1);
 
     btn_hacker_ = new QPushButton(this);
     btn_hacker_->setObjectName(QStringLiteral("ModeCard"));
     btn_hacker_->setCursor(Qt::PointingHandCursor);
-    btn_hacker_->setStyleSheet(card_style);
     setupCardLabel(btn_hacker_,
-        QStringLiteral("<div style='text-align:left;'>"
-                       "<span style='font-size:48pt;'>\xF0\x9F\x94\xA7</span><br>"
-                       "<span style='font-size:24pt; font-weight:700; color:white;'>Hacker</span><br>"
-                       "<span style='color:#d4d4e6; font-size:11pt;'>Advanced configuration &amp; tweaks</span>"
+        QStringLiteral("<div style='text-align:center;'>"
+                       "<span style='font-size:32pt; font-weight:700; color:#aa75f0;'>{ }</span><br>"
+                       "<span style='font-size:20pt; font-weight:700; color:white;'>Hacker</span><br>"
+                       "<span style='color:#d4d4e6; font-size:10pt;'>Advanced configuration &amp; tweaks</span>"
                        "</div>"));
     connect(btn_hacker_, &QPushButton::clicked, this, &ModeSelector::OnHackerClicked);
-    btn_layout->addWidget(btn_hacker_);
+    btn_layout->addWidget(btn_hacker_, 1);
 
     frame_layout->addLayout(btn_layout);
 
     lbl_description_ = new QLabel(GamerDesc(), this);
     lbl_description_->setWordWrap(true);
     lbl_description_->setAlignment(Qt::AlignCenter);
-    lbl_description_->setMinimumHeight(58);
+    lbl_description_->setMinimumHeight(42);
     lbl_description_->setObjectName(QStringLiteral("SubtitleLabel"));
     lbl_description_->setStyleSheet(QStringLiteral("color: #c8c8d8; font-size: 12pt;"));
     frame_layout->addWidget(lbl_description_);

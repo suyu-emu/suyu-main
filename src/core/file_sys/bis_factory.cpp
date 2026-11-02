@@ -13,13 +13,17 @@ constexpr u64 NAND_USER_SIZE = 0x680000000;  // 26624 MiB
 constexpr u64 NAND_SYSTEM_SIZE = 0xA0000000; // 2560 MiB
 constexpr u64 NAND_TOTAL_SIZE = 0x747C00000; // 29820 MiB
 
-BISFactory::BISFactory(VirtualDir nand_root_, VirtualDir load_root_, VirtualDir dump_root_)
+BISFactory::BISFactory(VirtualDir nand_root_, VirtualDir load_root_, VirtualDir dump_root_,
+                       VirtualDir system_registered, VirtualDir user_registered)
     : nand_root(std::move(nand_root_)), load_root(std::move(load_root_)),
       dump_root(std::move(dump_root_)),
       sysnand_cache(std::make_unique<RegisteredCache>(
-          GetOrCreateDirectoryRelative(nand_root, "/system/Contents/registered"))),
+          system_registered
+              ? std::move(system_registered)
+              : GetOrCreateDirectoryRelative(nand_root, "/system/Contents/registered"))),
       usrnand_cache(std::make_unique<RegisteredCache>(
-          GetOrCreateDirectoryRelative(nand_root, "/user/Contents/registered"))),
+          user_registered ? std::move(user_registered)
+                          : GetOrCreateDirectoryRelative(nand_root, "/user/Contents/registered"))),
       sysnand_placeholder(std::make_unique<PlaceholderCache>(
           GetOrCreateDirectoryRelative(nand_root, "/system/Contents/placehld"))),
       usrnand_placeholder(std::make_unique<PlaceholderCache>(
@@ -81,7 +85,8 @@ VirtualDir BISFactory::OpenPartition(BisPartitionId id) const {
 
 VirtualFile BISFactory::OpenPartitionStorage(BisPartitionId id,
                                              VirtualFilesystem file_system) const {
-    auto& keys = Core::Crypto::KeyManager::Instance();
+    // Reads the partitions with the BIS keys the user installed. Nothing here derives
+    // keys from the console data (BOOT0, fuses, package2); keys come only from key files.
     Core::Crypto::PartitionDataManager pdm{file_system->OpenDirectory(
         Common::FS::GetSuyuPathString(Common::FS::SuyuPath::NANDDir), OpenMode::Read)};
     keys.PopulateFromPartitionData(pdm);

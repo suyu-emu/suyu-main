@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -14,9 +15,15 @@
 #include <QUrl>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPainter>
+#include <QPainterPath>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QStandardPaths>
+
+#include <algorithm>
+#include <functional>
 
 #include "suyu/steam_integration.h"
 
@@ -422,39 +429,603 @@ bool SteamIntegration::AddSuyuSelfShortcut() {
     return AddGameShortcut(QStringLiteral("suyu"), QString(), icon_path);
 }
 
-bool SteamIntegration::RemoveGameShortcut(const QString& game_title) {
-    if (!IsSteamInstalled()) {
+namespace {
+
+// One shortcut entry of shortcuts.vdf, as byte offsets into the file.
+struct VdfEntryRange {
+    int begin{};      // at the entry's 0x00 type byte
+    int body_begin{}; // just past its index key ("0", "1", ...)
+    int end{};        // just past its closing 0x08
+    QString app_name;
+    QString exe;
+};
+
+// Walks Steam's binary shortcuts.vdf strictly. It understands every value type Steam writes
+// and fails on anything else, so a caller never rewrites a file it has not read completely.
+// Returns the length of the header (root key) on success, or -1.
+int ScanShortcutsVdf(const QByteArray& d, std::vector<VdfEntryRange>& entries) {
+    const int n = static_cast<int>(d.size());
+    int p = 0;
+    const auto c_string = [&](QByteArray* out) {
+        const int z = static_cast<int>(d.indexOf('\0', p));
+        if (z < 0) {
+            return false;
+        }
+        if (out) {
+            *out = d.mid(p, z - p);
+        }
+        p = z + 1;
+        return true;
+    };
+    std::function<bool(quint8)> skip_value = [&](quint8 type) -> bool {
+        switch (type) {
+        case 0x01: // string
+            return c_string(nullptr);
+        case 0x02: // int32
+        case 0x03: // float32
+        case 0x04: // pointer
+        case 0x06: // color
+            if (p + 4 > n) {
+                return false;
+            }
+            p += 4;
+            return true;
+        case 0x07: // uint64
+        case 0x0A: // int64
+            if (p + 8 > n) {
+                return false;
+            }
+            p += 8;
+            return true;
+        case 0x00: // nested map
+            while (true) {
+                if (p >= n) {
+                    return false;
+                }
+                const quint8 sub = static_cast<quint8>(d[p++]);
+                if (sub == 0x08) {
+                    return true;
+                }
+                if (!c_string(nullptr) || !skip_value(sub)) {
+                    return false;
+                }
+            }
+        default:
+            return false;
+        }
+    };
+
+    QByteArray root;
+    if (n < 2 || d[p++] != '\0' || !c_string(&root) ||
+        root.compare("shortcuts", Qt::CaseInsensitive) != 0) {
+        return -1;
+    }
+    const int header_length = p;
+    while (true) {
+        if (p >= n) {
+            return -1;
+        }
+        VdfEntryRange entry;
+        entry.begin = p;
+        const quint8 type = static_cast<quint8>(d[p++]);
+        if (type == 0x08) {
+            break;
+        }
+        if (type != 0x00 || !c_string(nullptr)) {
+            return -1;
+        }
+        entry.body_begin = p;
+        while (true) {
+            if (p >= n) {
+                return -1;
+            }
+            const quint8 field = static_cast<quint8>(d[p++]);
+            if (field == 0x08) {
+                break;
+            }
+            QByteArray key;
+            if (!c_string(&key)) {
+                return -1;
+            }
+            if (field == 0x01) {
+                QByteArray value;
+                if (!c_string(&value)) {
+                    return -1;
+                }
+                const QByteArray lower = key.toLower();
+                if (lower == "appname") {
+                    entry.app_name = QString::fromUtf8(value);
+                } else if (lower == "exe") {
+                    entry.exe = QString::fromUtf8(value);
+                }
+            } else if (!skip_value(field)) {
+                return -1;
+            }
+        }
+        entry.end = p;
+        entries.push_back(std::move(entry));
+    }
+    // The root map closes the file; anything after it is not something this code understands.
+    if (p >= n || d[p++] != 0x08 || p != n) {
+        return -1;
+    }
+    return header_length;
+}
+
+
+// What a byte-preserving rewrite of shortcuts.vdf starts from. The same rule as
+// AddLauncherShortcut: a file that exists but cannot be read in full, or that the strict scan
+// does not fully understand, is never rewritten, because rebuilding it from a partial read
+// would delete the user's other shortcuts. A missing file reads as empty.
+struct ShortcutsFile {
+    QByteArray original;
+    std::vector<VdfEntryRange> entries;
+    int header_length = 0;
+};
+
+bool ReadShortcutsFile(const QString& vdf_path, ShortcutsFile& file) {
+    if (!QFileInfo::exists(vdf_path)) {
+        return true;
+    }
+    QFile in(vdf_path);
+    if (!in.open(QIODevice::ReadOnly)) {
         return false;
     }
+    file.original = in.readAll();
+    if (file.original.size() != in.size()) {
+        return false; // a short read is not a file to rebuild from
+    }
+    if (file.original.isEmpty()) {
+        return true;
+    }
+    file.header_length = ScanShortcutsVdf(file.original, file.entries);
+    return file.header_length >= 0;
+}
 
+// The body of the only entry in a one-shortcut file, and that file's header.
+bool SplitSingleEntry(const QByteArray& single, QByteArray& header, QByteArray& body) {
+    std::vector<VdfEntryRange> entries;
+    if (ScanShortcutsVdf(single, entries) < 0 || entries.size() != 1) {
+        return false;
+    }
+    header = single.left(entries[0].begin);
+    body = single.mid(entries[0].body_begin, entries[0].end - entries[0].body_begin);
+    return true;
+}
+
+// Writes @p bodies in order under @p header, re-indexing their keys, and commits only a
+// result the scanner reads back.
+bool WriteShortcutsFile(const QString& vdf_path, const QByteArray& header,
+                        const std::vector<QByteArray>& bodies) {
+    QByteArray out = header;
+    int index = 0;
+    for (const auto& body : bodies) {
+        out.append('\0');
+        out.append(QByteArray::number(index++));
+        out.append('\0');
+        out.append(body);
+    }
+    out.append('\x08');
+    out.append('\x08');
+    std::vector<VdfEntryRange> check;
+    if (ScanShortcutsVdf(out, check) < 0 || check.size() != bodies.size()) {
+        return false;
+    }
+    QDir().mkpath(QFileInfo(vdf_path).absolutePath());
+    QSaveFile save(vdf_path);
+    return save.open(QIODevice::WriteOnly) && save.write(out) == out.size() && save.commit();
+}
+
+QByteArray EntryBody(const ShortcutsFile& file, const VdfEntryRange& entry) {
+    return file.original.mid(entry.body_begin, entry.end - entry.body_begin);
+}
+
+} // namespace
+
+bool SteamIntegration::AddLauncherShortcut(const QString& app_name, const QString& launcher_path,
+                                           const QString& replace_title) {
+    if (!IsSteamInstalled() || !QFileInfo(launcher_path).isFile()) {
+        return false;
+    }
     const QString vdf_path = FindShortcutsVdf();
     if (vdf_path.isEmpty()) {
         return false;
     }
 
-    QFile file(vdf_path);
-    if (!file.exists() || !file.open(QIODevice::ReadOnly)) {
+    // Other shortcuts are copied through byte for byte, including fields this code does not
+    // model, rather than parsed and re-serialized. A file that exists but cannot be read, or
+    // that the strict scan does not fully understand, is left alone: rewriting it from a
+    // partial read would silently delete the user's other shortcuts.
+    QByteArray original;
+    std::vector<VdfEntryRange> entries;
+    int header_length = 0;
+    if (QFileInfo::exists(vdf_path)) {
+        QFile file(vdf_path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return false;
+        }
+        original = file.readAll();
+        if (original.size() != file.size()) {
+            return false; // a short read is not a file to rebuild from
+        }
+    }
+    if (!original.isEmpty()) {
+        header_length = ScanShortcutsVdf(original, entries);
+        if (header_length < 0) {
+            return false;
+        }
+    }
+
+    const QFileInfo launcher(launcher_path);
+    const auto runs_launcher = [&launcher](const QString& exe) {
+        return QFileInfo(QString(exe).remove(QLatin1Char('"'))) == launcher;
+    };
+
+    // This export's entry, serialized alone and then cut out of that one-entry file.
+    SteamShortcut sc;
+    sc.app_name = app_name;
+    sc.exe = QStringLiteral("\"%1\"").arg(launcher.absoluteFilePath());
+    // The export finds its portable user/ folder next to the executable, whatever the
+    // working directory, but Steam should still start it from there.
+    sc.start_dir = QStringLiteral("\"%1\"").arg(launcher.absolutePath());
+    sc.shortcut_path = launcher.absolutePath();
+    // The exporter embeds the game's icon in the launcher, which Steam can read directly.
+    sc.icon = launcher.absoluteFilePath();
+    sc.allow_desktop_config = true;
+    sc.allow_overlay = true;
+    sc.tags = {QStringLiteral("suyu"), QStringLiteral("Nintendo Switch")};
+    // Steam keys artwork and play time by this id, which depends only on name and exe.
+    sc.id = GenerateAppId(sc.exe, sc.app_name);
+    const QByteArray single = SerializeShortcutsVdf({sc});
+    std::vector<VdfEntryRange> single_entries;
+    if (ScanShortcutsVdf(single, single_entries) < 0 || single_entries.size() != 1) {
         return false;
     }
-    auto shortcuts = ParseShortcutsVdf(file.readAll());
-    file.close();
+    const QByteArray new_body = single.mid(single_entries[0].body_begin,
+                                           single_entries[0].end - single_entries[0].body_begin);
 
-    // Remove matching shortcut
-    auto it = std::remove_if(shortcuts.begin(), shortcuts.end(),
-                             [&](const SteamShortcut& sc) { return sc.app_name == game_title; });
-    if (it == shortcuts.end()) {
+    QByteArray out = original.isEmpty() ? single.left(single_entries[0].begin)
+                                        : original.left(header_length);
+    int index = 0;
+    bool placed = false;
+    const auto append_entry = [&](const QByteArray& body) {
+        out.append('\0');
+        out.append(QByteArray::number(index++));
+        out.append('\0');
+        out.append(body);
+    };
+    for (const auto& entry : entries) {
+        if (runs_launcher(entry.exe)) {
+            // An earlier export of this same package: replace it in place, once.
+            if (!placed) {
+                append_entry(new_body);
+                placed = true;
+            }
+            continue;
+        }
+        // Only the library's own shortcut - suyu launched with the ROM - is taken over; a
+        // hand-made shortcut or another export that shares the name is left alone.
+        if (!replace_title.isEmpty() && entry.app_name == replace_title &&
+            QFileInfo(QString(entry.exe).remove(QLatin1Char('"')))
+                .fileName()
+                .startsWith(QStringLiteral("suyu"), Qt::CaseInsensitive)) {
+            continue;
+        }
+        append_entry(original.mid(entry.body_begin, entry.end - entry.body_begin));
+    }
+    if (!placed) {
+        append_entry(new_body);
+    }
+    out.append('\x08');
+    out.append('\x08');
+
+    // Never write something this code would itself refuse to read.
+    std::vector<VdfEntryRange> check;
+    if (ScanShortcutsVdf(out, check) < 0) {
+        return false;
+    }
+
+    QDir().mkpath(QFileInfo(vdf_path).absolutePath());
+    QSaveFile save(vdf_path);
+    if (!save.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    if (save.write(out) != out.size() || !save.commit()) {
+        return false;
+    }
+    emit ShortcutAdded(app_name);
+    return true;
+}
+
+namespace {
+
+// A soft blur from scaling alone: shrink hard, then grow back in doubling steps so the
+// bilinear passes smooth one another out. Fills @p size, cropping the source to it.
+QImage BlurredFill(const QImage& source, const QSize& size) {
+    const QImage filled =
+        source.scaled(size, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    QImage blurred = filled
+                         .copy((filled.width() - size.width()) / 2,
+                               (filled.height() - size.height()) / 2, size.width(), size.height())
+                         .scaled(std::max(1, size.width() / 48), std::max(1, size.height() / 48),
+                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    while (blurred.width() * 2 < size.width()) {
+        blurred = blurred.scaled(blurred.size() * 2, Qt::IgnoreAspectRatio,
+                                 Qt::SmoothTransformation);
+    }
+    return blurred.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+}
+
+// The blurred art, dimmed toward the bottom so the sharp art and the title stand out.
+QImage Backdrop(const QImage& art, const QSize& size) {
+    QImage canvas = BlurredFill(art, size);
+    QPainter painter(&canvas);
+    QLinearGradient shade(0, 0, 0, size.height());
+    shade.setColorAt(0.0, QColor(0, 0, 0, 60));
+    shade.setColorAt(1.0, QColor(0, 0, 0, 170));
+    painter.fillRect(canvas.rect(), shade);
+    return canvas;
+}
+
+// The sharp art, fitted and centred in @p bounds, with rounded corners over a soft shadow.
+void DrawArt(QPainter& painter, const QImage& art, const QRect& bounds) {
+    const QSize fitted = art.size().scaled(bounds.size(), Qt::KeepAspectRatio);
+    const QRect target(bounds.x() + (bounds.width() - fitted.width()) / 2,
+                       bounds.y() + (bounds.height() - fitted.height()) / 2, fitted.width(),
+                       fitted.height());
+    const qreal radius = std::min(target.width(), target.height()) * 0.05;
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0, 0, 0, 16));
+    for (int spread = 2; spread <= 16; spread += 2) {
+        painter.drawRoundedRect(QRectF(target).adjusted(-spread, -spread + 8, spread, spread + 8),
+                                radius + spread, radius + spread);
+    }
+    QPainterPath corners;
+    corners.addRoundedRect(QRectF(target), radius, radius);
+    painter.save();
+    painter.setClipPath(corners);
+    painter.drawImage(target,
+                      art.scaled(target.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+    painter.restore();
+}
+
+// The largest bold font, up to @p max_px, at which @p title fits in @p bounds.
+QFont TitleFont(const QString& title, const QRect& bounds, int max_px, int flags) {
+    QFont font;
+    font.setBold(true);
+    for (int px = max_px; px > 12; px -= 2) {
+        font.setPixelSize(px);
+        const QRect needed = QFontMetrics(font).boundingRect(bounds, flags, title);
+        if (needed.width() <= bounds.width() && needed.height() <= bounds.height()) {
+            break;
+        }
+    }
+    return font;
+}
+
+void DrawTitle(QPainter& painter, const QString& title, const QRect& bounds, const QFont& font,
+               int flags) {
+    painter.setFont(font);
+    painter.setPen(QColor(0, 0, 0, 170));
+    painter.drawText(bounds.translated(0, std::max(2, font.pixelSize() / 20)), flags, title);
+    painter.setPen(Qt::white);
+    painter.drawText(bounds, flags, title);
+}
+
+bool SavePng(const QImage& image, const QString& path) {
+    QSaveFile file(path);
+    return file.open(QIODevice::WriteOnly) && image.save(&file, "PNG") && file.commit();
+}
+
+} // namespace
+
+bool SteamIntegration::WriteLauncherArtwork(const QString& app_name, const QString& launcher_path,
+                                            const QImage& icon, const QImage& cover) {
+    if (icon.isNull() && cover.isNull()) {
+        return false;
+    }
+    const QString vdf_path = FindShortcutsVdf();
+    if (vdf_path.isEmpty()) {
+        return false;
+    }
+    // The grid folder belongs to the account whose shortcuts.vdf AddLauncherShortcut edits.
+    // Steam names a shortcut's artwork by its unsigned 32-bit appid, which has to be computed
+    // from the same quoted exe path and name as the shortcut itself.
+    const QString grid = QFileInfo(vdf_path).absolutePath() + QStringLiteral("/grid");
+    if (!QDir().mkpath(grid)) {
+        return false;
+    }
+    const QString base =
+        grid + QLatin1Char('/') +
+        QString::number(GenerateAppId(
+            QStringLiteral("\"%1\"").arg(QFileInfo(launcher_path).absoluteFilePath()), app_name));
+    const QImage art = (cover.isNull() ? icon : cover)
+                           .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const int centred = Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap;
+    const int beside = Qt::AlignLeft | Qt::AlignVCenter | Qt::TextWordWrap;
+
+    // Box art already carries the title; the icon gets it written underneath.
+    QImage portrait = Backdrop(art, {600, 900});
+    {
+        QPainter painter(&portrait);
+        if (!cover.isNull()) {
+            DrawArt(painter, art, QRect(40, 40, 520, 820));
+        } else {
+            DrawArt(painter, art, QRect(80, 110, 440, 440));
+            const QRect text(40, 610, 520, 250);
+            DrawTitle(painter, app_name, text, TitleFont(app_name, text, 64, centred), centred);
+        }
+    }
+
+    QImage wide = Backdrop(art, {920, 430});
+    {
+        QPainter painter(&wide);
+        DrawArt(painter, art, QRect(40, 40, 350, 350));
+        const QRect text(430, 40, 450, 350);
+        DrawTitle(painter, app_name, text, TitleFont(app_name, text, 60, beside), beside);
+    }
+
+    // Steam lays the logo over the hero, so the hero carries no text of its own.
+    const QImage hero = Backdrop(art, {1920, 620});
+
+    const int logo_flags = Qt::AlignCenter | Qt::TextWordWrap;
+    const QRect logo_bounds(0, 0, 1200, 400);
+    const QFont logo_font = TitleFont(app_name, logo_bounds, 140, logo_flags);
+    const QRect logo_used = QFontMetrics(logo_font).boundingRect(logo_bounds, logo_flags, app_name);
+    QImage logo(logo_used.size() + QSize(32, 32), QImage::Format_ARGB32_Premultiplied);
+    logo.fill(Qt::transparent);
+    {
+        QPainter painter(&logo);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setRenderHint(QPainter::TextAntialiasing);
+        DrawTitle(painter, app_name, logo.rect().adjusted(8, 8, -8, -8), logo_font, logo_flags);
+    }
+
+    const QImage steam_icon = (icon.isNull() ? cover : icon)
+                                  .scaled(256, 256, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+
+    return SavePng(portrait, base + QStringLiteral("p.png")) &&
+           SavePng(wide, base + QStringLiteral(".png")) &&
+           SavePng(hero, base + QStringLiteral("_hero.png")) &&
+           SavePng(logo, base + QStringLiteral("_logo.png")) &&
+           SavePng(steam_icon, base + QStringLiteral("_icon.png"));
+}
+
+bool SteamIntegration::AddGameShortcut(const QString& game_title, const QString& rom_path,
+                                       const QString& icon_path) {
+    if (!IsSteamInstalled()) {
+        return false;
+    }
+    const QString vdf_path = FindShortcutsVdf();
+    if (vdf_path.isEmpty()) {
+        return false;
+    }
+    // Only this game's entry is written; every other one is copied byte for byte.
+    ShortcutsFile file;
+    if (!ReadShortcutsFile(vdf_path, file)) {
+        return false;
+    }
+
+    // Path to the currently running suyu executable
+    const QString exe_path = QCoreApplication::applicationFilePath();
+    const QString quoted_exe = QStringLiteral("\"%1\"").arg(exe_path);
+    const QString start_dir = QStringLiteral("\"%1\"").arg(QFileInfo(exe_path).absolutePath());
+    const QString shortcut_path = QFileInfo(exe_path).absolutePath();
+    // Empty rom_path means "suyu itself" (its own library UI), not a
+    // specific game - don't pass an empty -g "" argument in that case.
+    const QString launch_options =
+        rom_path.isEmpty() ? QString() : QStringLiteral("-g \"%1\"").arg(rom_path);
+
+    // A shortcut with this title may already exist. Matching on the name alone
+    // and returning was not enough: an entry written by an earlier install
+    // keeps pointing at that install's executable, so Steam goes on launching a
+    // binary that has since moved or been deleted - which looks like the Steam
+    // integration silently doing nothing. Seen live, pointing at a different
+    // suyu directory entirely. Repoint it instead, and only leave it alone when
+    // it already refers to this executable.
+    const auto match = std::find_if(file.entries.begin(), file.entries.end(),
+                                    [&](const auto& entry) { return entry.app_name == game_title; });
+    SteamShortcut sc;
+    if (match != file.entries.end()) {
+        // The entry's own fields, read from it alone.
+        QByteArray alone = file.original.left(file.header_length);
+        alone.append('\0');
+        alone.append('0');
+        alone.append('\0');
+        alone.append(EntryBody(file, *match));
+        alone.append('\x08');
+        alone.append('\x08');
+        const auto parsed = ParseShortcutsVdf(alone);
+        if (parsed.size() != 1) {
+            return false;
+        }
+        sc = parsed.front();
+        const QString existing = QString(sc.exe).remove(QLatin1Char('"'));
+        const bool executable_changed = QFileInfo(existing) != QFileInfo(exe_path);
+        const bool metadata_changed = executable_changed || sc.start_dir != start_dir ||
+                                      sc.shortcut_path != shortcut_path ||
+                                      sc.launch_options != launch_options ||
+                                      (!icon_path.isEmpty() &&
+                                       sc.icon != QFileInfo(icon_path).absoluteFilePath());
+        if (!metadata_changed) {
+            return true;
+        }
+        sc.exe = quoted_exe;
+        if (executable_changed) {
+            sc.id = GenerateAppId(sc.exe, sc.app_name);
+        }
+        sc.start_dir = start_dir;
+        sc.shortcut_path = shortcut_path;
+        sc.launch_options = launch_options;
+        if (!icon_path.isEmpty()) {
+            sc.icon = QFileInfo(icon_path).absoluteFilePath();
+        }
+    } else {
+        sc.app_name = game_title;
+        sc.exe = quoted_exe;
+        sc.start_dir = start_dir;
+        sc.icon = icon_path.isEmpty() ? QString() : QFileInfo(icon_path).absoluteFilePath();
+        sc.shortcut_path = shortcut_path;
+        sc.launch_options = launch_options;
+        sc.allow_desktop_config = true;
+        sc.allow_overlay = true;
+        sc.tags.append(QStringLiteral("suyu"));
+        sc.tags.append(QStringLiteral("Nintendo Switch"));
+        sc.id = GenerateAppId(sc.exe, sc.app_name);
+    }
+
+    // This entry, serialized alone and cut out of that one-entry file.
+    QByteArray header;
+    QByteArray new_body;
+    if (!SplitSingleEntry(SerializeShortcutsVdf({sc}), header, new_body)) {
+        return false;
+    }
+    std::vector<QByteArray> bodies;
+    for (auto it = file.entries.begin(); it != file.entries.end(); ++it) {
+        bodies.push_back(it == match ? new_body : EntryBody(file, *it));
+    }
+    if (match == file.entries.end()) {
+        bodies.push_back(new_body);
+    }
+    if (!WriteShortcutsFile(vdf_path,
+                            file.original.isEmpty() ? header
+                                                    : file.original.left(file.header_length),
+                            bodies)) {
+        return false;
+    }
+    if (match == file.entries.end()) {
+        emit ShortcutAdded(game_title);
+    }
+    return true;
+}
+
+bool SteamIntegration::RemoveGameShortcut(const QString& game_title) {
+    if (!IsSteamInstalled()) {
+        return false;
+    }
+    const QString vdf_path = FindShortcutsVdf();
+    if (vdf_path.isEmpty() || !QFileInfo::exists(vdf_path)) {
+        return false;
+    }
+    // Only the matching entries go; every other one is copied byte for byte.
+    ShortcutsFile file;
+    if (!ReadShortcutsFile(vdf_path, file) || file.original.isEmpty()) {
+        return false;
+    }
+    std::vector<QByteArray> bodies;
+    for (const auto& entry : file.entries) {
+        if (entry.app_name != game_title) {
+            bodies.push_back(EntryBody(file, entry));
+        }
+    }
+    if (bodies.size() == file.entries.size()) {
         return false; // Not found
     }
-    shortcuts.erase(it, shortcuts.end());
-
-    // Write back
-    QFile out_file(vdf_path);
-    if (!out_file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    if (!WriteShortcutsFile(vdf_path, file.original.left(file.header_length), bodies)) {
         return false;
     }
-    out_file.write(SerializeShortcutsVdf(shortcuts));
-    out_file.close();
-
     emit ShortcutRemoved(game_title);
     return true;
 }

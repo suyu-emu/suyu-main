@@ -16,6 +16,7 @@
 #include <QTcpSocket>
 
 #include "common/fs/path_util.h"
+#include "core/crypto/key_manager.h"
 #include "suyu/mcp_server.h"
 
 namespace {
@@ -204,35 +205,12 @@ void McpServer::RegisterBuiltinTools() {
             };
         });
 
-    // 4) list_installed_titles — scan NAND for installed titles
-    RegisterTool(
-        QStringLiteral("list_installed_titles"),
-        QStringLiteral("List all titles installed in the emulator NAND."),
-        MakeSchema({}),
-        [](const QJsonObject& /*params*/) -> QJsonObject {
-            const QString data_dir =
-                QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
-            const QDir content_dir(data_dir +
-                                   QStringLiteral("/suyu/nand/user/Contents/registered/"));
-
-            QJsonArray titles;
-            if (content_dir.exists()) {
-                const auto entries = content_dir.entryInfoList(
-                    QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-                for (const auto& entry : entries) {
-                    QJsonObject title;
-                    title[QStringLiteral("name")] = entry.fileName();
-                    title[QStringLiteral("path")] = entry.absoluteFilePath();
-                    titles.append(title);
-                }
-            }
-
-            return QJsonObject{
-                {QStringLiteral("content_directory"), content_dir.absolutePath()},
-                {QStringLiteral("count"), titles.size()},
-                {QStringLiteral("titles"), titles},
-            };
-        });
+    // 4) list_installed_titles is registered in main.cpp, where the filesystem
+    //    controller is in scope. It used to live here, over
+    //    QStandardPaths::GenericDataLocation - which is %LOCALAPPDATA% on
+    //    Windows while the NAND is under %APPDATA%, so it reported an empty
+    //    directory that does not exist no matter what is installed. It also
+    //    listed the content-index folder names rather than any title.
 
     // 5) get_system_info — report emulator and host system information
     RegisterTool(
@@ -323,6 +301,13 @@ void McpServer::RegisterBuiltinTools() {
                 result[QStringLiteral("prod_keys_size")] = prod.exists() ? prod.size() : 0;
                 result[QStringLiteral("title_keys_present")] = title.exists();
                 result[QStringLiteral("title_keys_size")] = title.exists() ? title.size() : 0;
+                // Counts only: tickets read from the NAND ticket store at startup, and how
+                // many of them gave a title key.
+                const auto& key_manager = Core::Crypto::KeyManager::Instance();
+                result[QStringLiteral("installed_tickets")] =
+                    static_cast<qint64>(key_manager.GetInstalledTicketCount());
+                result[QStringLiteral("installed_ticket_title_keys")] =
+                    static_cast<qint64>(key_manager.GetInstalledTitleKeyCount());
                 result[QStringLiteral("external_tool_id")] = ext_tool_id;
                 result[QStringLiteral("external_tool_path")] = ext_tool_path;
                 result[QStringLiteral("external_tool_configured")] = ext_tool_exists;

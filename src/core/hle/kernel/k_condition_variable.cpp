@@ -7,6 +7,7 @@
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_condition_variable.h"
+#include "core/hle/kernel/k_lock_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
@@ -121,6 +122,10 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
         KScopedSchedulerLock sl(kernel);
 
         // Remove waiter thread.
+        u32 prev_value{};
+        if (LockTrace::Enabled()) {
+            ReadFromUser(kernel, std::addressof(prev_value), addr);
+        }
         bool has_waiters{};
         KThread* const next_owner_thread = owner_thread->RemoveUserWaiterByKey(kernel, std::addressof(has_waiters), addr);
 
@@ -148,6 +153,16 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
         if (next_owner_thread != nullptr) {
             next_owner_thread->EndWait(kernel, result);
         }
+
+        // next_value == 0 here means this thread's own waiter list held nobody
+        // keyed on addr. If a thread is nevertheless parked on addr, it queued
+        // itself against a different owner and has just been orphaned - which
+        // is the distinction the trace exists to catch.
+        LockTrace::Record(LockTrace::Ev::Unlock, static_cast<u32>(owner_thread->GetId()),
+                          GetInteger(addr), prev_value, next_value,
+                          next_owner_thread != nullptr
+                              ? static_cast<u32>(next_owner_thread->GetId())
+                              : 0u);
 
         R_RETURN(result);
     }

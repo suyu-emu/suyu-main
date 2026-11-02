@@ -1,0 +1,38 @@
+cmake_minimum_required(VERSION 3.20)
+project(recompiler_fastmem LANGUAGES C CXX)
+option(FMDIFF_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+add_executable(fmdiff_gen fmdiff_gen.cpp)
+target_compile_features(fmdiff_gen PRIVATE cxx_std_20)
+target_include_directories(fmdiff_gen PRIVATE "${SUYU_SOURCE}/src")
+
+set(gen "${CMAKE_CURRENT_BINARY_DIR}/gen")
+set(gen_files "${gen}/fm/recomp_runtime.h" "${gen}/fm/recomp_runtime.c"
+    "${gen}/abi5/recomp_runtime.h" "${gen}/abi5/recomp_runtime.c" "${gen}/abi5_rename.h")
+add_custom_command(OUTPUT ${gen_files} COMMAND fmdiff_gen "${gen}" DEPENDS fmdiff_gen VERBATIM)
+
+# Both runtimes as the static host builds them, the ABI 5 one renamed to abi5_*.
+add_library(fmdiff_abi6 STATIC "${gen}/fm/recomp_runtime.c")
+target_include_directories(fmdiff_abi6 PRIVATE "${gen}/fm")
+add_library(fmdiff_abi5 STATIC "${gen}/abi5/recomp_runtime.c" "${gen}/abi5_rename.h")
+target_include_directories(fmdiff_abi5 PRIVATE "${gen}/abi5")
+if(MSVC)
+  target_compile_options(fmdiff_abi5 PRIVATE "/FI${gen}/abi5_rename.h")
+else()
+  target_compile_options(fmdiff_abi5 PRIVATE -include "${gen}/abi5_rename.h")
+endif()
+add_executable(fmdiff fmdiff.c "${gen}/fm/recomp_runtime.h")
+target_include_directories(fmdiff PRIVATE "${gen}/fm")
+target_link_libraries(fmdiff PRIVATE fmdiff_abi6 fmdiff_abi5)
+foreach(target fmdiff_abi6 fmdiff_abi5 fmdiff)
+  target_compile_features(${target} PRIVATE c_std_11)
+  target_compile_definitions(${target} PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_HOST=1)
+  if(FMDIFF_SANITIZE)
+    target_compile_options(${target} PRIVATE -fsanitize=address,undefined
+                           -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+  endif()
+endforeach()
+if(NOT MSVC)
+  target_link_libraries(fmdiff PRIVATE m)
+endif()

@@ -24,6 +24,30 @@
 
 namespace FS = Common::FS;
 
+namespace {
+
+// Directories inside the executable's folder are stored relative to it, so a portable
+// installation keeps working after being moved or copied instead of pointing at its old place.
+std::string ToStoredPath(const std::string& value) {
+    const std::filesystem::path absolute = std::filesystem::path{FS::ToU8String(value)};
+    std::error_code ec;
+    const auto relative = std::filesystem::relative(absolute, FS::GetExeDirectory(), ec);
+    if (ec || relative.empty() || relative.is_absolute() || relative.begin()->string() == "..") {
+        return value;
+    }
+    return FS::ToUTF8String(relative.generic_u8string());
+}
+
+std::filesystem::path ResolveStoredPath(const std::string& value) {
+    const std::filesystem::path stored = std::filesystem::path{FS::ToU8String(value)};
+    if (value.empty() || stored.is_absolute()) {
+        return stored;
+    }
+    return FS::GetExeDirectory() / stored;
+}
+
+} // Anonymous namespace
+
 Config::Config(const ConfigType config_type)
     : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
 
@@ -588,7 +612,7 @@ void Config::SaveDataStorageValues() {
         WriteStringSetting(std::string("save_directory"), std::string(""),
                            std::make_optional(std::string("")));
     } else {
-        WriteStringSetting(std::string("save_directory"), save_path,
+        WriteStringSetting(std::string("save_directory"), ToStoredPath(save_path),
                            std::make_optional(std::string("")));
     }
 

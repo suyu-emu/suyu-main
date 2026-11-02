@@ -6,6 +6,7 @@
 
 #include "core/core.h"
 #include "core/hle/kernel/k_memory_layout.h"
+#include "core/hle/kernel/k_lock_trace.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 
@@ -20,7 +21,18 @@ Result ArbitrateLock(Core::System& system, Handle thread_handle, u64 address, u3
     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
     R_UNLESS(Common::IsAligned(address, sizeof(u32)), ResultInvalidAddress);
 
-    R_RETURN(KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag));
+    if (!LockTrace::Enabled()) {
+        R_RETURN(KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag));
+    }
+    // The word is read before the call so the trace shows what the waiter saw,
+    // not what it looks like after the kernel has rewritten it.
+    const u32 tid = static_cast<u32>(GetCurrentThreadPointer(system.Kernel())->GetId());
+    LockTrace::Record(LockTrace::Ev::LockEnter, tid, address, thread_handle, tag,
+                      GetCurrentProcess(system.Kernel()).GetMemory().Read32(address));
+    const Result r =
+        KConditionVariable::WaitForAddress(system.Kernel(), thread_handle, address, tag);
+    LockTrace::Record(LockTrace::Ev::LockExit, tid, address, r.raw);
+    R_RETURN(r);
 }
 
 /// Unlock a mutex

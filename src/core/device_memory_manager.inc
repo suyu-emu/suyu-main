@@ -20,6 +20,7 @@
 #include "common/div_ceil.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 #include "core/device_memory.h"
 #include "core/device_memory_manager.h"
 #include "core/memory.h"

@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/settings.h"
+#include <cstdlib>
+#include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -43,6 +45,9 @@ Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
 }
 
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
+    if (code_read_dirty.exchange(false, std::memory_order_acquire)) {
+        last_code_addr = u64(-1);
+    }
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
@@ -102,16 +107,33 @@ bool DynarmicCallbacks64::MemoryWriteExclusive128(u64 vaddr, Dynarmic::A64::Vect
 }
 
 void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op, u64 value) {
+    const bool compiled_modules = GetRecompLookup() != nullptr;
+    if (compiled_modules && !IsRecompCodeGuardReady()) {
+        LOG_CRITICAL(Core_ARM, "recomp: fallback IC requires a guard-v2 host and all guarded modules");
+        std::abort();
+    }
     last_code_addr = u64(-1); //invalidate cached page
     switch (op) {
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
         static constexpr u64 ICACHE_LINE_SIZE = 64;
         const u64 cache_line_start = value & ~(ICACHE_LINE_SIZE - 1);
-        m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+        if (compiled_modules) {
+            for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+                if (auto* cpu = m_process->GetArmInterface(core)) cpu->InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+            }
+        } else {
+            m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+        }
         break;
     }
     case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
-        m_parent.ClearInstructionCache();
+        if (compiled_modules) {
+            for (size_t core = 0; core < Hardware::NUM_CPU_CORES; ++core) {
+                if (auto* cpu = m_process->GetArmInterface(core)) cpu->ClearInstructionCache();
+            }
+        } else {
+            m_parent.ClearInstructionCache();
+        }
         break;
     case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
     default:
@@ -337,6 +359,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     case Settings::CpuAccuracy::Auto:
         config.unsafe_optimizations = true;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         config.fastmem_address_space_bits = 64;
         break;
     // Paranoia mode for debugging optimizations
@@ -446,10 +470,12 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
+    m_cb->code_read_dirty.store(true, std::memory_order_release);
     m_jit->ClearCache();
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
+    m_cb->code_read_dirty.store(true, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

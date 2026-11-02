@@ -8,6 +8,7 @@
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -159,7 +160,10 @@ Frame* PresentManager::GetRenderFrame() {
     free_queue.pop_front();
 
     // Wait for the presentation to be finished so all frame resources are free
-    frame->present_done.Wait();
+    {
+        StallProbe::Accum probe{StallProbe::frame_wait_ns};
+        frame->present_done.Wait();
+    }
     frame->present_done.Reset();
 
     return frame;
@@ -191,7 +195,9 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .pNext = nullptr,
         .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = swapchain.GetImageFormat(),
+        // Headless there is no swapchain to take the format from
+        .format = swapchain.GetImageFormat() != VK_FORMAT_UNDEFINED ? swapchain.GetImageFormat()
+                                                                     : image_view_format,
         .extent =
             {
                 .width = width,
@@ -202,7 +208,10 @@ void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        // Sampled: inside a libretro frontend the frame is handed over as this image, and the
+        // frontend draws it by sampling (RendererVulkan::PresentExternal)
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_SAMPLED_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,

@@ -126,6 +126,25 @@ public:
      */
     [[nodiscard]] bool IsValidVirtualAddress(Common::ProcessAddress vaddr) const;
 
+    /// Describes the page table well enough for generated C to resolve a guest
+    /// address inline, mirroring GetPointerImpl's fast path exactly.
+    ///
+    /// The static recompiler emits one C function per guest basic block, and
+    /// every guest load or store in it was an indirect call out to the host.
+    /// Handing it the page table lets the common case - a mapped page with a
+    /// real backing pointer - become a bounds check, one entry load and an add.
+    /// Anything else (unmapped, debug, or GPU-tracked memory, all of which have
+    /// a null pointer in the entry) still goes through the callback, so
+    /// rasterizer invalidation is not bypassed.
+    struct PageTableView {
+        const void* entries;   ///< PageEntryData[], null if there is no table yet
+        u64 entry_stride;      ///< sizeof(PageEntryData)
+        u64 page_bits;
+        u64 pointer_mask;      ///< PageInfo::ExtractPointer's mask
+        u64 address_space_max; ///< 1 << address space bits
+    };
+    [[nodiscard]] PageTableView GetPageTableView() const;
+
     /**
      * Checks whether or not the supplied range of addresses are all valid
      * virtual addresses for the current process.

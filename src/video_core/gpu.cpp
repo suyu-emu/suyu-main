@@ -48,7 +48,39 @@ struct GPU::Impl {
         , gpu_thread{system_}
     {}
 
-    ~Impl() = default;
+    ~Impl() {
+        // Join the GPU thread before the scheduler, channels and context it uses are destroyed.
+        ShutdownThread();
+        // Destroy the renderer while the channels it still points at are alive. Members are
+        // destroyed in reverse declaration order, so otherwise `channels` and `scheduler` (the
+        // last owners of each ChannelState once the services are gone) die before `renderer`,
+        // and ~RasterizerVulkan -> Scheduler::Finish -> InvalidateState ORs the invalidation mask
+        // into the bound channel's freed Maxwell3D dirty flags (heap corruption, reported as
+        // 0xC0000374 at some later free).
+        renderer.reset();
+    }
+
+    void ShutdownThread() {
+        if (gpu_thread.IsRunning()) {
+            // Drain first: host threads (nvhost_ctrl WaitHost, NVDEC/VIC) may be waiting on
+            // syncpoints produced by work still queued on the GPU thread.
+            const u64 fence = RequestSyncOperation(
+                [this] { renderer->ReadRasterizer()->ReleaseFences(true); });
+            gpu_thread.TickGPU(is_async);
+            std::unique_lock lck{sync_request_mutex};
+            if (!sync_request_cv.wait_for(lck, std::chrono::seconds(5), [this, fence] {
+                    return CurrentSyncRequestFence() >= fence;
+                })) {
+                LOG_WARNING(HW_GPU, "GPU thread did not drain within 5 s; stopping it anyway");
+            }
+        }
+        gpu_thread.ShutdownThread();
+        {
+            std::scoped_lock lk{sync_request_mutex};
+            gpu_thread_stopped = true;
+        }
+        sync_request_cv.notify_all();
+    }
 
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
@@ -127,7 +159,9 @@ struct GPU::Impl {
 
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return CurrentSyncRequestFence() >= fence || gpu_thread_stopped;
+        });
     }
 
     /// Tick pending requests within the GPU.
@@ -148,7 +182,8 @@ struct GPU::Impl {
         u64 gpu_tick = system.CoreTiming().GetGPUTicks();
         Settings::GpuOverclock overclock = Settings::values.fast_gpu_time.GetValue();
 
-        if (overclock != Settings::GpuOverclock::Normal) {
+        if (Settings::values.use_fast_gpu_time.GetValue() &&
+            overclock != Settings::GpuOverclock::Normal) {
             gpu_tick /= 256 * u64(overclock);
         }
 
@@ -297,6 +332,8 @@ struct GPU::Impl {
     u64 last_sync_fence{};
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+    /// Set once the GPU thread has exited; nothing will run pending sync requests after that.
+    bool gpu_thread_stopped{};
 
     const bool is_async;
 
@@ -454,6 +491,10 @@ void GPU::Start() {
 
 void GPU::NotifyShutdown() {
     impl->NotifyShutdown();
+}
+
+void GPU::ShutdownThread() {
+    impl->ShutdownThread();
 }
 
 void GPU::ObtainContext() {

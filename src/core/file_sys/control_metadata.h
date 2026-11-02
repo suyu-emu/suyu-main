@@ -16,6 +16,10 @@
 
 namespace FileSys {
 
+class NCA;
+// Validate bundled control content before registering it for a launch.
+bool IsValidControlMetadata(const NCA& nca, u64 program_id);
+
 // A localized entry containing strings within the NACP.
 // One for each language of type Language.
 struct LanguageEntry {

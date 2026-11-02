@@ -137,7 +137,11 @@ struct PageTable {
         PageInfo ptr;
         u64 block;
         u64 addr;
-        u64 padding;
+        /// Nonzero on a code page of a statically recompiled module whose code is
+        /// being kept stable (ABI 6 generation code guard). Stores to such a page
+        /// must reach Core::Memory, which tells the guard after writing. Set only
+        /// by core/arm/recomp; accessed atomically; 0 everywhere else.
+        u64 recomp_watch;
     };
     VirtualBuffer<PageEntryData> entries;
     static_assert(sizeof(PageEntryData) == 32);

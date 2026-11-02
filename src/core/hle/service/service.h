@@ -96,6 +96,11 @@ private:
 
     void RegisterHandlersBase(const FunctionInfoBase* functions, std::size_t n);
     void RegisterHandlersBaseTipc(const FunctionInfoBase* functions, std::size_t n);
+    // Single-entry registration. The array forms above index through a
+    // FunctionInfoBase* and so depend on the derived type having an identical
+    // layout, which it does not; see RegisterHandlers below.
+    void RegisterHandlerBase(const FunctionInfoBase& function);
+    void RegisterHandlerBaseTipc(const FunctionInfoBase& function);
     void ReportUnimplementedFunction(HLERequestContext& ctx, const FunctionInfoBase* info);
 
 protected:
@@ -134,14 +139,24 @@ protected:
     /// Contains information about a request type which is handled by the service.
     template <typename T>
     struct FunctionInfoTyped : FunctionInfoBase {
-        // TODO(yuriks): This function could be constexpr, but clang is the only compiler that
-        // doesn't emit an ICE or a wrong diagnostic because of the static_cast.
+        // NOT constexpr, deliberately. The original comment here said only clang
+        // handles the pointer-to-member cast below without an ICE or a wrong
+        // diagnostic - and it was marked constexpr regardless. On MSVC the
+        // result is worse than an error: the array is constant-initialised with
+        // silently wrong data. Dumping IpcController's table showed keys
+        // 0,1,0,0,0,0 instead of 0..5 and garbage name pointers from entry 1
+        // onward, so only 2 of its 6 handlers survived into the dispatch map.
+        // QueryPointerBufferSize was one of the lost, which stalled every title
+        // during CMIF session setup.
+        //
+        // Without constexpr the array is dynamically initialised on first use,
+        // which MSVC gets right.
 
         /// @brief Constructs a FunctionInfo for a function.
         /// @param expected_header_ request header in the command buffer which will trigger dispatch to this handler
         /// @param handler_callback_ member function in this service which will be called to handle the request
         /// @param name_ human-friendly name for the request. Used mostly for logging purposes.
-        constexpr FunctionInfoTyped(u32 expected_header_, HandlerFnP<T> handler_callback_, const char* name_)
+        FunctionInfoTyped(u32 expected_header_, HandlerFnP<T> handler_callback_, const char* name_)
             : FunctionInfoBase{expected_header_, HandlerFnP<ServiceFrameworkBase>(handler_callback_), name_} {}
     };
     using FunctionInfo = FunctionInfoTyped<Self>;
@@ -169,7 +184,25 @@ protected:
      */
     template <typename T = Self>
     void RegisterHandlers(const FunctionInfoTyped<T>* functions, std::size_t n) {
-        RegisterHandlersBase(functions, n);
+        // Index with the *typed* pointer, one element at a time.
+        //
+        // This used to pass the array straight to RegisterHandlersBase, which
+        // walks it as FunctionInfoBase[] - and the two layouts do not match.
+        // sizeof() agrees, so a size assert passes, but the member offsets
+        // differ: dumping IpcController's table showed entry 0 with its name at
+        // offset 24 and entry 1 with its name at offset 20, with entry 2's key
+        // landing at byte 60 rather than 64. Every element after the first was
+        // read from the wrong place.
+        //
+        // The visible result was silent and severe: IpcController registered 2
+        // of its 6 handlers, because the corrupted keys collided and emplace
+        // kept only the distinct ones. QueryPointerBufferSize (command 3) was
+        // among the lost, and it is part of CMIF session setup - so every title
+        // stalled during early service initialisation and never reached the
+        // graphics stack at all.
+        for (std::size_t i = 0; i < n; ++i) {
+            RegisterHandlerBase(functions[i]);
+        }
     }
 
     /// Registers handlers in the service.
@@ -184,7 +217,10 @@ protected:
      */
     template <typename T = Self>
     void RegisterHandlersTipc(const FunctionInfoTyped<T>* functions, std::size_t n) {
-        RegisterHandlersBaseTipc(functions, n);
+        // Same hazard as RegisterHandlers above.
+        for (std::size_t i = 0; i < n; ++i) {
+            RegisterHandlerBaseTipc(functions[i]);
+        }
     }
 
 protected:

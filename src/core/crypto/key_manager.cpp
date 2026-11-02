@@ -631,22 +631,6 @@ void KeyManager::LoadFromFile(const std::filesystem::path& file_path, bool is_ti
                     const auto& index = iter256->second;
                     const Key256 key = Common::HexStringToArray<32>(out[1]);
                     s256_keys[{index.type, index.field1, index.field2}] = key;
-                } else if (out[0].compare(0, 8, "keyblob_") == 0 && out[0].compare(0, 9, "keyblob_k") != 0) {
-                    if (!ValidCryptoRevisionString(out[0], 8, 2)) {
-                        continue;
-                    }
-
-                    const auto index = std::strtoul(out[0].substr(8, 2).c_str(), nullptr, 16);
-                    keyblobs[index] = Common::HexStringToArray<0x90>(out[1]);
-                } else if (out[0].compare(0, 18, "encrypted_keyblob_") == 0) {
-                    if (!ValidCryptoRevisionString(out[0], 18, 2)) {
-                        continue;
-                    }
-
-                    const auto index = std::strtoul(out[0].substr(18, 2).c_str(), nullptr, 16);
-                    encrypted_keyblobs[index] = Common::HexStringToArray<0xB0>(out[1]);
-                } else if (out[0].compare(0, 20, "eticket_extended_kek") == 0) {
-                    eticket_extended_kek = Common::HexStringToArray<576>(out[1]);
                 } else if (out[0].compare(0, 19, "eticket_rsa_keypair") == 0) {
                     const auto key_data = Common::HexStringToArray<528>(out[1]);
                     std::memcpy(eticket_rsa_keypair.decryption_key.data(), key_data.data(), eticket_rsa_keypair.decryption_key.size());
@@ -780,6 +764,9 @@ void KeyManager::WriteKeyToFile(KeyCategory category, std::string_view keyname, 
 }
 
 void KeyManager::SetKey(S128KeyType id, Key128 key, u64 field1, u64 field2) {
+    // Held in memory only. suyu never writes key files: keys come from the files the
+    // user installs, and anything computed from them (title keys from the user's own
+    // tickets, SD keys from the user's sources) lives only for this session.
     if (s128_keys.find({id, field1, field2}) != s128_keys.end() || key == Key128{}) {
         return;
     }
@@ -1156,5 +1143,167 @@ bool KeyManager::AddTicket(const Ticket& ticket) {
     }
     SetKey(S128KeyType::Titlekey, key.value(), rights_id[1], rights_id[0]);
     return true;
+}
+
+namespace {
+// Ticket files are a few hundred bytes (an RSA-4096 ticket is 0x500); anything far larger is
+// not one.
+constexpr std::size_t kMaxTicketFileSize = 0x10000;
+
+// Ticket::Read copies a whole ticket structure, so short input is zero-padded first.
+Ticket ReadTicketBytes(std::span<const u8> bytes) {
+    std::array<u8, sizeof(RSA4096Ticket)> padded{};
+    std::memcpy(padded.data(), bytes.data(), std::min(bytes.size(), padded.size()));
+    return Ticket::Read(std::span<const u8>{padded});
+}
+
+std::optional<std::vector<u8>> ReadSmallFile(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size > kMaxTicketFileSize) {
+        return std::nullopt;
+    }
+    std::ifstream file(path, std::ios::binary);
+    std::vector<u8> bytes(static_cast<std::size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) {
+        return std::nullopt;
+    }
+    return bytes;
+}
+} // Anonymous namespace
+
+std::filesystem::path TicketStoreDir(const std::filesystem::path& nand_dir) {
+    // A Switch keeps imported tickets on its SYSTEM partition (the ES saves 80000000000000e1
+    // and e2, which PopulateTickets reads), and suyu's NAND folder mirrors that partition as
+    // <nand>/system. Plain .tik files beside those saves avoid writing the ES save format,
+    // stay out of system/Contents/registered, which firmware installs replace, and sit in a
+    // NAND area the package policy keeps out of exports and releases. Only tickets are kept
+    // here, as the NSP shipped them: suyu writes no key files and never stores a title key
+    // in plain form.
+    return nand_dir / "system" / "tickets";
+}
+
+bool StoreInstalledTicket(const std::filesystem::path& nand_dir,
+                          const FileSys::VirtualFile& ticket_file) {
+    if (ticket_file == nullptr || nand_dir.empty()) {
+        return false;
+    }
+    const auto size = ticket_file->GetSize();
+    if (size < sizeof(SignatureType) || size > kMaxTicketFileSize) {
+        LOG_WARNING(Crypto, "Not keeping ticket {}: unexpected size {}", ticket_file->GetName(),
+                    size);
+        return false;
+    }
+    const std::vector<u8> bytes = ticket_file->ReadAllBytes();
+    if (bytes.size() != size) {
+        return false;
+    }
+    const auto ticket = ReadTicketBytes(bytes);
+    if (!ticket.IsValid() || ticket.GetData().rights_id == Key128{}) {
+        LOG_WARNING(Crypto, "Not keeping {}: not a ticket with a rights ID",
+                    ticket_file->GetName());
+        return false;
+    }
+
+    const auto dir = TicketStoreDir(nand_dir);
+    const auto path = dir / (Common::HexToString(ticket.GetData().rights_id, false) + ".tik");
+    if (const auto existing = ReadSmallFile(path); existing && *existing == bytes) {
+        return true;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        LOG_ERROR(Crypto, "Could not create the ticket store {}: {}",
+                  Common::FS::PathToUTF8String(dir), ec.message());
+        return false;
+    }
+    // Written beside the target and renamed over it, so a failed write never leaves a
+    // truncated ticket behind.
+    auto temp = path;
+    temp += ".part";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+            out.close();
+            std::filesystem::remove(temp, ec);
+            LOG_ERROR(Crypto, "Could not write ticket {}", Common::FS::PathToUTF8String(path));
+            return false;
+        }
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        std::filesystem::remove(temp, ec);
+        LOG_ERROR(Crypto, "Could not store ticket {}", Common::FS::PathToUTF8String(path));
+        return false;
+    }
+    LOG_INFO(Crypto, "Kept the ticket for rights ID {} in {}",
+             Common::HexToString(ticket.GetData().rights_id, false),
+             Common::FS::PathToUTF8String(dir));
+    return true;
+}
+
+std::size_t KeyManager::LoadInstalledTickets(const std::filesystem::path& nand_dir,
+                                            const std::filesystem::path& package_dir) {
+    if (nand_dir.empty()) {
+        return 0;
+    }
+    const auto dir = TicketStoreDir(nand_dir).lexically_normal();
+    if (!FileSys::CanReadInstalledTicketPath(dir, package_dir)) {
+        LOG_WARNING(Crypto, "Ignoring ticket store inside export package: {}",
+                    Common::FS::PathToUTF8String(dir));
+        return 0;
+    }
+    if (std::find(loaded_ticket_stores.begin(), loaded_ticket_stores.end(), dir) !=
+        loaded_ticket_stores.end()) {
+        return 0;
+    }
+    loaded_ticket_stores.push_back(dir);
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return 0;
+    }
+    std::size_t added = 0;
+    std::size_t with_title_key = 0;
+    for (auto it = std::filesystem::directory_iterator(dir, ec);
+         !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        const auto& path = it->path();
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec) ||
+            Common::ToLower(Common::FS::PathToUTF8String(path.extension())) != ".tik") {
+            continue;
+        }
+        if (!FileSys::CanReadInstalledTicketPath(path, package_dir)) {
+            LOG_WARNING(Crypto, "Ignoring ticket inside export package: {}",
+                        Common::FS::PathToUTF8String(path));
+            continue;
+        }
+        const auto bytes = ReadSmallFile(path);
+        const auto ticket = bytes ? ReadTicketBytes(*bytes) : Ticket{std::monostate()};
+        if (!ticket.IsValid() || ticket.GetData().rights_id == Key128{}) {
+            LOG_WARNING(Crypto, "Skipping {}: not a ticket", Common::FS::PathToUTF8String(path));
+            continue;
+        }
+        ++added;
+        if (AddTicket(ticket)) {
+            ++with_title_key;
+        }
+    }
+    installed_ticket_count += added;
+    installed_title_key_count += with_title_key;
+    LOG_INFO(Crypto, "Loaded {} installed tickets ({} with a title key) from {}", added,
+             with_title_key, Common::FS::PathToUTF8String(dir));
+    return added;
+}
+
+std::size_t KeyManager::GetInstalledTicketCount() const {
+    return installed_ticket_count;
+}
+
+std::size_t KeyManager::GetInstalledTitleKeyCount() const {
+    return installed_title_key_count;
 }
 } // namespace Core::Crypto

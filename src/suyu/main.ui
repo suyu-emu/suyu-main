@@ -105,6 +105,8 @@
       <string>&amp;Recent Files</string>
      </property>
     </widget>
+    <addaction name="action_Setup"/>
+    <addaction name="separator"/>
     <addaction name="action_Install_File_NAND"/>
     <addaction name="separator"/>
     <addaction name="action_Load_File"/>
@@ -135,6 +137,11 @@
     <property name="title">
      <string>&amp;View</string>
     </property>
+    <widget class="QMenu" name="menu_Resolution_Scale">
+     <property name="title">
+      <string>Resolution &amp;Scale</string>
+     </property>
+    </widget>
     <widget class="QMenu" name="menu_Reset_Window_Size">
      <property name="title">
       <string>&amp;Reset Window Size</string>
@@ -185,6 +192,7 @@
     <addaction name="action_Show_Folders_In_List"/>
     <addaction name="action_Change_Interface_Mode"/>
     <addaction name="separator"/>
+    <addaction name="menu_Resolution_Scale"/>
     <addaction name="menu_Reset_Window_Size"/>
     <addaction name="menu_View_Debugging"/>
    </widget>
@@ -571,6 +579,14 @@
   <action name="action_Export_Game">
    <property name="text">
     <string>&amp;Export Game...</string>
+   </property>
+  </action>
+  <action name="action_Setup">
+   <property name="text">
+    <string>&amp;Setup...</string>
+   </property>
+   <property name="toolTip">
+    <string>What still has to be installed before a game will run</string>
    </property>
   </action>
   <action name="action_Nintendo_Account">

@@ -6,6 +6,7 @@
 
 #include "common/demangle.h"
 #include "core/arm/debug.h"
+#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/symbols.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"

@@ -44,6 +44,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
     INSERT(Settings, login_share_applet_mode, tr("Login share"), QStringLiteral());
     INSERT(Settings, wifi_web_auth_applet_mode, tr("Wifi web auth"), QStringLiteral());
     INSERT(Settings, my_page_applet_mode, tr("My page"), QStringLiteral());
+    INSERT(Settings, enable_overlay, tr("Enable overlay applet"),
+           tr("Enables the console's built-in overlay applet."));
 
     // Audio
     INSERT(Settings, sink_id, tr("Output Engine:"), QStringLiteral());
@@ -205,6 +207,22 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "accuracy.\nExtreme should only be used for debugging.\nThis option can "
               "be changed while playing.\nSome games may require booting on high to render "
               "properly."));
+    INSERT(Settings, dma_accuracy, tr("DMA Accuracy:"),
+           tr("Controls DMA read accuracy. Default follows the GPU accuracy setting. Unsafe can be "
+              "faster; Safe can fix issues in some games."));
+    INSERT(Settings, gpu_fence_behavior, tr("GPU Fence Behavior:"),
+           tr("Controls GPU fence synchronization. Default follows the GPU accuracy setting. "
+              "Stricter modes can improve compatibility at a performance cost."));
+    INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only):"),
+           tr("Sets the target frame pacing rate for Vulkan presentation."));
+    INSERT(Settings, sync_memory_operations, tr("Sync memory operations"),
+           tr("Synchronizes memory operations for improved compatibility, potentially reducing "
+              "performance."));
+    INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
+           tr("Retains previous buffer states for games that need them."));
+    INSERT(Settings, enable_gpu_buffer_readback, tr("Enable GPU buffer readback"),
+           tr("Reads GPU-modified data back before uploading it again. Some games need this for "
+              "correct rendering."));
     INSERT(Settings, use_asynchronous_shaders, tr("Use asynchronous shader building (Hack)"),
            tr("Enables asynchronous shader compilation, which may reduce shader stutter.\nThis "
               "feature "
@@ -219,6 +237,18 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries (Experimental)"),
+           tr("Builds Vulkan graphics pipelines from reusable parts when supported by the driver. "
+              "Keeping this disabled is recommended for compatibility. Requires a restart."));
+    INSERT(Settings, dyna_state, tr("Extended dynamic state"),
+           tr("Selects the Vulkan extended dynamic state level when supported by the driver. "
+              "Select Disabled to turn off these extensions. Requires a restart."));
+    INSERT(Settings, sample_shading, tr("Sample shading (%)"),
+           tr("Sets the minimum percentage of samples shaded individually for multisampled "
+              "rendering. Higher values may reduce performance. Requires a restart."));
+    INSERT(Settings, vertex_input_dynamic_state, tr("Use dynamic vertex input state"),
+           tr("Uses Vulkan dynamic vertex input state when supported by the driver. "
+              "Disable this to use fixed vertex input state. Requires a restart."));
     INSERT(
         Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
         tr("Enable compute pipelines, required by some games.\nThis setting only exists for Intel "
@@ -242,6 +272,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
               "purposes."));
     INSERT(Settings, rng_seed_enabled, QStringLiteral(), QStringLiteral());
     INSERT(Settings, device_name, tr("Device Name"), tr("The name of the emulated Switch."));
+    INSERT(Settings, application_version_override, tr("Application version number override:"),
+           tr("Overrides the reported numeric application version when content has no control "
+              "metadata. Leave at 0 to use the detected version."));
+    INSERT(Settings, application_display_version_override,
+           tr("Application display version override:"),
+           tr("Overrides the version text shown to the game when content has no control metadata. "
+              "Leave empty to use the detected version."));
+    INSERT(Settings, program_args, tr("Homebrew arguments:"),
+           tr("Command-line arguments passed to homebrew when it starts."));
     INSERT(Settings, custom_rtc, tr("Custom RTC Date:"),
            tr("This option allows to change the emulated clock of the Switch.\n"
               "Can be used to manipulate time in games."));
@@ -313,6 +352,43 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
 #define PAIR(ENUM, VALUE, TRANSLATION) {static_cast<u32>(Settings::ENUM::VALUE), (TRANSLATION)}
 
     // Intentionally skipping VSyncMode to let the UI fill that one out
+    translations->insert({Settings::EnumMetadata<Settings::GpuOverclock>::Index(),
+                          {
+                              PAIR(GpuOverclock, Normal, tr("Normal (no divisor)")),
+                              PAIR(GpuOverclock, Medium, tr("Medium (256)")),
+                              PAIR(GpuOverclock, High, tr("High (512)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzleSize>::Index(),
+                          {
+                              PAIR(GpuUnswizzleSize, VerySmall, tr("16 MiB")),
+                              PAIR(GpuUnswizzleSize, Small, tr("32 MiB")),
+                              PAIR(GpuUnswizzleSize, Normal, tr("128 MiB")),
+                              PAIR(GpuUnswizzleSize, Large, tr("256 MiB")),
+                              PAIR(GpuUnswizzleSize, VeryLarge, tr("512 MiB")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzle>::Index(),
+                          {
+                              PAIR(GpuUnswizzle, VeryLow, tr("4 MiB")),
+                              PAIR(GpuUnswizzle, Low, tr("8 MiB")),
+                              PAIR(GpuUnswizzle, Normal, tr("16 MiB")),
+                              PAIR(GpuUnswizzle, Medium, tr("32 MiB")),
+                              PAIR(GpuUnswizzle, High, tr("64 MiB")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzleChunk>::Index(),
+                          {
+                              PAIR(GpuUnswizzleChunk, VeryLow, tr("32 slices")),
+                              PAIR(GpuUnswizzleChunk, Low, tr("64 slices")),
+                              PAIR(GpuUnswizzleChunk, Normal, tr("128 slices")),
+                              PAIR(GpuUnswizzleChunk, Medium, tr("256 slices")),
+                              PAIR(GpuUnswizzleChunk, High, tr("512 slices")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::ExtendedDynamicState>::Index(),
+                          {
+                              PAIR(ExtendedDynamicState, Disabled, tr("Disabled")),
+                              PAIR(ExtendedDynamicState, EDS1, tr("EDS1")),
+                              PAIR(ExtendedDynamicState, EDS2, tr("EDS2")),
+                              PAIR(ExtendedDynamicState, EDS3, tr("EDS3")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::AppletMode>::Index(),
                           {
                               PAIR(AppletMode, HLE, tr("Custom frontend")),
@@ -332,6 +408,28 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
              PAIR(AstcRecompression, Bc1, tr("BC1 (Low quality)")),
              PAIR(AstcRecompression, Bc3, tr("BC3 (Medium quality)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::FramePacingMode>::Index(),
+                          {
+                              PAIR(FramePacingMode, Target_Auto, tr("Auto")),
+                              PAIR(FramePacingMode, Target_30, tr("30 FPS")),
+                              PAIR(FramePacingMode, Target_60, tr("60 FPS")),
+                              PAIR(FramePacingMode, Target_90, tr("90 FPS")),
+                              PAIR(FramePacingMode, Target_120, tr("120 FPS")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::DmaAccuracy>::Index(),
+                          {
+                              PAIR(DmaAccuracy, Default, tr("Default")),
+                              PAIR(DmaAccuracy, Unsafe, tr("Unsafe (fast)")),
+                              PAIR(DmaAccuracy, Safe, tr("Safe (stable)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuFenceBehavior>::Index(),
+                          {
+                              PAIR(GpuFenceBehavior, Default, tr("Default")),
+                              PAIR(GpuFenceBehavior, Immediate, tr("Immediate")),
+                              PAIR(GpuFenceBehavior, Balanced, tr("Balanced")),
+                              PAIR(GpuFenceBehavior, Accurate, tr("Accurate")),
+                              PAIR(GpuFenceBehavior, Strict, tr("Strict")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::VramUsageMode>::Index(),
                           {
                               PAIR(VramUsageMode, Conservative, tr("Conservative")),

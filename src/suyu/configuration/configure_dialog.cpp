@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <QScreen>
+#include <QScrollArea>
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -206,8 +208,35 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     const auto tabs = qvariant_cast<QList<QWidget*>>(items[0]->data(Qt::UserRole));
 
+    const bool showing_controls = tabs.contains(input_tab->GetSubTabs().front());
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(tab, tab->accessibleName());
+        QWidget* page = tab;
+        if (showing_controls) {
+            // Keep the controller diagram at its usable size, and scroll the
+            // page on displays too short to show it all at once. Reuse each
+            // wrapper when the user leaves and returns to Controls.
+            auto* scroll = tab->parentWidget()
+                               ? qobject_cast<QScrollArea*>(tab->parentWidget()->parentWidget())
+                               : nullptr;
+            if (!scroll || scroll->objectName() != QLatin1String("ControlsTabScrollArea")) {
+                scroll = new QScrollArea(ui->tabWidget);
+                scroll->setObjectName(QStringLiteral("ControlsTabScrollArea"));
+                scroll->setFrameShape(QFrame::NoFrame);
+                scroll->setWidgetResizable(true);
+                tab->setMinimumSize(952, 735);
+                scroll->setWidget(tab);
+            }
+            page = scroll;
+        }
+        ui->tabWidget->addTab(page, tab->accessibleName());
+    }
+
+    const QRect available = screen()->availableGeometry();
+    const QSize capped_controls{qMin(1120, available.width() - 40),
+                                qMin(820, available.height() - 40)};
+    setMinimumSize(showing_controls ? capped_controls : QSize{0, 650});
+    if (showing_controls) {
+        resize(size().expandedTo(capped_controls).boundedTo(available.size() - QSize{40, 40}));
     }
 }

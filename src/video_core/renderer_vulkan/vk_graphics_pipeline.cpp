@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -19,8 +20,10 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_timing.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
@@ -247,11 +250,16 @@ GraphicsPipeline::GraphicsPipeline(
     const Device& device_, DescriptorPool& descriptor_pool,
     GuestDescriptorQueue& guest_descriptor_queue_, Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+    GraphicsPipelineLibraryCache& library_cache_, Common::ThreadWorker& optimization_worker_,
+    const GraphicsPipelineCacheKey& key_, bool precompile_only_,
+    std::array<vk::ShaderModule, NUM_STAGES> stages,
+    std::array<u64, NUM_STAGES> code_hashes_,
     const std::array<const Shader::Info*, NUM_STAGES>& infos)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
-      pipeline_cache(pipeline_cache_), scheduler{scheduler_},
-      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)} {
+      pipeline_cache(pipeline_cache_), library_cache(library_cache_),
+      optimization_worker(optimization_worker_), scheduler{scheduler_},
+      guest_descriptor_queue{guest_descriptor_queue_}, spv_modules{std::move(stages)},
+      code_hashes{code_hashes_}, precompile_only{precompile_only_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -276,9 +284,10 @@ GraphicsPipeline::GraphicsPipeline(
         uses_push_descriptor = builder.CanUsePushDescriptor();
         descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
 
-        if (!uses_push_descriptor) {
-            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
-        }
+            if (!uses_push_descriptor) {
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, *descriptor_set_layout, stage_infos);
+            }
 
         const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
         pipeline_layout = builder.CreatePipelineLayout(set_layout);
@@ -298,6 +307,7 @@ GraphicsPipeline::GraphicsPipeline(
         if (shader_notify) {
             shader_notify->MarkShaderComplete();
         }
+        publish();
     }};
     if (worker_thread) {
         worker_thread->QueueWork(std::move(func));
@@ -524,7 +534,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return true;
 }
 
-void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
     if (!is_built.load(std::memory_order::relaxed)) {
@@ -534,6 +544,37 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });
     }
+    if (build_failed.load(std::memory_order::relaxed)) {
+        // No pipeline to bind. Drop the draw instead of binding a null handle.
+        return false;
+    }
+    if (!pipeline && pipeline_libraries[0]) {
+        std::scoped_lock lock{build_mutex};
+        if (build_failed.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (!pipeline) {
+            precompile_only = false;
+            try {
+                MakePipeline(optimized_render_pass);
+            } catch (const std::exception& exception) {
+                LOG_ERROR(Render_Vulkan, "Failed to link precompiled pipeline {:016x}: {}",
+                          key.Hash(), exception.what());
+                build_failed.store(true, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
+    if (!pipeline) {
+        LOG_ERROR(Render_Vulkan, "Pipeline {:016x} has no executable pipeline", key.Hash());
+        build_failed.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    if (pipeline_libraries[0] &&
+        !optimization_queued.exchange(true, std::memory_order_relaxed)) {
+        optimization_worker.QueueWork([this] { OptimizePipeline(); });
+    }
+    const bool use_optimized = optimized_ready.load(std::memory_order_acquire);
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
@@ -546,12 +587,13 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
 
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
-    scheduler.Record([this, descriptor_data, bind_pipeline, rescaling_data = rescaling.Data(),
+    scheduler.Record([this, descriptor_data, bind_pipeline, pipeline_handle,
+                      rescaling_data = rescaling.Data(),
                       is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_pipeline) {
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_handle);
         }
         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
@@ -582,6 +624,7 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    return true;
 }
 
 void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
@@ -597,7 +640,28 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (!key.state.dynamic_vertex_input) {
         const size_t num_vertex_arrays = (std::min)(
             Maxwell::NumVertexArrays, static_cast<size_t>(device.GetMaxVertexInputBindings()));
+        // Declare only the bindings an enabled attribute actually reads. A
+        // binding no attribute references does nothing, and declaring all 32
+        // leaves most of them with no buffer bound, which every draw then
+        // reports as VUID-vkCmdDraw*-None-04007. It also costs real resources
+        // on Metal, where each declared binding consumes one of the vertex
+        // stage's limited buffer argument slots and MoltenVK reserves several
+        // of those for itself. Binding numbers are indices, not positions, so
+        // a sparse set stays consistent with vkCmdBindVertexBuffers.
+        u32 used_bindings{};
+        for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+            const auto& attribute = key.state.attributes[index];
+            if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
+                continue;
+            }
+            if (static_cast<size_t>(attribute.buffer) < num_vertex_arrays) {
+                used_bindings |= 1U << attribute.buffer;
+            }
+        }
         for (size_t index = 0; index < num_vertex_arrays; ++index) {
+            if ((used_bindings & (1U << index)) == 0) {
+                continue;
+            }
             const bool instanced = key.state.binding_divisors[index] != 0;
             const auto rate =
                 instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
@@ -618,10 +682,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            VkFormat vertex_format =
+                MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const u32 stride = key.state.vertex_strides[attribute.buffer];
+            // MoltenVK translates attributes crossing a stride into another binding,
+            // which misreads packed RGBA8 weights on Apple M5. If W is unused,
+            // RGB8 preserves XYZ within the original vertex record. Static stride
+            // mode also keeps this format decision in the pipeline cache key.
+            if (device.IsMoltenVK() && !key.state.extended_dynamic_state &&
+                vertex_format == VK_FORMAT_R8G8B8A8_UNORM && stride != 0 &&
+                u64{attribute.offset.Value()} + 3 <= stride &&
+                u64{attribute.offset.Value()} + 4 > stride &&
+                !stage_infos[0].loads.Generic(index, 3) &&
+                device.IsFormatSupported(VK_FORMAT_R8G8B8_UNORM,
+                                         VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT, FormatType::Buffer)) {
+                vertex_format = VK_FORMAT_R8G8B8_UNORM;
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = vertex_format,
                 .offset = attribute.offset,
             });
         }
@@ -974,7 +1054,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     }
 
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
+    const bool time_pipeline = PipelineTimingEnabled(key.Hash());
+    const bool probe_pipeline = StallProbe::Enabled();
+    const auto driver_start = (time_pipeline || probe_pipeline)
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    const VkGraphicsPipelineCreateInfo pipeline_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = flags,
@@ -994,7 +1079,201 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .subpass = 0,
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    };
+    bool gpl_precompiled{};
+    // EDS2 ignores the static rasterizer-discard value, which is zero in the key.
+    // Such pipelines still need the fragment shader and output library parts.
+    const bool may_rasterize = key.state.extended_dynamic_state_2 || dynamic.rasterize_enable != 0;
+    if (device.IsGraphicsPipelineLibrarySupported() && !key.state.xfb_enabled &&
+        may_rasterize && spv_modules[NUM_STAGES - 1]) {
+        try {
+            std::array<std::shared_ptr<vk::Pipeline>, 4> libraries;
+            std::array<VkPipeline, 4> handles{};
+            constexpr std::array parts{
+                VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
+                VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
+                VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
+            };
+            static_vector<VkPipelineShaderStageCreateInfo, 4> pre_raster_stages;
+            const VkPipelineShaderStageCreateInfo* fragment_stage{};
+            for (const auto& stage : shader_stages) {
+                if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                    fragment_stage = &stage;
+                } else {
+                    pre_raster_stages.push_back(stage);
+                }
+            }
+            for (size_t index = 0; index < parts.size(); ++index) {
+                VkGraphicsPipelineLibraryCreateInfoEXT library_info{
+                    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                    .pNext = nullptr,
+                    .flags = static_cast<VkGraphicsPipelineLibraryFlagsEXT>(parts[index]),
+                };
+                auto create_info = pipeline_ci;
+                create_info.pNext = &library_info;
+                create_info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+                                    VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+                create_info.stageCount = index == 1 ? static_cast<u32>(pre_raster_stages.size())
+                                           : index == 2 && fragment_stage ? 1U : 0U;
+                create_info.pStages = index == 1 ? pre_raster_stages.data()
+                                     : index == 2 ? fragment_stage : nullptr;
+                GraphicsPipelineLibraryKey cache_key{key, static_cast<u32>(index), 0};
+                if (index == 0) {
+                    cache_key.pipeline.unique_hashes = {};
+                    cache_key.pipeline.unique_hashes[0] = code_hashes[0];
+                    cache_key.variant = static_cast<u32>(has_tess_stages);
+                    auto& state = cache_key.pipeline.state;
+                    // Vertex input consumes only the vertex layout and input assembly state.
+                    // Keep the dynamic flags used by FixedPipelineState::Size().
+                    constexpr u32 input_bits = (1U << 0) | (1U << 1) | (1U << 3) |
+                                               (1U << 5) | (0xFU << 24);
+                    state.raw1 &= input_bits;
+                    state.raw2 = 0;
+                    state.color_formats.fill(0);
+                    state.alpha_test_ref = 0;
+                    state.point_size = 0;
+                    state.viewport_swizzles.fill(0);
+                    state.attribute_types = 0;
+                    state.dynamic_state.raw1 &= 1U << 3; // static primitive restart
+                    state.dynamic_state.raw2 = 0;
+                    for (auto& attachment : state.attachments) {
+                        attachment.raw = 0;
+                    }
+                    if (state.dynamic_vertex_input) {
+                        for (auto& attribute : state.attributes) {
+                            attribute.raw = 0;
+                        }
+                        state.binding_divisors.fill(0);
+                        state.vertex_strides.fill(0);
+                    }
+                } else if (index == 1 || index == 2) {
+                    cache_key.layout_signature = layout_signature;
+                    cache_key.pipeline.unique_hashes = {};
+                    std::ranges::copy(code_hashes,
+                                      cache_key.pipeline.unique_hashes.begin());
+                    auto& state = cache_key.pipeline.state;
+                    // Shader libraries do not consume vertex-input or color-blend state.
+                    // The emitted code hashes retain any shader specialization caused by them.
+                    state.attribute_types = 0;
+                    state.alpha_test_ref = 0;
+                    state.point_size = 0;
+                    state.binding_divisors.fill(0);
+                    state.vertex_strides.fill(0);
+                    for (auto& attribute : state.attributes) {
+                        attribute.raw = 0;
+                    }
+                    for (auto& attachment : state.attachments) {
+                        attachment.raw = 0;
+                    }
+                    if (index == 1) {
+                        // Pre-rasterization consumes viewport, rasterization and tessellation
+                        // state, plus render-pass compatibility, but not depth/stencil state.
+                        constexpr u32 depth_render_pass = (1U << 5) | (0x1FU << 6);
+                        constexpr u32 pre_raster = (1U << 11) | (7U << 12);
+                        state.raw2 &= depth_render_pass | pre_raster;
+                        state.dynamic_state.raw2 &= 1U << 28; // static front face
+                        state.depth_bounds_min = 0;
+                        state.depth_bounds_max = 0;
+                    } else {
+                        // The fragment library consumes multisample and depth/stencil state.
+                        // Its render pass still depends on formats, depth format and MSAA.
+                        constexpr u32 pre_raster_bits = (1U << 7) | (0xFFFU << 8) |
+                                                       (0xFU << 24);
+                        constexpr u32 fragment_bits = (1U << 5) | (0x1FU << 6) |
+                                                      (3U << 15);
+                        state.raw1 &= ~pre_raster_bits;
+                        state.raw2 &= fragment_bits;
+                        state.viewport_swizzles.fill(0);
+                        state.dynamic_state.raw1 = 0;
+                        state.dynamic_state.raw2 &= ~(1U << 28); // static front face
+                        state.line_stipple_factor = 0;
+                        state.line_stipple_pattern = 0;
+                    }
+                    cache_key.variant = static_cast<u32>(fragment_has_color0_output) |
+                                        (Settings::values.sample_shading.GetValue() << 1);
+                } else {
+                    cache_key.pipeline.unique_hashes = {};
+                    cache_key.variant = static_cast<u32>(fragment_has_color0_output) |
+                                        (Settings::values.sample_shading.GetValue() << 1);
+                    // Keep the full fixed state for fragment-output library reuse. Reducing
+                    // it to blend/render-pass state corrupts rendering on NVIDIA (580.159.03).
+                    // The other three library parts still use their narrower state keys.
+                }
+                const auto part_start = time_pipeline ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+                bool cache_hit{};
+                libraries[index] = library_cache.GetOrCreate(cache_key, [&] {
+                    return device.GetLogical().CreateGraphicsPipeline(create_info, *pipeline_cache);
+                }, &cache_hit);
+                if (!static_cast<bool>(*libraries[index])) {
+                    throw std::runtime_error("driver returned a null pipeline library");
+                }
+                handles[index] = **libraries[index];
+                if (time_pipeline) {
+                    const auto part_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - part_start).count();
+                    LOG_INFO(Render_Vulkan, "Pipeline {:016x} GPL part {} {} {:.2f} ms",
+                             key.Hash(), index, cache_hit ? "reused" : "built", part_ms);
+                }
+            }
+            if (!precompile_only) {
+                const VkPipelineLibraryCreateInfoKHR link_info{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                    .pNext = nullptr,
+                    .libraryCount = static_cast<u32>(handles.size()),
+                    .pLibraries = handles.data(),
+                };
+                const VkGraphicsPipelineCreateInfo link_ci{
+                    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                    .pNext = &link_info,
+                    .flags = flags,
+                    .stageCount = 0,
+                    .pStages = nullptr,
+                    .layout = *pipeline_layout,
+                    .renderPass = render_pass,
+                    .subpass = 0,
+                };
+                const auto link_start = std::chrono::steady_clock::now();
+                pipeline = device.GetLogical().CreateGraphicsPipeline(link_ci, *pipeline_cache);
+                if (!pipeline) {
+                    throw std::runtime_error("driver returned a null fast-linked pipeline");
+                }
+                const auto link_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - link_start).count();
+                library_cache.RecordLink(false, static_cast<u64>(link_ns));
+                if (time_pipeline) {
+                    const auto link_ms = static_cast<double>(link_ns) * 1.0e-6;
+                    LOG_INFO(Render_Vulkan, "Pipeline {:016x} GPL fast link {:.2f} ms",
+                             key.Hash(), link_ms);
+                }
+            }
+            pipeline_libraries = std::move(libraries);
+            optimized_render_pass = render_pass;
+            optimized_flags = flags;
+            gpl_precompiled = true;
+        } catch (const std::exception& exception) {
+            pipeline_libraries = {};
+            LOG_WARNING(Render_Vulkan, "Pipeline {:016x} GPL creation failed: {}; using monolithic path",
+                        key.Hash(), exception.what());
+        }
+    }
+    if (!pipeline && !gpl_precompiled) {
+        pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
+    }
+    if (probe_pipeline) {
+        const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - driver_start).count();
+        StallProbe::pipeline_build_ns.fetch_add(static_cast<u64>(nanoseconds),
+                                                std::memory_order_relaxed);
+        StallProbe::pipeline_build_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (time_pipeline) {
+        const auto driver_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - driver_start).count();
+        LOG_INFO(Render_Vulkan, "Pipeline {:016x} vkCreateGraphicsPipelines {:.2f} ms",
+                 key.Hash(), driver_ms);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

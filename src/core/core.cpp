@@ -301,10 +301,14 @@ struct System::Impl {
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window,
                             const std::string& filepath,
-                            Service::AM::FrontendAppletParameters& params) {
+                            Service::AM::FrontendAppletParameters& params,
+                            FileSys::VirtualFile game_file = nullptr) {
         InitializeKernel(system);
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
+        // A caller-supplied file (such as a decrypting view) replaces the one at filepath,
+        // for the game card as well.
+        const auto file =
+            game_file ? game_file : GetGameFileFromPath(virtual_filesystem, filepath);
 
         // Create the application process
         Loader::ResultStatus load_result{};
@@ -312,6 +316,10 @@ struct System::Impl {
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            // A service process finalizes its kernel process when it is destroyed, and that
+            // touches the kernel's object containers - so it has to be released while they still
+            // exist, i.e. before ShutdownMainProcess() tears the kernel down.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
@@ -364,7 +372,9 @@ struct System::Impl {
 
         if (Settings::values.gamecard_inserted) {
             if (Settings::values.gamecard_current_game) {
-                fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, filepath));
+                fs_controller.SetGameCard(game_file ? game_file
+                                                    : GetGameFileFromPath(virtual_filesystem,
+                                                                          filepath));
             } else if (!Settings::values.gamecard_path.GetValue().empty()) {
                 const auto& gamecard_path = Settings::values.gamecard_path.GetValue();
                 fs_controller.SetGameCard(GetGameFileFromPath(virtual_filesystem, gamecard_path));
@@ -411,6 +421,11 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        // Closing the nvdrv sessions unmaps their buffers from device memory, so the GPU
+        // thread must be done with queued command lists before the services go away.
+        if (gpu_core) {
+            gpu_core->ShutdownThread();
+        }
         kernel.CloseServices();
         kernel.ShutdownCores();
         services.reset();
@@ -502,6 +517,8 @@ struct System::Impl {
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
     /// ContentProviderUnion instance
     std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    std::optional<u32> application_version_override;
+    std::string application_display_version_override;
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -527,7 +544,11 @@ struct System::Impl {
 
 System::System() : impl{std::make_unique<Impl>(*this)} {}
 
-System::~System() = default;
+System::~System() {
+    // Timing callbacks use the kernel, which is destroyed before core_timing
+    // during the default Impl member teardown.
+    impl->core_timing.Reset();
+}
 
 CpuManager& System::GetCpuManager() {
     return impl->cpu_manager;
@@ -594,6 +615,15 @@ void System::InitializeDebugger() {
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
     return impl->Load(*this, emu_window, filepath, params);
+}
+
+SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, FileSys::VirtualFile game_file,
+                                Service::AM::FrontendAppletParameters& params) {
+    if (game_file == nullptr) {
+        return SystemResultStatus::ErrorGetLoader;
+    }
+    const std::string name = game_file->GetName();
+    return impl->Load(*this, emu_window, name, params, std::move(game_file));
 }
 
 bool System::IsPoweredOn() const {
@@ -785,6 +815,23 @@ Service::AM::AppletManager& System::GetAppletManager() {
 
 void System::SetContentProvider(std::unique_ptr<FileSys::ContentProviderUnion> provider) {
     impl->content_provider = std::move(provider);
+}
+
+void System::SetApplicationVersionOverride(u32 version, std::string display_version) {
+    if (version == 0 && display_version.empty()) {
+        impl->application_version_override.reset();
+    } else {
+        impl->application_version_override = version;
+    }
+    impl->application_display_version_override = std::move(display_version);
+}
+
+std::optional<u32> System::GetApplicationVersionOverride() const {
+    return impl->application_version_override;
+}
+
+const std::string& System::GetApplicationDisplayVersionOverride() const {
+    return impl->application_display_version_override;
 }
 
 FileSys::ContentProvider& System::GetContentProvider() {

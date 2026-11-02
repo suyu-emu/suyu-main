@@ -336,6 +336,15 @@ bool RemoveDirContentsRecursively(const fs::path& path) {
             break;
         }
 
+        // Empty subdirectories before removing them. Use symlink_status so a symlinked
+        // directory is removed as a link instead of deleting its target's contents.
+        if (entry.symlink_status().type() == fs::file_type::directory) {
+            if (!RemoveDirContentsRecursively(entry.path())) {
+                ec = std::make_error_code(std::errc::directory_not_empty);
+                break;
+            }
+        }
+
         fs::remove(entry.path(), ec);
 
         if (ec) {
@@ -343,12 +352,6 @@ bool RemoveDirContentsRecursively(const fs::path& path) {
                       "Failed to remove the filesystem object at path={}, ec_message={}",
                       PathToUTF8String(entry.path()), ec.message());
             break;
-        }
-
-        // TODO (Morph): Remove this when MSVC fixes recursive_directory_iterator.
-        // recursive_directory_iterator throws an exception despite passing in a std::error_code.
-        if (entry.status().type() == fs::file_type::directory) {
-            return RemoveDirContentsRecursively(entry.path());
         }
     }
 

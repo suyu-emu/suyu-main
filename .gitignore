@@ -6,6 +6,9 @@
 
 # Build directory
 /[Bb]uild*/
+
+# Export Game output in a source checkout: generated game code and game data, never committed
+/exports/
 doc-build/
 AppDir/
 uruntime

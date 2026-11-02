@@ -7,8 +7,11 @@
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#endif
+#include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
@@ -18,6 +21,7 @@
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/k_worker_task_manager.h"
 
+#ifndef SUYU_NO_JIT
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/recomp/arm_recomp.h"
@@ -1338,6 +1342,17 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
     } else
 #endif
+#ifdef SUYU_NO_JIT
+    {
+        // Built without a dynamic recompiler: a process with no statically
+        // recompiled image has no engine that can run it. Saying so here is
+        // better than leaving null interfaces for a thread to trip over later.
+        LOG_CRITICAL(Kernel,
+                     "No JIT in this build and no recompiled image for process '{}'; it "
+                     "cannot run",
+                     this->GetName());
+    }
+#else
         if (this->Is64Bit()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
@@ -1351,6 +1366,7 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
                 static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
         }
     }
+#endif
 }
 
 bool KProcess::InsertWatchpoint(KernelCore& kernel, KProcessAddress addr, u64 size, DebugWatchpointType type) {

@@ -8,6 +8,9 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "common/hex_util.h"
 #include "common/logging.h"
@@ -212,6 +215,20 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
 
                 if (!manual_update_versions.empty()) {
                     checked_manual = true;
+                    // The frontend adds every NCA of the file being booted to
+                    // this provider, so for an XCI carrying an on-cart update
+                    // that update shows up here - and this loop takes the FIRST
+                    // enabled entry, not the highest version. A newer update
+                    // installed to NAND therefore loses to the cartridge's,
+                    // which is how a title can boot an old on-cart update
+                    // while a newer one sits unused in NAND.
+                    for (const auto& update_entry : manual_update_versions) {
+                        LOG_INFO(Loader,
+                                 "DIAG update candidate (manual): version={} ({}.{}.{}) tid={:016X}",
+                                 update_entry.version, (update_entry.version >> 26) & 0x3F,
+                                 (update_entry.version >> 20) & 0x3F,
+                                 (update_entry.version >> 16) & 0xF, update_tid);
+                    }
                     for (const auto& update_entry : manual_update_versions) {
                         if (!IsVersionedExternalUpdateDisabled(disabled, update_entry.version)) {
                             update_disabled = false;
@@ -265,7 +282,8 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
         }
     }
 
-    // Game Updates
+    // Game Updates. GetExeFSUpdate names the same update for the export dialog; keep the
+    // two selections in sync.
     std::unique_ptr<NCA> update = nullptr;
 
     // If we have a specific enabled version from external provider, use it
@@ -293,6 +311,17 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
 
     // Fallback to regular content provider if no external update was loaded
     if (update == nullptr && !update_disabled) {
+        // Which provider actually answers matters: the union checks SysNAND,
+        // UserNAND, SDMC, FrontendManual, External in that order, and the
+        // frontend puts every NCA of the booted file into FrontendManual - so
+        // an on-cart update can answer here even when a newer one is installed
+        // to NAND. Naming the slot is the difference between knowing that and
+        // guessing at it.
+        if (content_union) {
+            const auto slot = content_union->GetSlotForEntry(update_tid, ContentRecordType::Program);
+            LOG_INFO(Loader, "DIAG update source: tid={:016X} slot={}", update_tid,
+                     slot.has_value() ? static_cast<int>(*slot) : -1);
+        }
         update = content_provider.GetEntry(update_tid, ContentRecordType::Program);
     }
 
@@ -418,10 +447,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         return nso;
     }
 
-    auto patch_dirs = load_dir->GetSubdirectories();
-    std::sort(patch_dirs.begin(), patch_dirs.end(),
-              [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
-    const auto patches = CollectPatches(patch_dirs, build_id);
+    const auto patches = GetNSOPatches(header.build_id);
 
     auto out = nso;
     for (const auto& patch_file : patches) {
@@ -450,22 +476,26 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 }
 
 bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name) const {
+    LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}",
+             Common::HexToString(build_id_), name);
+    return !GetNSOPatches(build_id_).empty();
+}
+
+std::vector<VirtualFile> PatchManager::GetNSOPatches(const BuildID& build_id_) const {
     const auto build_id_raw = Common::HexToString(build_id_);
     const auto build_id = build_id_raw.substr(0, build_id_raw.find_last_not_of('0') + 1);
-
-    LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
 
     const auto load_dir = fs_controller.GetModificationLoadRoot(title_id);
     if (load_dir == nullptr) {
         LOG_ERROR(Loader, "Cannot load mods for invalid title_id={:016X}", title_id);
-        return false;
+        return {};
     }
 
     auto patch_dirs = load_dir->GetSubdirectories();
     std::sort(patch_dirs.begin(), patch_dirs.end(),
               [](const VirtualDir& l, const VirtualDir& r) { return l->GetName() < r->GetName(); });
 
-    return !CollectPatches(patch_dirs, build_id).empty();
+    return CollectPatches(patch_dirs, build_id);
 }
 
 std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildID& build_id_) const {
@@ -583,6 +613,28 @@ static void ApplyLayeredFS(VirtualFile& romfs, u64 title_id, ContentRecordType t
     romfs = std::move(packed);
 }
 
+namespace {
+std::mutex unapplied_lock;
+std::vector<UnappliedUpdate> unapplied_updates;
+} // Anonymous namespace
+
+void RecordUnappliedUpdate(u64 title_id, u32 version) {
+    std::scoped_lock lk{unapplied_lock};
+    // The loader patches several content types per boot and would otherwise
+    // record the same title repeatedly.
+    for (const auto& entry : unapplied_updates) {
+        if (entry.title_id == title_id) {
+            return;
+        }
+    }
+    unapplied_updates.push_back({title_id, version});
+}
+
+std::vector<UnappliedUpdate> ConsumeUnappliedUpdates() {
+    std::scoped_lock lk{unapplied_lock};
+    return std::exchange(unapplied_updates, {});
+}
+
 VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs,
                                      ContentRecordType type, VirtualFile packed_update_raw,
                                      bool apply_layeredfs) const {
@@ -685,15 +737,35 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
         }
     }
 
+    const auto installed_version = enabled_version.has_value()
+                                       ? enabled_version
+                                       : content_provider.GetEntryVersion(update_tid);
+
     if (!update_disabled && update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&
             new_nca->GetRomFS() != nullptr) {
             LOG_INFO(Loader, "    RomFS: Update ({}) applied successfully",
-                     enabled_version.has_value() ? FormatTitleVersion(*enabled_version) :
-                     FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
+                     FormatTitleVersion(installed_version.value_or(0)));
             romfs = new_nca->GetRomFS();
+        } else if (type == ContentRecordType::Program) {
+            LOG_ERROR(Loader,
+                      "    RomFS: Update ({}) for title_id={:016X} is installed but could not be "
+                      "read (nca status={}); the game will run UNPATCHED",
+                      FormatTitleVersion(installed_version.value_or(0)), title_id,
+                      static_cast<int>(new_nca->GetStatus()));
+            RecordUnappliedUpdate(title_id, installed_version.value_or(0));
         }
+    } else if (!update_disabled && update_raw == nullptr && base_nca != nullptr &&
+               packed_update_raw == nullptr && installed_version.has_value() &&
+               type == ContentRecordType::Program) {
+        // Registered, enabled, and the provider still handed back nothing -
+        // the NCA the index points at could not be opened at all.
+        LOG_ERROR(Loader,
+                  "    RomFS: Update ({}) for title_id={:016X} is installed but its content could "
+                  "not be opened; the game will run UNPATCHED",
+                  FormatTitleVersion(*installed_version), title_id);
+        RecordUnappliedUpdate(title_id, *installed_version);
     } else if (!update_disabled && packed_update_raw != nullptr && base_nca != nullptr) {
         const auto new_nca = std::make_shared<NCA>(packed_update_raw, base_nca);
         if (new_nca->GetStatus() == Loader::ResultStatus::Success &&
@@ -709,6 +781,158 @@ VirtualFile PatchManager::PatchRomFS(const NCA* base_nca, VirtualFile base_romfs
     }
 
     return romfs;
+}
+
+PatchManager::UpdateSelection PatchManager::GetUpdateSelection() const {
+    const auto& disabled = Settings::values.disabled_addons[title_id];
+    const auto is_disabled = [&disabled](std::string_view name) {
+        return std::find(disabled.cbegin(), disabled.cend(), name) != disabled.cend();
+    };
+    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
+    const auto update_tid = GetUpdateTitleID(title_id);
+
+    // External, then Android's manual provider: the first one listing versions decides.
+    bool listed = false;
+    bool listed_enabled = false;
+    if (content_union) {
+        const auto check = [&](const auto& versions) {
+            if (listed || versions.empty()) {
+                return;
+            }
+            listed = true;
+            for (const auto& entry : versions) {
+                if (!IsVersionedExternalUpdateDisabled(disabled, entry.version)) {
+                    listed_enabled = true;
+                    break;
+                }
+            }
+        };
+        if (const auto* external = content_union->GetExternalProvider()) {
+            check(external->ListUpdateVersions(update_tid));
+        }
+        if (const auto* manual = static_cast<const ManualContentProvider*>(
+                content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual))) {
+            check(manual->ListUpdateVersions(update_tid));
+        }
+    }
+
+    const bool nand_disabled = is_disabled("Update (NAND)");
+    const bool sdmc_disabled = is_disabled("Update (SDMC)");
+    UpdateSelection selection;
+    if (!listed) {
+        // NAND/SD only: any of the three flags turns updates off. PatchExeFS also needs one
+        // installed; PatchRomFS does not, which is what lets it apply a packed update.
+        const bool flags_clear = !nand_disabled && !sdmc_disabled && !is_disabled("Update");
+        selection.installed_exefs =
+            flags_clear && content_provider.HasEntry(update_tid, ContentRecordType::Program);
+        selection.romfs_enabled = flags_clear;
+        return selection;
+    }
+    if (listed_enabled) {
+        selection.installed_exefs = true;
+        selection.romfs_enabled = true;
+        return selection;
+    }
+    // Every listed version is off: a NAND or SD copy may still apply by its own flag.
+    if (content_union && (!nand_disabled || !sdmc_disabled)) {
+        for (const auto& [slot, entry] : content_union->ListEntriesFilterOrigin(
+                 std::nullopt, TitleType::Update, ContentRecordType::Program, update_tid)) {
+            const bool nand = slot == ContentProviderUnionSlot::UserNAND ||
+                              slot == ContentProviderUnionSlot::SysNAND;
+            if ((nand && !nand_disabled) ||
+                (slot == ContentProviderUnionSlot::SDMC && !sdmc_disabled)) {
+                selection.installed_exefs = true;
+                selection.romfs_enabled = true;
+                break;
+            }
+        }
+    }
+    return selection;
+}
+
+std::optional<PatchManager::ExeFSUpdate> PatchManager::GetExeFSUpdate() const {
+    if (!GetUpdateSelection().installed_exefs) {
+        return std::nullopt;
+    }
+    const auto& disabled = Settings::values.disabled_addons[title_id];
+    const auto* content_union = static_cast<const ContentProviderUnion*>(&content_provider);
+    const auto update_tid = GetUpdateTitleID(title_id);
+    const auto cnmt_version = [](const VirtualFile& meta_file) -> u32 {
+        if (meta_file == nullptr) {
+            return 0;
+        }
+        const NCA meta{meta_file};
+        const auto sections = meta.GetSubdirectories();
+        if (meta.GetStatus() != Loader::ResultStatus::Success || sections.empty()) {
+            return 0;
+        }
+        for (const auto& file : sections[0]->GetFiles()) {
+            if (file->GetExtension() == "cnmt") {
+                return CNMT{file}.GetTitleVersion();
+            }
+        }
+        return 0;
+    };
+
+    // As PatchExeFS: whichever of the external and manual providers lists versions first
+    // decides, and its first enabled version is the one read.
+    std::optional<ExternalUpdateEntry> enabled;
+    const auto pick = [&](const std::vector<ExternalUpdateEntry>& versions) {
+        if (enabled || versions.empty()) {
+            return !versions.empty();
+        }
+        for (const auto& entry : versions) {
+            if (!IsVersionedExternalUpdateDisabled(disabled, entry.version)) {
+                enabled = entry;
+                break;
+            }
+        }
+        return true;
+    };
+    const auto* external = content_union->GetExternalProvider();
+    const auto* manual = static_cast<const ManualContentProvider*>(
+        content_union->GetSlotProvider(ContentProviderUnionSlot::FrontendManual));
+    if (!(external && pick(external->ListUpdateVersions(update_tid))) && manual) {
+        pick(manual->ListUpdateVersions(update_tid));
+    }
+
+    ExeFSUpdate update;
+    const auto from_provider = [&](ContentProviderUnionSlot slot, const auto* provider) {
+        if (provider == nullptr) {
+            return false;
+        }
+        auto program =
+            provider->GetEntryForVersion(update_tid, ContentRecordType::Program, enabled->version);
+        if (program == nullptr) {
+            return false;
+        }
+        update.slot = slot;
+        update.program = std::move(program);
+        update.version = enabled->version;
+        update.version_string = enabled->version_string;
+        if (update.version == 0) {
+            update.version = cnmt_version(
+                provider->GetEntryForVersion(update_tid, ContentRecordType::Meta, enabled->version));
+        }
+        return true;
+    };
+    if (enabled && (from_provider(ContentProviderUnionSlot::External, external) ||
+                    from_provider(ContentProviderUnionSlot::FrontendManual, manual))) {
+        return update;
+    }
+
+    // Otherwise the union answers, NAND and SD first.
+    update.slot = content_union->GetSlotForEntry(update_tid, ContentRecordType::Program);
+    update.program = content_union->GetEntryRaw(update_tid, ContentRecordType::Program);
+    if (update.program == nullptr) {
+        return std::nullopt;
+    }
+    update.version = content_union->GetEntryVersion(update_tid).value_or(0);
+    if (update.version == 0) {
+        // The frontend's manual provider records no versions for what it registers.
+        update.version = cnmt_version(content_union->GetEntryRaw(update_tid, ContentRecordType::Meta));
+    }
+    return update;
 }
 
 std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {

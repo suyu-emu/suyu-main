@@ -7,6 +7,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 
+#include "core/arm/recomp/recomp_gap_session.h"
 #include "core/hle/kernel/k_process.h"
 
 #include "core/hle/service/cmif_serialization.h"
@@ -392,6 +393,9 @@ public:
         ProcessContext* context = this->GetContextById(context_id);
         ASSERT(context != nullptr);
 
+        LOG_INFO(Service_LDR, "MapManualLoadModuleMemory nro={:#x} size={:#x} bss={:#x}",
+                 nro_address, nro_size, bss_size);
+
         // Validate address/size.
         R_TRY(ValidateAddressAndNonZeroSize(nro_address, nro_size));
         R_TRY(ValidateAddressAndSize(bss_address, bss_size));
@@ -429,6 +433,9 @@ public:
         context->SetNroInfoInUse(nro_info, true);
         nro_info->code_size = rx_size + ro_size;
         nro_info->rw_size = rw_size;
+        // A late-loaded module never has a recompiled image; say it ran anyway.
+        Core::RecompGaps::NoteModule(nro_info->base_address, rx_size + ro_size + rw_size, "nro",
+                                     nro_info->module_id.data);
         *out_address = nro_info->base_address;
         R_SUCCEED();
     }
@@ -453,6 +460,7 @@ public:
             context->SetNroInfoInUse(nro_info, false);
             std::memset(nro_info, 0, sizeof(*nro_info));
         }
+        Core::RecompGaps::ForgetModule(nro_backup.base_address);
         R_RETURN(UnmapNro(context->GetProcess(), nro_backup.base_address,
                           nro_backup.nro_heap_address, nro_backup.code_size + nro_backup.rw_size,
                           nro_backup.bss_heap_address, nro_backup.bss_heap_size));

@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/crypto/key_manager.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/control_metadata.h"
@@ -21,6 +22,7 @@
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/sdmc_factory.h"
+#include "core/file_sys/ticket_source.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -304,11 +306,22 @@ Result FileSystemController::RegisterProcess(
     std::shared_ptr<FileSys::RomFSFactory>&& romfs_factory) {
     std::scoped_lock lk{registration_lock};
 
-    registrations.emplace(process_id, Registration{
-                                          .program_id = program_id,
-                                          .romfs_factory = std::move(romfs_factory),
-                                          .save_data_factory = CreateSaveDataFactory(program_id),
-                                      });
+    // insert_or_assign, not emplace: a process is registered more than once and
+    // the later registration is the authoritative one.
+    //
+    // AppLoader_NCA delegates to AppLoader_DeconstructedRomDirectory for the
+    // ExeFS, and that inner loader registers first - with a factory holding no
+    // RomFS, because an ExeFS directory has no romfs.bin. The NCA loader then
+    // registers the real one. With emplace the second call was silently
+    // dropped, so every title booted from an XCI or NSP served its RomFS from
+    // the empty factory: OpenDataStorageByCurrentProcess returned nothing and
+    // the game panicked through svcBreak the moment it opened its own data.
+    registrations.insert_or_assign(process_id,
+                                   Registration{
+                                       .program_id = program_id,
+                                       .romfs_factory = std::move(romfs_factory),
+                                       .save_data_factory = CreateSaveDataFactory(program_id),
+                                   });
 
     LOG_DEBUG(Service_FS, "Registered for process {}", process_id);
     return ResultSuccess;
@@ -685,6 +698,12 @@ FileSys::VirtualDir FileSystemController::GetBCATDirectory(u64 title_id) const {
     return bis_factory->GetBCATDirectory(title_id);
 }
 
+void FileSystemController::SetSystemContentFallback(std::filesystem::path installed_nand,
+                                                   std::filesystem::path package_dir) {
+    system_content_fallback = std::move(installed_nand);
+    export_package_dir = std::move(package_dir);
+}
+
 void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool overwrite) {
     if (overwrite) {
         bis_factory = nullptr;
@@ -708,12 +727,66 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
         vfs.OpenDirectory(Common::FS::GetSuyuPathString(SuyuPath::DumpDir), rw_mode);
 
     if (bis_factory == nullptr) {
+        // Firmware installed into this NAND always wins. Only a NAND with no system content at
+        // all borrows the installed one, and only for reading: installs still land here.
+        FileSys::VirtualDir system_registered;
+        const auto own_registered =
+            nand_directory ? nand_directory->GetDirectoryRelative("system/Contents/registered")
+                           : nullptr;
+        const bool own_is_empty = own_registered == nullptr ||
+                                  (own_registered->GetFiles().empty() &&
+                                   own_registered->GetSubdirectories().empty());
+        if (own_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "system" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr &&
+                !(fallback->GetFiles().empty() && fallback->GetSubdirectories().empty())) {
+                LOG_INFO(Service_FS, "No system content in this NAND; reading firmware from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                system_registered = std::move(fallback);
+            } else {
+                LOG_WARNING(Service_FS,
+                            "No system content in this NAND or in {}; firmware-backed features "
+                            "such as Mii models will be unavailable",
+                            Common::FS::PathToUTF8String(system_content_fallback));
+            }
+        }
+        // The same rule for installed games and updates: an exported game reads the ones
+        // installed in suyu, read-only, and loads the user's own game file with them.
+        FileSys::VirtualDir user_registered;
+        const auto own_user =
+            nand_directory ? nand_directory->GetDirectoryRelative("user/Contents/registered")
+                           : nullptr;
+        const bool own_user_is_empty = own_user == nullptr || (own_user->GetFiles().empty() &&
+                                                               own_user->GetSubdirectories().empty());
+        if (own_user_is_empty && !system_content_fallback.empty()) {
+            auto fallback = vfs.OpenDirectory(
+                Common::FS::PathToUTF8String(system_content_fallback / "user" / "Contents" /
+                                             "registered"),
+                FileSys::OpenMode::Read);
+            if (fallback != nullptr) {
+                LOG_INFO(Service_FS, "Reading installed games and updates from {}",
+                         Common::FS::PathToUTF8String(system_content_fallback));
+                user_registered = std::move(fallback);
+            }
+        }
+        const auto ticket_source = FileSys::SelectTicketSource(
+            Common::FS::GetSuyuPath(SuyuPath::NANDDir), system_content_fallback,
+            export_package_dir, user_registered != nullptr);
         bis_factory = std::make_unique<FileSys::BISFactory>(
-            nand_directory, std::move(load_directory), std::move(dump_directory));
+            nand_directory, std::move(load_directory), std::move(dump_directory),
+            std::move(system_registered), std::move(user_registered));
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::SysNAND,
                                        bis_factory->GetSystemNANDContents());
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::UserNAND,
                                        bis_factory->GetUserNANDContents());
+
+        // Tickets of content installed from NSPs, kept by ContentManager::InstallNSP, so
+        // that content can be decrypted again. Read from the NAND supplying user content,
+        // including a configured external NAND, but never from inside an export package.
+        Core::Crypto::KeyManager::Instance().LoadInstalledTickets(ticket_source, export_package_dir);
     }
 
     if (sdmc_factory == nullptr) {
@@ -729,8 +802,16 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
         LOG_DEBUG(Service_FS, "Initializing ExternalContentProvider with {} configured directories",
                   Settings::values.external_content_dirs.size());
 
-        for (const auto& dir_path : Settings::values.external_content_dirs) {
-            if (!dir_path.empty()) {
+        for (const auto& configured_path : Settings::values.external_content_dirs) {
+            if (!configured_path.empty()) {
+                // Relative folders belong to a portable installation; resolve them against the
+                // executable's folder rather than whatever the working directory happens to be.
+                std::string dir_path = configured_path;
+                if (!std::filesystem::path{Common::FS::ToU8String(dir_path)}.is_absolute()) {
+                    dir_path = Common::FS::PathToUTF8String(
+                        Common::FS::GetExeDirectory() /
+                        std::filesystem::path{Common::FS::ToU8String(dir_path)});
+                }
                 LOG_DEBUG(Service_FS, "Attempting to open directory: {}", dir_path);
                 auto dir = vfs.OpenDirectory(dir_path, FileSys::OpenMode::Read);
                 if (dir != nullptr) {

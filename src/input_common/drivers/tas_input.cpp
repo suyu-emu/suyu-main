@@ -152,6 +152,7 @@ void Tas::WriteTasFile(std::u8string_view file_name) {
 }
 
 void Tas::RecordInput(u64 buttons, TasAnalog left_axis, TasAnalog right_axis) {
+    std::scoped_lock lock{input_snapshot_mutex};
     last_input = {
         .buttons = buttons,
         .l_axis = left_axis,
@@ -180,6 +181,35 @@ std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> Tas::GetStatus()
     return {state, current_command, lengths};
 }
 
+void Tas::BeginBootSession(TasBootMode mode) {
+    is_running = false;
+    is_recording = false;
+    needs_reset = false;
+    current_command = 0;
+    record_commands.clear();
+    ClearInput();
+
+    if (!Settings::values.tas_enable || mode == TasBootMode::None) {
+        return;
+    }
+    if (mode == TasBootMode::Playback) {
+        LoadTasFiles();
+        is_running = true;
+        return;
+    }
+
+    {
+        std::scoped_lock lock{input_snapshot_mutex};
+        last_input = {};
+    }
+    is_recording = true;
+}
+
+std::tuple<u64, size_t, bool> Tas::GetCompletionStatus() const {
+    std::scoped_lock lock{completion_status_mutex};
+    return {completion_generation, last_completed_commands, last_completion_looping};
+}
+
 void Tas::UpdateThread() {
     if (!Settings::values.tas_enable) {
         if (is_running) {
@@ -189,6 +219,7 @@ void Tas::UpdateThread() {
     }
 
     if (is_recording) {
+        std::scoped_lock lock{input_snapshot_mutex};
         record_commands.push_back(last_input);
     }
     if (needs_reset) {
@@ -227,7 +258,14 @@ void Tas::UpdateThread() {
             SetTasAxis(identifier, TasAxis::SubstickY, command.r_axis.y);
         }
     } else {
-        is_running = Settings::values.tas_loop.GetValue();
+        const bool loop = Settings::values.tas_loop.GetValue();
+        {
+            std::scoped_lock lock{completion_status_mutex};
+            last_completed_commands = current_command;
+            last_completion_looping = loop;
+            ++completion_generation;
+        }
+        is_running = loop;
         LoadTasFiles();
         current_command = 0;
         ClearInput();

@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <numeric>
 #include "common/cityhash.h"
 #include "common/fs/fs.h"
@@ -34,6 +36,8 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_pipeline_timing.h"
+#include "video_core/renderer_vulkan/vk_stall_probe.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -45,7 +49,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
@@ -251,6 +255,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         if (device.IsMoltenVK()) {
             for (size_t i = 0; i < 8; ++i) {
                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
+                // Most draws bind fewer than eight attachments, leaving the rest NONE.
+                // Converting NONE is not a format question with a wrong answer, it is a
+                // slot that is not there, and asking anyway trips an assert on every
+                // pipeline built. Float is what the unused slots already default to.
+                if (format == Tegra::RenderTargetFormat::NONE) {
+                    info.color_output_types[i] = Shader::AttributeType::Float;
+                    continue;
+                }
                 const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
                 if (VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
                     if (VideoCore::Surface::IsPixelFormatSignedInteger(pixel_format)) {
@@ -350,6 +362,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder"),
+      optimization_workers(device.IsGraphicsPipelineLibrarySupported() ? 1 : 0,
+                           "VkPipelineOptimize"),
       serialization_thread(1, "VkPipelineSerialization") {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
@@ -523,6 +537,24 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 }
 
 PipelineCache::~PipelineCache() {
+    workers.WaitForRequests();
+    optimization_workers.WaitForRequests();
+    if (device.IsGraphicsPipelineLibrarySupported()) {
+        const auto stats = graphics_library_cache.GetStats();
+        for (size_t part = 0; part < stats.hits.size(); ++part) {
+            LOG_INFO(Render_Vulkan, "GPL library part {}: {} hits, {} compile attempts, {} unique",
+                     part, stats.hits[part], stats.compile_attempts[part], stats.unique[part]);
+        }
+        for (size_t index = 0; index < stats.link_count.size(); ++index) {
+            const double mean_ms = stats.link_count[index] == 0
+                                       ? 0.0
+                                       : static_cast<double>(stats.link_total_ns[index]) * 1.0e-6 /
+                                             static_cast<double>(stats.link_count[index]);
+            LOG_INFO(Render_Vulkan, "GPL {} links: {} completed, mean {:.3f} ms, max {:.3f} ms",
+                     index == 0 ? "fast" : "optimized", stats.link_count[index], mean_ms,
+                     static_cast<double>(stats.link_max_ns[index]) * 1.0e-6);
+        }
+    }
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
@@ -650,7 +682,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
             ShaderPools pools;
-            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+            boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
+                env_ptrs;
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
             }
@@ -679,6 +712,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    if (const char* timing = std::getenv("SUYU_VK_PIPELINE_TIMING");
+        timing && *timing && *timing != '0') {
+        const auto elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - load_start).count();
+        LOG_INFO(Render_Vulkan, "Boot pipeline precompile completed {}/{} entries in {:.2f} ms",
+                 state.built, state.total, elapsed_ms);
+    }
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
@@ -729,6 +769,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     bool build_in_parallel) try {
     auto hash = key.Hash();
     LOG_INFO(Render_Vulkan, "0x{:016x}", hash);
+    const bool time_pipeline = PipelineTimingEnabled(hash);
+    const bool probe_pipeline = StallProbe::Enabled();
+    const bool measure_pipeline = time_pipeline || probe_pipeline;
+    if (time_pipeline && std::getenv("SUYU_VK_PIPELINE_TIMING_HASH")) {
+        LOG_INFO(Render_Vulkan, "Targeted graphics pipeline {:016x} compilation started", hash);
+    }
+    const auto translate_start = measure_pipeline ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
@@ -772,8 +820,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             layer_source_program = &programs[index];
         }
     }
+    const auto emit_start = measure_pipeline ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    std::array<u64, Maxwell::MaxShaderStage> code_hashes{};
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -793,6 +844,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        if (device.IsGraphicsPipelineLibrarySupported()) {
+            code_hashes[stage_index] = Common::CityHash64(
+                reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        }
+        if (time_pipeline) {
+            LOG_INFO(Render_Vulkan, "Pipeline {:016x} stage {} SPIR-V {} bytes", hash,
+                     stage_index, code.size() * sizeof(u32));
+        }
         device.SaveShader(code);
         modules[stage_index] = BuildShader(device, code);
 
@@ -820,11 +879,35 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    if (measure_pipeline) {
+        const auto emitted = std::chrono::steady_clock::now();
+        if (probe_pipeline) {
+            const auto nanoseconds = [](auto duration) {
+                return static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+            };
+            StallProbe::shader_translate_ns.fetch_add(nanoseconds(emit_start - translate_start),
+                                                       std::memory_order_relaxed);
+            StallProbe::shader_emit_ns.fetch_add(nanoseconds(emitted - emit_start),
+                                                 std::memory_order_relaxed);
+            StallProbe::shader_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (time_pipeline) {
+            const auto milliseconds = [](auto duration) {
+                return std::chrono::duration<double, std::milli>(duration).count();
+            };
+            LOG_INFO(Render_Vulkan,
+                     "Pipeline {:016x} shader translation {:.2f} ms, SPIR-V emission {:.2f} ms",
+                     hash, milliseconds(emit_start - translate_start),
+                     milliseconds(emitted - emit_start));
+        }
+    }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
-        descriptor_pool, guest_descriptor_queue, thread_worker, statistics, render_pass_cache, key,
-        std::move(modules), infos);
+        descriptor_pool, guest_descriptor_queue, thread_worker, statistics, render_pass_cache,
+        graphics_library_cache, optimization_workers, key, !build_in_parallel,
+        std::move(modules), code_hashes, infos);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -837,7 +920,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         ++env_index;
 
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        try {
+            // Walks the program again so the dump covers it; the same error can recur here.
+            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+        } catch (const Shader::Exception&) {
+        }
         env.Dump(hash, key.unique_hashes[index]);
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());

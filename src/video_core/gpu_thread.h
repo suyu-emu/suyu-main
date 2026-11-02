@@ -125,6 +125,14 @@ public:
 
     void TickGPU(bool is_async);
 
+    /// Stops the GPU thread and waits for it to exit. Commands pushed afterwards are dropped.
+    void ShutdownThread();
+
+    /// Whether the GPU thread was started and has not been shut down yet.
+    bool IsRunning() const {
+        return thread.joinable();
+    }
+
 private:
     /// Pushes a command to be executed by the GPU thread
     u64 PushCommand(CommandData&& command_data, bool block, bool is_async);

@@ -436,14 +436,19 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
+        {
+            // Acquire the scheduler lock.
+            KScopedSchedulerLock sl{kernel};
 
-        // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
+            // Signal.
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Close the thread.
+        // Close the thread outside the scheduler lock. If this drops the last reference,
+        // Finalize() runs here and unmaps the TLS page under the page table's KLightLock. A
+        // KLightLock wait nested inside the scheduler lock never blocks (the inner unlock does
+        // not reschedule), so a contended lock would be "acquired" without being owned.
         this->Close(kernel);
     }
 

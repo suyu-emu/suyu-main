@@ -12,7 +12,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <iomanip>
+#include <utility>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +24,8 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -70,6 +76,9 @@ inline bool IsTerminator(u32 i) {
     if ((i & 0x7F000000) == 0x37000000) return true; // TBNZ
     if ((i & 0xFF000010) == 0x54000000) return true; // B.cond
     if ((i & 0xFFE0001F) == 0xD4000001) return true; // SVC
+    if ((i & 0xFFE0001F) == 0xD4200000) return true; // BRK
+    if ((i & 0xFFFFF0FF) == 0xD50330DF) return true; // ISB: new fetch boundary
+    if ((i & 0xFFFFFFE0) == 0xD50B7520) return true; // IC IVAU host event
     return false;
 }
 
@@ -193,17 +202,35 @@ inline std::vector<Block> DiscoverBlocks(const u8* text, size_t n_bytes, u64 bas
         if (IsTerminator(insn)) {
             if (i + 1 < n) start[i + 1] = true;
             u64 t = 0;
-            if (DirectBranchTarget(insn, pc, t) && t >= base && (t - base) / 4 < n)
-                start[(u32)((t - base) / 4)] = true;
+            if (DirectBranchTarget(insn, pc, t) && t >= base && (t - base) / 4 < n) {
+                const u32 target = (u32)((t - base) / 4);
+                start[target] = required[target] = true;
+            }
         }
     }
     std::vector<Block> blocks;
-    u32 s = 0;
-    for (u32 i = 1; i <= n; ++i) {
-        if (i == n || start[i]) {
-            blocks.push_back(Block{base + (u64)s * 4, (i - s) * 4, i - s, s == 0});
-            s = i;
+    for (u32 s = 0; s < n;) {
+        u32 end = s + 1;
+        if (p[s] != 0) {
+            while (end < n && !start[end] && p[end] != 0) ++end;
         }
+        // A zero immediately after B/BR/RET has no architectural fallthrough.
+        // Omit only that mechanical boundary, retaining every independently
+        // rooted address. Calls, conditional branches and SVC can return/fall
+        // through, so their first zero remains an undefined-instruction trap.
+        const u32 previous = s > 0 ? p[s - 1] : 0;
+        const bool no_fallthrough = (previous & 0xFC000000) == 0x14000000 || // B, not BL
+                                    (previous & 0xFFFFFC1F) == 0xD61F0000 || // BR
+                                    (previous & 0xFFFFFC1F) == 0xD65F0000;   // RET
+        if (p[s] != 0 || required[s] || !no_fallthrough) {
+            blocks.push_back(Block{base + (u64)s * 4, (end - s) * 4, end - s, s == 0});
+        }
+        // Further unrooted zeros cannot execute past the retained trap (or
+        // preceding transfer). Resume conservatively at the next nonzero word.
+        if (p[s] == 0) {
+            while (end < n && p[end] == 0 && !start[end]) ++end;
+        }
+        s = end;
     }
     return blocks;
 }
@@ -248,6 +275,61 @@ inline bool DecodeBitMasks(u32 N, u32 imms, u32 immr, bool is64, u64& out) {
     return true;
 }
 
+inline std::string FuncName(const std::string& mod, u64 v) {
+    char b[64]; snprintf(b, sizeof b, "blk_%s_%016llx", mod.c_str(), (unsigned long long)v); return b;
+}
+
+// Same name, written into a caller-owned buffer. The emit loops call this once
+// per block for the body and twice more per block for the dispatch table, so on
+// a multi-million-block title the returned-std::string form above is millions of
+// heap allocations for a name that is always well under 64 bytes.
+inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
+    return (size_t)snprintf(b, sizeof b, "blk_%s_%016llx", mod, (unsigned long long)v);
+}
+
+// Set by the emit loop so a direct branch whose target is a known block start
+// can call that block instead of returning to the dispatcher. Null while the
+// decode tests run, which is what keeps their expected output stable.
+// Emits "carry on at t": a direct call when t is a block we emitted, otherwise
+// the original park-the-PC-and-return. Loop back edges are conditional, so the
+// conditional forms need this as much as the unconditional ones do.
+inline std::string ChainTo(u64 t);
+
+inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
+inline const char* g_chain_mod = nullptr;
+
+// How many blocks may run before control goes back to the dispatcher. The
+// dispatcher checks for interrupts and services SVCs between blocks, so an
+// unbounded chain would let a guest loop run uninterruptibly; it also derives
+// the executed-block count from how much of this budget was spent.
+inline constexpr int kChainBudget = 256;
+
+// Conditional branches deliberately do not chain. Measured: chaining them too
+// takes 2.00 ms/frame against 1.80, and turns a tight distribution into one
+// spanning 1.70-2.54 across six reps while the dynarmic arm stays at 2.905 in
+// the same runs. It also pushed JIT transitions from 69,008 to 88,983 and more
+// than doubled lookup misses, which is unexplained and worth understanding
+// before trying this again.
+inline std::string ChainTo(u64 t) {
+    char b[256];
+    if (g_chain_blocks && g_chain_mod && g_chain_blocks->count(t)) {
+        char nm[64];
+        FuncNameTo(nm, g_chain_mod, t);
+        // The declaration is at block scope so a unit needs no list of the
+        // blocks it reaches. `return f(c)` is written as a tail call, though
+        // nothing may come of that below -O2 - which is why the budget has to
+        // bound the depth rather than assume it stays at one frame.
+        snprintf(b, sizeof b,
+                 "{ void %s(GuestContext*); if (--c->chain_budget <= 0) "
+                 "{ c->pc=g_module_base+0x%llxULL; return; } return %s(c); }",
+                 nm, (unsigned long long)t, nm);
+    } else {
+        snprintf(b, sizeof b, "{ c->pc=g_module_base+0x%llxULL; return; }",
+                 (unsigned long long)t);
+    }
+    return b;
+}
+
 inline std::string Xz(u32 r) {
     return r == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(r) + "]");
 }
@@ -269,7 +351,19 @@ inline std::string Xsp(u32 r) {
 }
 
 // Append C for one instruction. Returns false if the instruction terminates the block.
-inline bool Translate(u32 i, u64 pc, std::string& out) {
+/// Translate one AArch64 instruction to C.
+///
+/// Returns true if the block stays open. `unhandled`, when supplied, reports
+/// whether this instruction fell through the decoder to recomp_unhandled -
+/// which the return value cannot express, because an unhandled instruction is
+/// stepped over and leaves the block open exactly like a translated one. Without
+/// this signal the emitter cannot tell a full translation from a stream of
+/// fallbacks, which is how a whole module of misdecoded ARM32 once passed for a
+/// successful export.
+inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
+    if (unhandled) {
+        *unhandled = false;
+    }
     char buf[256];
     // Appends in place. Taking a string_view and appending piecewise (rather
     // than `out += "    " + s + "\n"`) matters at scale: that expression built
@@ -279,6 +373,20 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         out.append("    ", 4);
         out.append(s);
         out.push_back('\n');
+    };
+    // Every "we cannot translate this" path goes through here. Three sites used
+    // to emit the call by hand and return early, which meant they never set the
+    // coverage flag - the exclusives alone were 5,036 instructions per export
+    // that the static coverage figure silently did not count.
+    auto put_unhandled = [&]() {
+        if (unhandled) {
+            *unhandled = true;
+        }
+        char b[128];
+        snprintf(b, sizeof b,
+                 "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
+                 (unsigned long long)pc);
+        put(b);
     };
     const u64 next = pc + 4;
 
@@ -297,6 +405,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // an object, barrier, store the pointer) can be observed pointer-first by
     // another thread, surfacing much later as a live vtable pointer reading
     // back as zero.
+    // CLREX before the barrier group: it shares their encoding shape but has to
+    // drop the exclusive mark, and treating it as a plain barrier left a stale
+    // mark that could make a later unrelated STXR succeed.
+    if ((i & 0xFFFFF0FF) == 0xD503305F) { put("recomp_clrex(c);"); return true; }
+
     if ((i & 0xFFFFF01F) == 0xD503301F) { put("recomp_barrier();"); return true; }
 
     if ((i & 0x1F800000) == 0x12800000) { // MOVZ/MOVN/MOVK
@@ -398,10 +511,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         // ROR is reserved for ADD/SUB shifted register - decoding it as a shift
         // would silently invent an instruction the CPU does not have.
         if (shift == 3) {
-            snprintf(buf, sizeof buf,
-                     "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-                     (unsigned long long)pc);
-            put(buf);
+            put_unhandled();
             return true;
         }
         std::string rmv = shifted_operand(Xz(rm), shift, imm6, sf);
@@ -409,7 +519,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         snprintf(buf, sizeof buf, "{ uint64_t _a=%s,_b=%s,_r=%s; ", a.c_str(), rmv.c_str(), op ? "_a-_b" : "_a+_b");
         std::string s = buf; if (!sf) s += "_r&=0xFFFFFFFFULL; ";
         if (rd != 31) s += "c->x[" + std::to_string(rd) + "]=_r; ";
-        if (S) s += "recomp_set_flags(c," + std::string(op ? "1" : "0") + ",_a,_b,_r," + (sf ? "1" : "0") + "); ";
+        if (S) s += SetFlags(op != 0, "_a", "_b", "_r", sf != 0) + " ";
         s += "}"; put(s); return true;
     }
 
@@ -424,6 +534,20 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
             else { s64 imm = (immhi << 2) | immlo; snprintf(buf, sizeof buf, "c->x[%u]=g_module_base + 0x%llxULL + (int64_t)%lld;", rd, (unsigned long long)pc, (long long)imm); }
             put(buf);
         }
+        return true;
+    }
+
+    // PRFM / PRFUM - prefetch hints.
+    //
+    // A hint has no architectural effect, so emitting nothing is not an
+    // approximation, it is the correct translation. These were reaching the
+    // "size==3 with opc>=2 is not a defined load/store" path and being sent to
+    // the JIT, which is both wrong and expensive: 1,606 instructions in Super
+    // a second title, 16.8% of the static gap, for something that does nothing.
+    if ((i & 0xFFC00000) == 0xF9800000 ||        // PRFM (unsigned offset)
+        (i & 0xFFE00C00) == 0xF8A00800 ||        // PRFM (register offset)
+        (i & 0xFFE00C00) == 0xF8800000) {        // PRFUM (unscaled)
+        put("/* prfm: hint, no effect */");
         return true;
     }
 
@@ -461,10 +585,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
             }
         } else {
             // size==3 with opc>=2 is not a defined load/store here.
-            snprintf(buf, sizeof buf,
-                     "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-                     (unsigned long long)pc);
-            put(buf);
+            put_unhandled();
             return true;
         }
         return true;
@@ -477,7 +598,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     if (((i & 0xFC000000) == 0x14000000 || (i & 0xFC000000) == 0x94000000) &&
         DirectBranchTarget(i, pc, t)) {
         if ((i & 0xFC000000) == 0x94000000) { snprintf(buf, sizeof buf, "c->x[30]=g_module_base+0x%llxULL;", (unsigned long long)next); put(buf); }
-        snprintf(buf, sizeof buf, "c->pc=g_module_base+0x%llxULL; return;", (unsigned long long)t); put(buf); return false;
+        // Call the target block directly when it is one we emitted. The
+        // declaration is at block scope so a unit needs no list of the blocks it
+        // reaches, and `return f(c)` gives the compiler a sibling call, which
+        // keeps the chain from growing the stack. Falling out of budget parks
+        // the PC and returns exactly as before, so the dispatcher stays the only
+        // thing that decides what runs when a chain ends.
+        put(ChainTo(t));
+        return false;
     }
     if ((i & 0xFFFFFC1F) == 0xD65F0000) { put("c->pc=c->x[30]; return; /* RET */"); return false; }
     if ((i & 0xFFFFFC1F) == 0xD61F0000) { u32 rn = (i >> 5) & 31; snprintf(buf, sizeof buf, "c->pc=c->x[%u]; return; /* BR */", rn); put(buf); return false; }
@@ -749,17 +877,86 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     if ((i & 0x3F000000) == 0x08000000) {
         const u32 size = i >> 30, o2 = (i >> 23) & 1, L = (i >> 22) & 1, o1 = (i >> 21) & 1;
         const u32 rt2 = (i >> 10) & 31, rn = (i >> 5) & 31, rt = i & 31;
-        // Pair variants (o1 set) are left to the fallback; only the single
-        // register forms are handled here.
+        // Pair forms: LDXP/LDAXP/STXP/STLXP. size 00/01 is unallocated here,
+        // so only the 32- and 64-bit register widths exist.
+        //
+        // These carry the lock traffic. A threaded engine implements its mutex
+        // as a 128-bit compare-and-swap over {owner, count} or {ptr, tag}, and
+        // on a second title the pair forms alone were 73.5% of every
+        // transition to the fallback engine once cntpct_el0 was implemented.
+        if (o1 && !o2 && (size == 2 || size == 3)) {
+            const u32 rbytes = (size == 3) ? 8u : 4u;
+            const std::string addr = "c->x[" + std::to_string(rn) + "]";
+            const std::string sz = std::to_string(rbytes);
+            if (L) {
+                // LDXP/LDAXP. Rt takes the low half, Rt2 the high half - the
+                // same order DynarmicExclusiveMonitor::ExclusiveRead128 fills,
+                // and for the 32-bit form the low and high words of the
+                // doubleword at the address.
+                std::string s2 = "{ uint64_t _lo,_hi; recomp_ldxp(c," + addr + "," + sz +
+                                 ",&_lo,&_hi); ";
+                // A W-register destination is written zero-extended.
+                const char* cast = (rbytes == 4) ? "(uint32_t)" : "";
+                if (rt != 31) {
+                    s2 += "c->x[" + std::to_string(rt) + "] = " + cast + "_lo; ";
+                }
+                if (rt2 != 31) {
+                    s2 += "c->x[" + std::to_string(rt2) + "] = " + cast + "_hi; ";
+                }
+                s2 += "}";
+                put(s2);
+            } else {
+                // STXP/STLXP. Rs (bits 20:16) receives the status, 0 on success.
+                const u32 rs = (i >> 16) & 31;
+                const std::string lo =
+                    (rbytes == 4) ? ("(uint64_t)(uint32_t)" + Xz(rt)) : Xz(rt);
+                const std::string hi =
+                    (rbytes == 4) ? ("(uint64_t)(uint32_t)" + Xz(rt2)) : Xz(rt2);
+                std::string s2 = "{ uint32_t _st = recomp_stxp(c," + addr + "," + sz + "," +
+                                 lo + "," + hi + "); ";
+                if (rs != 31) {
+                    s2 += "c->x[" + std::to_string(rs) + "] = _st; ";
+                }
+                s2 += "}";
+                put(s2);
+            }
+            return true;
+        }
         if (!o1 && rt2 == 31) {
+            const u32 bits = 8u << size;
             if (!o2) {
-                snprintf(buf, sizeof buf,
-                         "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;",
-                         i, (unsigned long long)pc);
-                put(buf);
+                // LDXR/LDAXR and STXR/STLXR. Both route through the emulator's
+                // own exclusive monitor, so an exclusive taken here is visible
+                // to a thread running on the fallback JIT.
+                //
+                // Acquire/release ordering (the LDAXR/STLXR spelling, o0 set)
+                // is not modelled separately: suyu's memory accessors are
+                // already atomic at these widths and the host is x86-64, whose
+                // ordering is strong enough that the fence these imply is a
+                // no-op in practice. Noted rather than silently assumed.
+                const std::string addr = "c->x[" + std::to_string(rn) + "]";
+                if (L) {
+                    // LDXR/LDAXR: mark and load.
+                    if (rt != 31) {
+                        put("c->x[" + std::to_string(rt) + "] = recomp_ldxr(c," + addr + "," +
+                            std::to_string(bits / 8) + ");");
+                    } else {
+                        put("(void)recomp_ldxr(c," + addr + "," + std::to_string(bits / 8) + ");");
+                    }
+                } else {
+                    // STXR/STLXR: Rs receives the status, 0 on success. Rs is
+                    // held in the Rt2 field's neighbour (bits 20:16).
+                    const u32 rs = (i >> 16) & 31;
+                    std::string s2 = "{ uint32_t _st = recomp_stxr(c," + addr + "," +
+                                     std::to_string(bits / 8) + "," + Xz(rt) + "); ";
+                    if (rs != 31) {
+                        s2 += "c->x[" + std::to_string(rs) + "] = _st; ";
+                    }
+                    s2 += "}";
+                    put(s2);
+                }
                 return true;
             }
-            const u32 bits = 8u << size;
             const std::string addr = "c->x[" + std::to_string(rn) + "]";
             if (L) {
                 // LDAR
@@ -893,6 +1090,730 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
         }
     }
 
+    // SHA256SU0: the sigma0 half of the message schedule update.
+    //   W[t] = W[t-16] + s0(W[t-15]) + W[t-7] + s1(W[t-2])
+    // This instruction contributes the first two terms; SHA256SU1 adds the
+    // rest. Verified against the scalar recurrence, not transcribed.
+    if ((i & 0xFFFE0C00) == 0x5E280800) {
+        const u32 opcode = (i >> 12) & 0x1F;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        if (opcode == 2) {
+            std::string s = "{ uint32_t _d[4],_n[4],_t[4],_r[4]; ";
+            s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "],16); ";
+            s += "memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); ";
+            // T is the window one word along: Vn<31:0> : Vd<127:32>.
+            s += "_t[0]=_d[1]; _t[1]=_d[2]; _t[2]=_d[3]; _t[3]=_n[0]; ";
+            s += "for(int _e=0;_e<4;_e++){ uint32_t _x=_t[_e]; ";
+            s += "uint32_t _s0=((_x>>7)|(_x<<25))^((_x>>18)|(_x<<14))^(_x>>3); ";
+            s += "_r[_e]=_s0+_d[_e]; } ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // SHA256SU1: the sigma1 half, plus the two carried terms. The upper two
+    // words need sigma1 of the two just computed, because W[t+2] depends on
+    // W[t] - which is why this cannot be written as one loop.
+    if ((i & 0xFFE0FC00) == 0x5E006000) {
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        std::string s = "{ uint32_t _d[4],_n[4],_m[4],_t0[4],_t1[2],_r[4]; ";
+        s += "memcpy(_d,c->vreg[" + std::to_string(rd) + "],16); ";
+        s += "memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); ";
+        s += "memcpy(_m,c->vreg[" + std::to_string(rm) + "],16); ";
+        s += "_t0[0]=_n[1]; _t0[1]=_n[2]; _t0[2]=_n[3]; _t0[3]=_m[0]; ";
+        s += "_t1[0]=_m[2]; _t1[1]=_m[3]; ";
+        s += "for(int _e=0;_e<2;_e++){ uint32_t _x=_t1[_e]; ";
+        s += "uint32_t _s1=((_x>>17)|(_x<<15))^((_x>>19)|(_x<<13))^(_x>>10); ";
+        s += "_r[_e]=_s1+_d[_e]+_t0[_e]; } ";
+        s += "for(int _e=2;_e<4;_e++){ uint32_t _x=_r[_e-2]; ";
+        s += "uint32_t _s1=((_x>>17)|(_x<<15))^((_x>>19)|(_x<<13))^(_x>>10); ";
+        s += "_r[_e]=_s1+_d[_e]+_t0[_e]; } ";
+        s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+        put(s);
+        return true;
+    }
+
+    // LD1-LD4 / ST1-ST4, whole registers. opcode says how many registers and
+    // whether they are interleaved: LD2/3/4 spread consecutive elements across
+    // the registers, while the LD1 forms are plain consecutive blocks.
+    if ((i & 0xBFBF0000) == 0x0C000000 || (i & 0xBF800000) == 0x0C800000) {
+        const u32 Q = (i >> 30) & 1;
+        const bool post = ((i >> 23) & 1) != 0;
+        const bool load = ((i >> 22) & 1) != 0;
+        const u32 rm = (i >> 16) & 31;
+        const u32 opcode = (i >> 12) & 15, size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        int regs = 0, step = 0;
+        switch (opcode) {
+        case 0x0: regs = 4; step = 4; break;   // LD4/ST4, interleaved
+        case 0x2: regs = 4; step = 1; break;   // LD1/ST1, four registers
+        case 0x4: regs = 3; step = 3; break;   // LD3/ST3, interleaved
+        case 0x6: regs = 3; step = 1; break;
+        case 0x7: regs = 1; step = 1; break;
+        case 0x8: regs = 2; step = 2; break;   // LD2/ST2, interleaved
+        case 0xA: regs = 2; step = 1; break;
+        default: break;
+        }
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        // The 64-bit element has no 8-byte form: one element per register is
+        // not an addressing mode the architecture provides here.
+        const bool shaped = regs > 0 && !(size == 3 && !Q);
+        if (shaped) {
+            const int lanes = bytes / esz;
+            const int bits = esz * 8;
+            std::string s = "{ uint64_t _a=" + Xsp(rn) + "; uint64_t _v; ";
+            for (int e = 0; e < lanes; ++e) {
+                for (int r = 0; r < regs; ++r) {
+                    const int off = (step == 1) ? (r * bytes + e * esz)
+                                                : ((e * regs + r) * esz);
+                    const std::string vr = std::to_string((rt + (u32)r) & 31);
+                    const std::string lane = std::to_string(e * esz);
+                    if (load) {
+                        s += "_v=recomp_load" + std::to_string(bits) + "(c,_a+" +
+                             std::to_string(off) + "); memcpy((uint8_t*)c->vreg[" + vr + "]+" +
+                             lane + ",&_v," + std::to_string(esz) + "); ";
+                    } else {
+                        s += "_v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + vr + "]+" + lane + "," +
+                             std::to_string(esz) + "); recomp_store" + std::to_string(bits) +
+                             "(c,_a+" + std::to_string(off) + ",_v); ";
+                    }
+                }
+            }
+            if (load && !Q) {
+                // The 64-bit forms clear the top half of every register written.
+                for (int r = 0; r < regs; ++r) {
+                    s += "c->vreg[" + std::to_string((rt + (u32)r) & 31) + "][1]=0; ";
+                }
+            }
+            if (post) {
+                const std::string adv = (rm == 31)
+                                            ? (std::to_string(regs * bytes) + "ULL")
+                                            : ("c->x[" + std::to_string(rm) + "]");
+                s += "c->x[" + std::to_string(rn) + "]=_a+" + adv + "; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
+    // AESMC / AESIMC: the MixColumns step and its inverse. The matrix and the
+    // xtime-based GF(2^8) multiply below are dynarmic's
+    // (common/crypto/aes.cpp), not written from the specification.
+    if ((i & 0xFFFE0C00) == 0x4E280800) {
+        const u32 opcode = (i >> 12) & 0x1F;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        if (opcode == 4 || opcode == 5) {
+            // AESE: Vd = SubBytes(ShiftRows(Vd EOR Vn)).
+            // AESD is the same with the inverse of each step. ShiftRows rotates
+            // row r left by r, which over the column-major state is a shift of
+            // 4*(i&3) - the permutation dynarmic spells out byte by byte.
+            const bool dec = (opcode == 5);
+            std::string s = "{ uint8_t _s[16],_k[16],_t[16]; const uint8_t* _sb=recomp_aes_sbox(" +
+                            std::string(dec ? "1" : "0") + "); ";
+            s += "memcpy(_s,c->vreg[" + std::to_string(rd) + "],16); ";
+            s += "memcpy(_k,c->vreg[" + std::to_string(rn) + "],16); ";
+            s += "for(int _i=0;_i<16;_i++) _s[_i]=(uint8_t)(_s[_i]^_k[_i]); ";
+            if (dec) {
+                s += "for(int _i=0;_i<16;_i++) _t[_i]=_s[(_i+16-4*(_i&3))&15]; ";
+            } else {
+                s += "for(int _i=0;_i<16;_i++) _t[_i]=_s[(_i+4*(_i&3))&15]; ";
+            }
+            s += "for(int _i=0;_i<16;_i++) _t[_i]=_sb[_t[_i]]; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_t,16); }";
+            put(s);
+            return true;
+        }
+        if (opcode == 6 || opcode == 7) {
+            const char* mtx = (opcode == 7)
+                                  ? "{14,11,13,9},{9,14,11,13},{13,9,14,11},{11,13,9,14}"
+                                  : "{2,3,1,1},{1,2,3,1},{1,1,2,3},{3,1,1,2}";
+            std::string s = "{ uint8_t _s[16],_r[16]; static const uint8_t _mx[4][4]={";
+            s += mtx;
+            s += "}; memcpy(_s,c->vreg[" + std::to_string(rn) + "],16); ";
+            s += "for(int _cl=0;_cl<16;_cl+=4) for(int _o=0;_o<4;_o++){ uint8_t _acc=0; ";
+            s += "for(int _k=0;_k<4;_k++){ uint8_t _x=_s[_cl+_k],_y=_mx[_o][_k],_pp=0; ";
+            s += "while(_y){ if(_y&1) _pp=(uint8_t)(_pp^_x); ";
+            s += "_x=(uint8_t)((_x<<1)^((_x>>7)*0x1B)); _y=(uint8_t)(_y>>1); } ";
+            s += "_acc=(uint8_t)(_acc^_pp); } _r[_cl+_o]=_acc; } ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // PMULL / PMULL2: carry-less multiply of the low or high 64-bit halves.
+    if ((i & 0xBF20FC00) == 0x0E20E000) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        if (!U && size == 3) {
+            const int half = Q ? 1 : 0;   // PMULL2 takes the top half of each source
+            std::string s = "{ uint64_t _a=c->vreg[" + std::to_string(rn) + "][" +
+                            std::to_string(half) + "], _b=c->vreg[" + std::to_string(rm) + "][" +
+                            std::to_string(half) + "]; uint64_t _lo=0,_hi=0; ";
+            s += "for(int _k=0;_k<64;_k++) if((_b>>_k)&1ULL){ _lo^=_a<<_k; ";
+            // Shifting by 64 is undefined, and that is exactly the k=0 case.
+            s += "if(_k) _hi^=_a>>(64-_k); } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=_lo; c->vreg[" + std::to_string(rd) +
+                 "][1]=_hi; }";
+            put(s);
+            return true;
+        }
+    }
+
+    // CRC32 / CRC32C. Computed a bit at a time rather than from a table: this
+    // is the same recurrence dynarmic's tables encode, and a cold instruction
+    // does not justify carrying 2 KB of tables in every generated image.
+    if ((i & 0x7FE0E000) == 0x1AC04000) {
+        const u32 sf = i >> 31;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const u32 castagnoli = (i >> 12) & 1, sz = (i >> 10) & 3;
+        // The 64-bit variant is the sz=11 form only, and it needs sf set.
+        if (!(sz == 3 && !sf) && !(sz != 3 && sf) && rd != 31) {
+            const int nbytes = 1 << sz;
+            const char* poly = castagnoli ? "0x82F63B78UL" : "0xEDB88320UL";
+            std::string s = "{ uint32_t _crc=(uint32_t)" + Xz(rn) + "; uint64_t _v=" + Xz(rm) +
+                            "; ";
+            s += "for(int _i=0;_i<" + std::to_string(nbytes) + ";_i++){ ";
+            s += "_crc^=(uint8_t)(_v>>(8*_i)); ";
+            s += "for(int _b=0;_b<8;_b++) _crc=(_crc>>1)^(" + std::string(poly) +
+                 " & (uint32_t)(-(int32_t)(_crc&1u))); } ";
+            s += "c->x[" + std::to_string(rd) + "]=(uint64_t)_crc; }";
+            put(s);
+            return true;
+        }
+    }
+
+    // FADDP, scalar: add the two lanes of the source together.
+    if ((i & 0xFFBFFC00) == 0x7E30D800) {
+        const bool dbl = ((i >> 22) & 1) != 0;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        const char* ct = dbl ? "double" : "float";
+        const int fsz = dbl ? 8 : 4;
+        std::string s = "{ " + std::string(ct) + " _a[2],_r; memcpy(_a,c->vreg[" +
+                        std::to_string(rn) + "]," + std::to_string(fsz * 2) + "); ";
+        s += "_r=_a[0]+_a[1]; c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+             std::to_string(rd) + "][1]=0; ";
+        s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," + std::to_string(fsz) + "); }";
+        put(s);
+        return true;
+    }
+
+    // BSL / BIT / BIF: bitwise select. All three are the same operation with a
+    // different choice of which register supplies the mask and which the
+    // destination, so size picks the variant rather than an element width.
+    // U must be set; the U=0 half of this encoding is AND/BIC/ORR/ORN.
+    if ((i & 0xBF20FC00) == 0x2E201C00) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        if (size != 0) {   // size 0 is EOR, handled with the other logicals
+            const int halves = Q ? 2 : 1;
+            std::string s = "{ ";
+            for (int h = 0; h < halves; ++h) {
+                const std::string k = "[" + std::to_string(h) + "]";
+                const std::string d = "c->vreg[" + std::to_string(rd) + "]" + k;
+                const std::string n = "c->vreg[" + std::to_string(rn) + "]" + k;
+                const std::string m = "c->vreg[" + std::to_string(rm) + "]" + k;
+                if (size == 1) {
+                    // BSL: the destination is the mask.
+                    s += d + " = (" + d + " & " + n + ") | (~" + d + " & " + m + "); ";
+                } else if (size == 2) {
+                    // BIT: insert where the second source has bits set.
+                    s += d + " = (" + d + " & ~" + m + ") | (" + n + " & " + m + "); ";
+                } else {
+                    // BIF: insert where it has them clear.
+                    s += d + " = (" + d + " & " + m + ") | (" + n + " & ~" + m + "); ";
+                }
+            }
+            if (!Q) {
+                s += "c->vreg[" + std::to_string(rd) + "][1]=0; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
+    // TBL / TBX: byte-wise table lookup. The table is 1-4 consecutive vector
+    // registers starting at Rn, wrapping at 32, and each byte of Rm indexes it.
+    // An index past the end gives zero for TBL and leaves the byte alone for
+    // TBX, which is the only difference between them.
+    if ((i & 0xBFE08C00) == 0x0E000000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const u32 len = (i >> 13) & 3, op = (i >> 12) & 1;
+        const int regs = (int)len + 1;
+        const int bytes = Q ? 16 : 8;
+        const int tbl_bytes = regs * 16;
+        std::string s = "{ uint8_t _t[" + std::to_string(tbl_bytes) + "],_x[" +
+                        std::to_string(bytes) + "],_r[" + std::to_string(bytes) + "]; ";
+        for (int k = 0; k < regs; ++k) {
+            // The table wraps at v31, so a run starting near the top comes back
+            // round to v0 rather than reading off the end of the register file.
+            s += "memcpy(_t+" + std::to_string(k * 16) + ",c->vreg[" +
+                 std::to_string((rn + (u32)k) & 31) + "],16); ";
+        }
+        s += "memcpy(_x,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+        if (op) {
+            s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," + std::to_string(bytes) + "); ";
+        }
+        s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ unsigned _k=_x[_i]; ";
+        s += "if(_k<" + std::to_string(tbl_bytes) + "U) _r[_i]=_t[_k];";
+        if (!op) {
+            s += " else _r[_i]=0;";
+        }
+        s += " } ";
+        s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+             "][1]=0; ";
+        s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+        put(s);
+        return true;
+    }
+
+    // LD1 / ST1, one element. Unlike most vector loads this leaves the rest of
+    // the register alone, so the destination is not zeroed. Bit 23 selects the
+    // post-index form, where Rm of 31 means "advance by the element size" and
+    // anything else names a register to advance by.
+    if ((i & 0xBF200000) == 0x0D000000) {
+        const u32 Q = (i >> 30) & 1;
+        const bool post = ((i >> 23) & 1) != 0;
+        const bool load = ((i >> 22) & 1) != 0;
+        const u32 rm = (i >> 16) & 31;
+        const u32 opcode = (i >> 13) & 7, S = (i >> 12) & 1, size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        int esz = 0, index = 0;
+        bool shaped = true;
+        if (opcode == 0) {
+            esz = 1;
+            index = (int)((Q << 3) | (S << 2) | size);
+        } else if (opcode == 2 && (size & 1) == 0) {
+            esz = 2;
+            index = (int)((Q << 2) | (S << 1) | (size >> 1));
+        } else if (opcode == 4 && size == 0) {
+            esz = 4;
+            index = (int)((Q << 1) | S);
+        } else if (opcode == 4 && size == 1 && S == 0) {
+            esz = 8;
+            index = (int)Q;
+        } else {
+            shaped = false;   // LD2/LD3/LD4 and the replicating forms
+        }
+        // Only the no-offset form may have a register field of zero meaning
+        // "no offset"; in the post-index form that field is Rm.
+        if (shaped && (post || rm == 0)) {
+            const int bits = esz * 8;
+            std::string s = "{ uint64_t _a=" + Xsp(rn) + "; ";
+            if (load) {
+                s += "uint64_t _v=recomp_load" + std::to_string(bits) + "(c,_a); ";
+                s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rt) + "]+" +
+                     std::to_string(index * esz) + ",&_v," + std::to_string(esz) + "); ";
+            } else {
+                s += "uint64_t _v=0; memcpy(&_v,(const uint8_t*)c->vreg[" + std::to_string(rt) +
+                     "]+" + std::to_string(index * esz) + "," + std::to_string(esz) + "); ";
+                s += "recomp_store" + std::to_string(bits) + "(c,_a,_v); ";
+            }
+            if (post) {
+                const std::string step =
+                    (rm == 31) ? (std::to_string(esz) + "ULL") : ("c->x[" + std::to_string(rm) + "]");
+                s += "c->x[" + std::to_string(rn) + "]=_a+" + step + "; ";
+            }
+            s += "}";
+            put(s);
+            return true;
+        }
+    }
+
+    // SSHLL / USHLL: widen half the source elements and shift them left. SXTL
+    // and UXTL are these with a shift of zero, which is how the assembler spells
+    // them and why they never appeared as their own encoding.
+    if ((i & 0x9F00FC00) == 0x0F00A400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        u32 size = 0;
+        bool shaped = true;
+        if (immh & 8)       shaped = false;   // reserved for this encoding
+        else if (immh & 4)  size = 2;
+        else if (immh & 2)  size = 1;
+        else if (immh & 1)  size = 0;
+        else                shaped = false;
+        if (shaped) {
+            const int sbits = 8 << size;
+            const u32 shift = ((immh << 3) | immb) - (u32)sbits;
+            const int ssz = sbits / 8;
+            const int lanes = 8 / ssz;            // always half a register in
+            const int off = Q ? 8 : 0;            // ...the top half when Q is set
+            const std::string sty =
+                (U ? std::string("uint") : std::string("int")) + std::to_string(sbits) + "_t";
+            const std::string dty = "uint" + std::to_string(sbits * 2) + "_t";
+            std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + dty + " _r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,(const uint8_t*)c->vreg[" + std::to_string(rn) + "]+" +
+                 std::to_string(off) + ",8); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + dty + ")((" +
+                 dty + ")_a[_i]<<" + std::to_string(shift) + "); ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // ZIP/UZP/TRN. All six are the same read of two registers with a different
+    // index pattern, so they share one emitter.
+    if ((i & 0xBF208C00) == 0x0E000800) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 opcode = (i >> 12) & 7;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        const int lanes = bytes / esz;
+        const char* pattern = nullptr;
+        switch (opcode) {
+        case 1: pattern = "uzp1"; break;
+        case 2: pattern = "trn1"; break;
+        case 3: pattern = "zip1"; break;
+        case 5: pattern = "uzp2"; break;
+        case 6: pattern = "trn2"; break;
+        case 7: pattern = "zip2"; break;
+        default: break;
+        }
+        if (pattern && !(size == 3 && !Q)) {
+            const std::string ty = "uint" + std::to_string(esz * 8) + "_t";
+            const int half = lanes / 2;
+            std::string idx;
+            if (opcode == 3 || opcode == 7) {
+                // ZIP: interleave one half of each source.
+                const int base = (opcode == 7) ? half : 0;
+                idx = "_r[2*_i]=_a[" + std::to_string(base) + "+_i]; _r[2*_i+1]=_b[" +
+                      std::to_string(base) + "+_i];";
+            } else if (opcode == 1 || opcode == 5) {
+                // UZP: take every other element, all of a then all of b.
+                const int first = (opcode == 5) ? 1 : 0;
+                idx = "_r[_i]=_a[2*_i+" + std::to_string(first) + "]; _r[" +
+                      std::to_string(half) + "+_i]=_b[2*_i+" + std::to_string(first) + "];";
+            } else {
+                // TRN: pair up matching even or odd elements.
+                const int first = (opcode == 6) ? 1 : 0;
+                idx = "_r[2*_i]=_a[2*_i+" + std::to_string(first) + "]; _r[2*_i+1]=_b[2*_i+" +
+                      std::to_string(first) + "];";
+            }
+            std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_b[" +
+                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(half) + ";_i++){ " + idx + " } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // EXT: a window into Rn:Rm starting imm4 bytes in.
+    if ((i & 0xBFE08400) == 0x2E000000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 imm4 = (i >> 11) & 15;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int bytes = Q ? 16 : 8;
+        if ((int)imm4 < bytes) {
+            std::string s = "{ uint8_t _a[" + std::to_string(bytes) + "],_b[" +
+                            std::to_string(bytes) + "],_r[" + std::to_string(bytes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ int _k=_i+" +
+                 std::to_string(imm4) + "; _r[_i] = (_k<" + std::to_string(bytes) +
+                 ") ? _a[_k] : _b[_k-" + std::to_string(bytes) + "]; } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // FCMEQ / FCMGE / FCMGT, register forms. The compare-against-zero forms are
+    // handled with the other two-register-misc ops; these take a second vector.
+    // U and size<1> pick which comparison: the two bits are the operator.
+    if ((i & 0x9F20FC00) == 0x0E20E400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const bool dbl = (size & 1) != 0;
+        const char* cmp = nullptr;
+        if (!U && !(size & 2))      cmp = "==";   // FCMEQ
+        else if (U && !(size & 2))  cmp = ">=";   // FCMGE
+        else if (U && (size & 2))   cmp = ">";    // FCMGT
+        if (cmp && !(dbl && !Q)) {
+            const char* ct = dbl ? "double" : "float";
+            const int fsz = dbl ? 8 : 4;
+            const int bytes = Q ? 16 : 8;
+            const int lanes = bytes / fsz;
+            const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
+            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
+                            "],_b[" + std::to_string(lanes) + "]; " + uty + " _r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            // A NaN operand compares false and the lane comes out zero, which is
+            // what the architecture specifies and what C's comparison already
+            // does - so no NaN test is needed here.
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
+                 "_b[_i]) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // USHL / SSHL: shift each lane by the signed low byte of the corresponding
+    // lane of Rm - positive shifts left, negative shifts right. Bits 15..11 are
+    // pinned because UQSHL (01001) and URSHL (01010) sit immediately next to
+    // this encoding and saturate or round instead.
+    if ((i & 0x9F20FC00) == 0x0E204400) {
+        const u32 Q = (i >> 30) & 1, U = (i >> 29) & 1;
+        const u32 size = (i >> 22) & 3;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const int esz = 1 << size;
+        const int ebits = esz * 8;
+        const int bytes = Q ? 16 : 8;
+        // The 64-bit element only exists as 2D; 1D is the scalar encoding.
+        if (!(size == 3 && !Q)) {
+            const int lanes = bytes / esz;
+            const std::string uty = "uint" + std::to_string(ebits) + "_t";
+            const std::string ity = "int" + std::to_string(ebits) + "_t";
+            const std::string eb = std::to_string(ebits);
+            std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_m[" +
+                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "memcpy(_m,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ ";
+            s += "int _s=(int)(int8_t)(_m[_i]&0xFF); ";
+            // A shift of the element width or more is defined by the
+            // architecture but undefined in C, so both ends are special-cased.
+            s += "if(_s>=0) _r[_i]=(_s>=" + eb + ")?(" + uty + ")0:(" + uty + ")((" + uty +
+                 ")_a[_i]<<_s); ";
+            s += "else { int _t=-_s; ";
+            if (U) {
+                s += "_r[_i]=(_t>=" + eb + ")?(" + uty + ")0:(" + uty + ")(_a[_i]>>_t); ";
+            } else {
+                s += "_r[_i]=(" + uty + ")((" + ity + ")_a[_i]>>((_t>=" + eb + ")?(" + eb +
+                     "-1):_t)); ";
+            }
+            s += "} } ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // SHL by immediate. Bit 29 is U and must stay in the mask: the same opcode
+    // with U set is UQSHL, which saturates. immh selects the element width and
+    // immh:immb encodes the shift as a bias above it.
+    // Off deliberately, and measured. Enabling this frees the hot block that also
+    // contains MOVI - transitions drop 47% - and costs 2.13 ms/frame against
+    // 1.95. The block is SIMD-heavy and the JIT compiles it better than the
+    // emitted C does, so paying the transition to stay in the JIT is cheaper
+    // than owning the block. Re-measure before flipping this.
+    constexpr bool kTranslateShiftLeftImmediate = false;
+    if (kTranslateShiftLeftImmediate && (i & 0xBF80FC00) == 0x0F005400) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 immh = (i >> 19) & 15, immb = (i >> 16) & 7;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        u32 size = 0;
+        bool ok = true;
+        if (immh & 8)        size = 3;
+        else if (immh & 4)   size = 2;
+        else if (immh & 2)   size = 1;
+        else if (immh & 1)   size = 0;
+        else                 ok = false;   // immh 0000 is the modified-immediate space
+        // A 64-bit element only exists as 2D.
+        if (size == 3 && !Q) ok = false;
+        if (ok) {
+            const int ebits = 8 << size;
+            const u32 shift = ((immh << 3) | immb) - (u32)ebits;
+            const int esz = ebits / 8;
+            const int bytes = Q ? 16 : 8;
+            const int lanes = bytes / esz;
+            const std::string uty = "uint" + std::to_string(ebits) + "_t";
+            std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_r[" +
+                            std::to_string(lanes) + "]; ";
+            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
+            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + uty + ")((" +
+                 uty + ")_a[_i]<<" + std::to_string(shift) + "); ";
+            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                 "][1]=0; ";
+            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
+            put(s);
+            return true;
+        }
+    }
+
+    // MOVI / MVNI: materialise an immediate into a vector register. The same
+    // encoding with cmode<0> set (below cmode 1100) is ORR/BIC immediate, which
+    // reads the destination instead of replacing it - those fall through.
+    if ((i & 0x9FF80400) == 0x0F000400) {
+        const u32 Q = (i >> 30) & 1, op = (i >> 29) & 1;
+        const u32 cmode = (i >> 12) & 15;
+        const u32 imm8 = ((((i >> 16) & 7) << 5) | ((i >> 5) & 31)) & 0xFF;
+        const u32 rd = i & 31;
+        const u32 hi3 = cmode >> 1;
+        bool ok = true;
+        u64 imm64 = 0;
+        if (hi3 <= 3 && (cmode & 1) == 0) {
+            const u64 v = (u64)imm8 << (8 * hi3);
+            imm64 = (v << 32) | v;
+        } else if ((hi3 == 4 || hi3 == 5) && (cmode & 1) == 0) {
+            const u64 h = ((u64)imm8 << (8 * (hi3 - 4))) & 0xFFFF;
+            imm64 = (h << 48) | (h << 32) | (h << 16) | h;
+        } else if (hi3 == 6) {
+            const u64 v = (cmode & 1) ? (((u64)imm8 << 16) | 0xFFFF)
+                                      : (((u64)imm8 << 8) | 0xFF);
+            imm64 = (v << 32) | v;
+        } else if (cmode == 14) {
+            if (op == 0) {
+                for (int k = 0; k < 8; ++k) imm64 |= (u64)imm8 << (8 * k);
+            } else {
+                // Each bit of imm8 expands to a whole byte of the result.
+                for (int k = 0; k < 8; ++k) {
+                    if ((imm8 >> k) & 1) imm64 |= 0xFFULL << (8 * k);
+                }
+            }
+        } else if (cmode == 15) {
+            // FMOV (vector, immediate). VFPExpandImm, built at double width and
+            // narrowed for the 32-bit form the way the scalar FMOV above does.
+            const u32 sgn = (imm8 >> 7) & 1, b6 = (imm8 >> 6) & 1;
+            const u64 e11 = ((u64)(b6 ^ 1) << 10) | (b6 ? (0xFFULL << 2) : 0ULL) |
+                            ((imm8 >> 4) & 3);
+            const u64 dbits = ((u64)sgn << 63) | (e11 << 52) | ((u64)(imm8 & 0xF) << 48);
+            if (op == 0) {
+                double dv;
+                memcpy(&dv, &dbits, 8);
+                const float fv = (float)dv;
+                u32 fb;
+                memcpy(&fb, &fv, 4);
+                imm64 = ((u64)fb << 32) | fb;
+            } else if (Q) {
+                imm64 = dbits;   // the 64-bit form is 2D only
+            } else {
+                ok = false;
+            }
+        } else {
+            ok = false;   // the ORR/BIC immediate forms
+        }
+        if (ok) {
+            // MVNI inverts, but cmode 1110 is MOVI in both op encodings.
+            if (op == 1 && cmode < 14) imm64 = ~imm64;
+            char lo[32];
+            snprintf(lo, sizeof lo, "0x%llxULL", (unsigned long long)imm64);
+            put("c->vreg[" + std::to_string(rd) + "][0]=" + lo + "; c->vreg[" +
+                std::to_string(rd) + "][1]=" + (Q ? std::string(lo) : std::string("0")) + ";");
+            return true;
+        }
+    }
+
+    // LD1R: load one element and replicate it across every lane. Bit 21 is R,
+    // which selects LD2R/LD4R - those write a second register and must stay on
+    // the fallback, so it has to be in the mask.
+    if ((i & 0xBFFFF000) == 0x0D40C000) {
+        const u32 Q = (i >> 30) & 1;
+        const u32 size = (i >> 10) & 3;
+        const u32 rn = (i >> 5) & 31, rt = i & 31;
+        const int esz = 1 << size;
+        const int bytes = Q ? 16 : 8;
+        const int lanes = bytes / esz;
+        const std::string uty = "uint" + std::to_string(esz * 8) + "_t";
+        std::string s = "{ " + uty + " _e = (" + uty + ")recomp_load" +
+                        std::to_string(esz * 8) + "(c," + Xsp(rn) + "); ";
+        s += uty + " _r[" + std::to_string(lanes) + "]; ";
+        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_e; ";
+        s += "c->vreg[" + std::to_string(rt) + "][0]=0; c->vreg[" + std::to_string(rt) +
+             "][1]=0; ";
+        s += "memcpy(c->vreg[" + std::to_string(rt) + "],_r," + std::to_string(bytes) + "); }";
+        put(s);
+        return true;
+    }
+
+    // FP <-> fixed-point conversions: the same shape as the integer forms
+    // below but with bit 21 clear and a scale field. fbits is 64 - scale, and
+    // the value is shifted by 2^fbits around the conversion. ldexp does that
+    // exactly; multiplying by a built-up power of two does not.
+    // Off deliberately, and measured: enabling this costs 25.0s against 20.7s on
+    // the reference replay. Translating one instruction pulls its whole block out
+    // of the JIT and into generated C, and these sit in float-heavy blocks the JIT
+    // compiles well - a NaN test, two bound compares and a cast cannot beat the
+    // single native instruction it replaces. Coverage only pays when the emitted C
+    // is faster than the JIT for that block. Re-measure before flipping this.
+    constexpr bool kTranslateFixedPointConversions = false;
+    if (kTranslateFixedPointConversions &&
+        (i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
+        const u32 sf = i >> 31, ftype = (i >> 22) & 3;
+        const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
+        const u32 fbits = 64 - ((i >> 10) & 0x3F);
+        // fbits is fixed at translation time, so the scale is a literal rather
+        // than a call into libm. 2^n is exact in binary floating point for every
+        // n this encoding can name, so "%.1f" round-trips it without loss.
+        char scale_lit[64];
+        snprintf(scale_lit, sizeof scale_lit, "%.1f", std::pow(2.0, (double)fbits));
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        // A 32-bit destination only encodes scales that leave fbits in 1..32.
+        const bool shaped = (ftype == 0 || ftype == 1) && fbits >= 1 && (sf || fbits <= 32);
+        if (shaped) {
+            const bool dbl = (ftype == 1);
+            const char* ct = dbl ? "double" : "float";
+            const int fsz = dbl ? 8 : 4;
+                if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
+                const bool is_signed = (opcode == 0);
+                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
+                                    : (is_signed ? "int32_t" : "uint32_t");
+                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
+                                          : (is_signed ? "-2147483648.0" : "0.0");
+                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
+                                                       : "18446744073709551615.0")
+                                          : (is_signed ? "2147483647.0" : "4294967295.0");
+                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
+                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
+                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
+                                                     : "0xFFFFFFFFFFFFFFFFULL")
+                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
+                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
+                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
+                s += std::string("_a = _a * (") + ct + ")" + scale_lit + "; ";
+                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
+                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
+                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
+                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
+                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
+                s += "c->x[" + std::to_string(rd) + "] = _r; }";
+                put(s);
+                return true;
+            }
+            if (rmode == 0 && (opcode == 2 || opcode == 3)) {
+                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
+                                                          : "(uint64_t)" + Xz(rn))
+                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
+                                                          : "(uint32_t)" + Xz(rn));
+                std::string s = "{ double _t = (double)(" + src + "); ";
+                s += std::string(ct) + " _r = (" + ct + ")(_t / " + scale_lit + "); ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
+                     std::to_string(fsz) + "); }";
+                put(s);
+                return true;
+            }
+        }
+    }
+
     // FP <-> integer conversions and FMOV between register files. These share
     // bit 21 with the FP arithmetic forms and are distinguished by bits 15..10
     // being zero, so they must be decoded ahead of the arithmetic/compare block
@@ -920,12 +1841,30 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 return true;
             }
 
-            // FCVTZS / FCVTZU: FP register -> integer register, round toward zero.
-            if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
-                const char* it = sf ? (opcode == 0 ? "int64_t" : "uint64_t")
-                                    : (opcode == 0 ? "int32_t" : "uint32_t");
+            // FCVT{N,P,M,Z}{S,U} and FCVTA{S,U}: FP register -> integer register.
+            // rmode names the rounding mode; FCVTA{S,U} is the odd one out,
+            // encoded as opcode 4/5 with rmode 0 and rounding halfway cases away
+            // from zero.
+            const bool cvt_away = (rmode == 0 && (opcode == 4 || opcode == 5));
+            if ((opcode == 0 || opcode == 1 || cvt_away) && rd != 31) {
+                const bool is_signed = cvt_away ? (opcode == 4) : (opcode == 0);
+                const char* rnd = nullptr;
+                if (cvt_away) {
+                    rnd = dbl ? "round" : "roundf";
+                } else if (rmode == 0) {
+                    rnd = dbl ? "nearbyint" : "nearbyintf";
+                } else if (rmode == 1) {
+                    rnd = dbl ? "ceil" : "ceilf";
+                } else if (rmode == 2) {
+                    rnd = dbl ? "floor" : "floorf";
+                }
+                // rmode 3 needs no call: the cast below already truncates.
+                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
+                                    : (is_signed ? "int32_t" : "uint32_t");
                 std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
                                 std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
+                // Round before saturating, the order the architecture specifies.
+                if (rnd) s += std::string("_a = ") + rnd + "(_a); ";
                 // FCVTZS/FCVTZU saturate: NaN gives 0, and anything outside the
                 // destination's range clamps to that range's min or max. A bare
                 // C cast is undefined for exactly those inputs, and on x86 it
@@ -934,7 +1873,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 // game code converts out-of-range values constantly - clamped
                 // indices, hashes, fixed-point - so the wrong answer here is a
                 // steady drip of corruption rather than an immediate fault.
-                const bool is_signed = (opcode == 0);
                 const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
                                           : (is_signed ? "-2147483648.0" : "0.0");
                 const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
@@ -1049,6 +1987,38 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // MRS/MSR against the small set of system registers a user-mode program
     // actually touches. Anything else stays on the fallback rather than being
     // silently invented.
+    // SYS: 1101 0101 0000 1 op1 CRn CRm op2 Rt - the DC/IC/AT/TLBI space, which
+    // the MRS/MSR handler below does not cover (that one matches op0=3 only).
+    if ((i & 0xFFF80000) == 0xD5080000) {
+        const u32 sys_op1 = (i >> 16) & 7;
+        const u32 sys_crn = (i >> 12) & 0xF;
+        const u32 sys_crm = (i >> 8) & 0xF;
+        const u32 sys_op2 = (i >> 5) & 7;
+
+        // Data cache clean / invalidate by VA: DC CVAC, CVAU, CVAP, CVADP,
+        // CIVAC. Guest memory is host memory here with no emulated cache
+        // hierarchy, so there is nothing to write back or discard.
+        //
+        // This is not an assumption about what is safe to skip: suyu never sets
+        // Dynarmic's hook_data_cache_operations, so it stays false and the
+        // fallback JIT compiles these to nothing. Emitting nothing matches the
+        // other engine exactly.
+        //
+        // Deliberately narrow. Two neighbours in the same CRn=7 space must keep
+        // falling back:
+        //   DC ZVA (CRm=4)  zeroes a cache line - a real memory write.
+        //   IC IVAU (CRm=5) invalidates the instruction cache, which suyu does
+        //                   act on (InvalidateCacheRange, then halts the JIT).
+        const bool is_dc_clean_invalidate =
+            sys_op1 == 3 && sys_crn == 7 && sys_op2 == 1 &&
+            (sys_crm == 10 || sys_crm == 11 || sys_crm == 12 || sys_crm == 13 || sys_crm == 14);
+        if (is_dc_clean_invalidate) {
+            put("/* dc clean/invalidate: no cache to maintain */");
+            return true;
+        }
+        // Everything else in this space - DC ZVA, the IC family, AT, TLBI -
+        // goes to the fallback engine.
+    }
     if ((i & 0xFFF00000) == 0xD5300000 || (i & 0xFFF00000) == 0xD5100000) {
         const bool is_read = ((i >> 21) & 1) != 0;   // MRS reads, MSR writes
         const u32 sysreg = (i >> 5) & 0x7FFF;
@@ -1066,6 +2036,90 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 if (rt != 31) put("c->x[" + std::to_string(rt) + "] = c->tpidr_el0;");
             } else {
                 put("c->tpidr_el0 = " + Xz(rt) + ";");
+            }
+            return true;
+        }
+        // FPCR/FPSR. sysreg here is o0 op1 CRn CRm op2, so FPCR (op0=3, op1=3,
+        // CRn=4, CRm=4, op2=0) packs to 0x5A20 and FPSR to 0x5A21.
+        //
+        // These are stored and returned rather than acted on: the generated C
+        // computes in the host's default rounding mode and nothing here changes
+        // that. Keeping the value is still strictly better than dropping it -
+        // code that saves FPCR, changes it, and restores it now round-trips,
+        // and the value survives a transition to the JIT, which does honour it.
+        // A recompiler that actually implemented the rounding modes would set
+        // the host FP mode here instead.
+        constexpr u32 kFpcr = 0x5A20;
+        constexpr u32 kFpsr = 0x5A21;
+        if (sysreg == kFpcr || sysreg == kFpsr) {
+            const char* field = (sysreg == kFpcr) ? "fpcr" : "fpsr";
+            if (is_read) {
+                if (rt != 31) {
+                    put("c->x[" + std::to_string(rt) + "] = c->" + std::string(field) + ";");
+                }
+            } else {
+                put("c->" + std::string(field) + " = " + Xz(rt) + ";");
+            }
+            return true;
+        }
+        // CNTPCT_EL0 / CNTVCT_EL0 / CNTFRQ_EL0. Packed the same way as the
+        // registers above: o0 op1 CRn CRm op2, so CNTPCT (op0=3, op1=3, CRn=14,
+        // CRm=0, op2=1) is 0x5F01.
+        //
+        // The counter is read from the emulator's own timing source, the same
+        // one the fallback JIT uses (DynarmicCallbacks64::GetCNTPCT ->
+        // CoreTiming::GetClockTicks). Two independent clocks would let the
+        // guest observe time moving backwards across an engine transition.
+        constexpr u32 kCntfrqEl0 = 0x5F00;
+        constexpr u32 kCntpctEl0 = 0x5F01;
+        constexpr u32 kCntvctEl0 = 0x5F02;
+        if (sysreg == kCntpctEl0 || sysreg == kCntvctEl0) {
+            // CNTVCT is the virtual counter. With no hypervisor offset it reads
+            // the same as the physical one, which is what the guest sees on a
+            // Switch and what the JIT reports.
+            if (is_read) {
+                if (rt != 31) {
+                    put("c->x[" + std::to_string(rt) + "] = recomp_cntpct(c);");
+                } else {
+                    put("(void)recomp_cntpct(c);");
+                }
+            } else {
+                // Writing the counter traps at EL0; swallow it.
+                put("(void)" + Xz(rt) + ";");
+            }
+            return true;
+        }
+        if (sysreg == kCntfrqEl0) {
+            if (is_read) {
+                if (rt != 31) {
+                    // Core::Hardware::CNTFREQ. Fixed on this platform.
+                    put("c->x[" + std::to_string(rt) + "] = 19200000ULL;");
+                }
+            } else {
+                put("(void)" + Xz(rt) + ";");
+            }
+            return true;
+        }
+        // CTR_EL0, the cache type register (op0=3 op1=3 CRn=0 CRm=0 op2=1).
+        //
+        // A constant, and read constantly: 31% of every transition to the
+        // fallback engine on a matrix-heavy title was this one instruction, most
+        // of a matrix-heavy title's remaining gap spent marshalling the whole
+        // context into dynarmic to fetch a number that never changes.
+        //
+        // The value is the one suyu configures dynarmic with
+        // (arm_dynarmic_64.cpp: config.ctr_el0), not a plausible-looking
+        // constant. Code that reads a cache line size once and relies on it
+        // later must not see it change when a thread crosses between engines.
+        constexpr u32 kCtrEl0 = 0x5801;
+        if (sysreg == kCtrEl0) {
+            if (is_read) {
+                if (rt != 31) {
+                    put("c->x[" + std::to_string(rt) + "] = 0x8444c004ULL;");
+                }
+            } else {
+                // Read-only at EL0; a write traps on hardware.
+                put("(void)" + Xz(rt) + ";");
             }
             return true;
         }
@@ -1200,6 +2254,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 }
             }
 
+            // FCCMP / FCCMPE: compare when the condition holds, otherwise take
+            // the flags straight from nzcv. Bits 11..10 are 01 here, where an
+            // ordinary FCMP has 1000 in bits 13..10, so the two do not overlap.
+            if (((i >> 10) & 3) == 1) {
+                const u32 cond = (i >> 12) & 15, nzcv = i & 15;
+                std::string s = "{ if (recomp_cond(c," + std::to_string(cond) + ")) ";
+                s += ld_n + ld_m;
+                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
+                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
+                     "c->c = (_a >= _b); c->v = 0; } ";
+                s += "(void)_r; } ";
+                s += "else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
+                s += "c->z=" + std::to_string((nzcv >> 2) & 1) + "; ";
+                s += "c->c=" + std::to_string((nzcv >> 1) & 1) + "; ";
+                s += "c->v=" + std::to_string(nzcv & 1) + "; } }";
+                put(s);
+                return true;
+            }
+
             // FCMP / FCMPE, including the compare-against-zero forms. The
             // low five bits are opcode2: bit 3 selects the #0.0 variant (Rm is
             // then not a register at all) and bit 4 selects the signalling
@@ -1306,6 +2379,146 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 put(s);
                 return true;
             }
+            // FABS / FNEG. size<0> picks the element width, as it does for
+            // every FP op in this class.
+            if (opcode == 0x0E || opcode == 0x0F) {
+                const char* ct = dbl ? "double" : "float";
+                const int fsz = dbl ? 8 : 4;
+                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int lanes = bytes / fsz;
+                const char* expr = (opcode == 0x0F)
+                                       ? "-_a[_i]"
+                                       : (dbl ? "fabs(_a[_i])" : "fabsf(_a[_i])");
+                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
+                                "],_r[" + std::to_string(lanes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
+                     "); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=" + expr + "; ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
+                     "); }";
+                put(s);
+                return true;
+            }
+
+            // XTN / XTN2: take the low half of each element. XTN2 writes the
+            // top half of the destination and leaves the bottom alone, which is
+            // the only reason this is not a plain narrowing.
+            if (opcode == 0x12 && !U && !scl_misc) {
+                const u32 size = (i >> 22) & 3;
+                if (size != 3) {
+                    const int dsz = 1 << size;            // destination element
+                    const int lanes = 8 / dsz;            // always half a register out
+                    const std::string sty = "uint" + std::to_string(dsz * 16) + "_t";
+                    const std::string dty = "uint" + std::to_string(dsz * 8) + "_t";
+                    std::string s = "{ " + sty + " _a[" + std::to_string(lanes) + "]; " + dty +
+                                    " _r[" + std::to_string(lanes) + "]; ";
+                    s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "],16); ";
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" + dty +
+                         ")_a[_i]; ";
+                    if (!Q) {
+                        s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                             std::to_string(rd) + "][1]=0; ";
+                    }
+                    s += "memcpy((uint8_t*)c->vreg[" + std::to_string(rd) + "]+" +
+                         std::to_string(Q ? 8 : 0) + ",_r,8); }";
+                    put(s);
+                    return true;
+                }
+            }
+
+            // FCVTZS / FCVTZU, vector. Round toward zero and saturate, the same
+            // contract as the scalar forms further up.
+            if (opcode == 0x1B) {
+                const char* ct = dbl ? "double" : "float";
+                const int fsz = dbl ? 8 : 4;
+                const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
+                const int lanes = bytes / fsz;
+                const std::string ity =
+                    (U ? std::string("uint") : std::string("int")) + std::to_string(fsz * 8) + "_t";
+                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
+                const char* lo_bound = dbl ? (U ? "0.0" : "-9223372036854775808.0")
+                                           : (U ? "0.0" : "-2147483648.0");
+                const char* hi_bound = dbl ? (U ? "18446744073709551615.0"
+                                                : "9223372036854775807.0")
+                                           : (U ? "4294967295.0" : "2147483647.0");
+                const char* sat_lo = dbl ? (U ? "0ULL" : "0x8000000000000000ULL")
+                                         : (U ? "0ULL" : "0xFFFFFFFF80000000ULL");
+                const char* sat_hi = dbl ? (U ? "0xFFFFFFFFFFFFFFFFULL"
+                                              : "0x7FFFFFFFFFFFFFFFULL")
+                                         : (U ? "0xFFFFFFFFULL" : "0x7FFFFFFFULL");
+                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
+                                uty + " _r[" + std::to_string(lanes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
+                     "); ";
+                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ " + std::string(ct) +
+                     " _v=_a[_i]; ";
+                s += "if(_v!=_v) _r[_i]=(" + uty + ")0; ";
+                s += std::string("else if(!(_v > (") + ct + ")" + lo_bound + ")) _r[_i]=(" + uty +
+                     ")" + sat_lo + "; ";
+                s += std::string("else if(!(_v < (") + ct + ")" + hi_bound + ")) _r[_i]=(" + uty +
+                     ")" + sat_hi + "; ";
+                s += "else _r[_i]=(" + uty + ")(" + ity + ")_v; } ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
+                     "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
+                     "); }";
+                put(s);
+                return true;
+            }
+
+            // CNT: set bits per byte. Defined for byte elements only.
+            if (opcode == 0x05 && ((i >> 22) & 3) == 0 && !U) {
+                const int bytes = Q ? 16 : 8;
+                std::string s = "{ uint8_t _a[" + std::to_string(bytes) + "],_r[" +
+                                std::to_string(bytes) + "]; ";
+                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                     std::to_string(bytes) + "); ";
+                s += "for(int _i=0;_i<" + std::to_string(bytes) + ";_i++){ ";
+                s += "uint8_t _v=_a[_i]; _v=(uint8_t)(_v-((_v>>1)&0x55)); ";
+                s += "_v=(uint8_t)((_v&0x33)+((_v>>2)&0x33)); ";
+                s += "_r[_i]=(uint8_t)((_v+(_v>>4))&0x0F); } ";
+                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                     std::to_string(rd) + "][1]=0; ";
+                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," +
+                     std::to_string(bytes) + "); }";
+                put(s);
+                return true;
+            }
+
+            // ABS / NEG, lanewise over integer elements. U picks NEG.
+            if (opcode == 0x0B) {
+                const u32 size = (i >> 22) & 3;
+                const int esz = 1 << size;
+                const int bytes = scl_misc ? 8 : (Q ? 16 : 8);
+                // The 64-bit element only exists as 2D or as the scalar form.
+                const bool shaped = scl_misc ? (size == 3) : !(size == 3 && !Q);
+                if (shaped) {
+                    const int lanes = bytes / esz;
+                    const std::string uty = "uint" + std::to_string(esz * 8) + "_t";
+                    const std::string ity = "int" + std::to_string(esz * 8) + "_t";
+                    std::string s = "{ " + uty + " _a[" + std::to_string(lanes) + "],_r[" +
+                                    std::to_string(lanes) + "]; ";
+                    s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," +
+                         std::to_string(bytes) + "); ";
+                    // Unsigned throughout: negating the minimum signed value wraps
+                    // on the architecture and is undefined on a signed C type.
+                    if (U) {
+                        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" +
+                             uty + ")(0-_a[_i]); ";
+                    } else {
+                        s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=((" +
+                             ity + ")_a[_i]<0) ? (" + uty + ")(0-_a[_i]) : _a[_i]; ";
+                    }
+                    s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
+                         std::to_string(rd) + "][1]=0; ";
+                    s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," +
+                         std::to_string(bytes) + "); }";
+                    put(s);
+                    return true;
+                }
+            }
             if (cmp) {
                 const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
@@ -1333,8 +2546,13 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // bits would silently address the wrong register.
     {
         // Bit 29 (U) selects FMULX, a different operation - keep it out of FMUL.
-        const bool vec_idx = (i & 0xBF00F400) == 0x0F009000;
-        const bool scl_idx = (i & 0xFF00F400) == 0x5F009000;
+        // Opcode 1001 is FMUL, 0001 FMLA, 0101 FMLS; the three share everything
+        // except whether the product replaces the destination or accumulates
+        // into it.
+        const u32 idxop = (i >> 12) & 0xF;
+        const bool idx_shape = (idxop == 0x9 || idxop == 0x1 || idxop == 0x5);
+        const bool vec_idx = idx_shape && (i & 0xBF000400) == 0x0F000000;
+        const bool scl_idx = idx_shape && (i & 0xFF000400) == 0x5F000000;
         if ((vec_idx || scl_idx) && ((i >> 23) & 1) == 1) {
             const u32 Q = (i >> 30) & 1;
             const bool dbl = ((i >> 22) & 1) != 0;
@@ -1352,7 +2570,15 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
                 s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
                 s += "memcpy(&_m,(const uint8_t*)c->vreg[" + std::to_string(rm) + "]+" +
                      std::to_string(index * fsz) + "," + std::to_string(fsz) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_a[_i]*_m; ";
+                if (idxop == 0x9) {
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=_a[_i]*_m; ";
+                } else {
+                    // FMLA/FMLS read the destination before writing it.
+                    s += "memcpy(_r,c->vreg[" + std::to_string(rd) + "]," +
+                         std::to_string(bytes) + "); ";
+                    s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]" +
+                         std::string(idxop == 0x1 ? "+=" : "-=") + "_a[_i]*_m; ";
+                }
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
                 s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
@@ -1765,32 +2991,165 @@ inline bool Translate(u32 i, u64 pc, std::string& out) {
     // hand-off to the fallback engine correct: the remaining instructions in
     // this block must not run twice, since the fallback resumes at this same
     // PC and will execute them itself.
-    snprintf(buf, sizeof buf,
-             "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
-             (unsigned long long)pc);
-    put(buf); return true;
+    // ---- EXTR (and therefore ROR immediate) ----------------------------
+    //
+    // ROR Rd, Rn, #imm is EXTR with Rn == Rm, and between the two widths it was
+    // 13.1% of every unhandled instruction in a second title - the single
+    // largest gap after EXT, and pure integer work. Compilers emit it for
+    // rotates in hashing and bit-twiddling code.
+    //
+    // sf 0 0 100111 N 0 Rm imms Rn Rd. N must track sf: N==sf is the only
+    // allocated combination, and imms must be < 32 in the 32-bit form.
+    if ((i & 0x7FA00000) == 0x13800000) {
+        const u32 sf = i >> 31, N = (i >> 22) & 1;
+        const u32 rm = (i >> 16) & 31, imms = (i >> 10) & 63;
+        const u32 rn = (i >> 5) & 31, rd = i & 31;
+        const u32 width = sf ? 64u : 32u;
+        if (N == sf && imms < width) {
+            if (rd != 31) {
+                std::string s2 = "{ uint64_t _hi=" + (sf ? Xz(rn) : ("(uint64_t)" + Wz(rn))) +
+                                 ", _lo=" + (sf ? Xz(rm) : ("(uint64_t)" + Wz(rm))) + ", _r; ";
+                if (imms == 0) {
+                    // Shifting by the full width is undefined in C, and lsb==0
+                    // is the common case (a plain MOV-through-EXTR).
+                    s2 += "_r = _lo; ";
+                } else {
+                    s2 += "_r = (_lo >> " + std::to_string(imms) + ") | (_hi << " +
+                          std::to_string(width - imms) + "); ";
+                }
+                if (!sf) s2 += "_r &= 0xFFFFFFFFULL; ";
+                s2 += "c->x[" + std::to_string(rd) + "] = _r; }";
+                put(s2);
+            } else {
+                put("/* extr -> xzr */");
+            }
+            return true;
+        }
+    }
+
+    // ---- ADC / ADCS / SBC / SBCS ---------------------------------------
+    //
+    // sf op S 11010000 Rm 000000 Rn Rd. op: 0 = ADC, 1 = SBC. Small but real -
+    // 1.4% of the gap - and it appears in multi-word arithmetic where getting
+    // the carry wrong is silent.
+    if ((i & 0x1FE0FC00) == 0x1A000000) {
+        const u32 sf = i >> 31, op = (i >> 30) & 1, S = (i >> 29) & 1;
+        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
+        const char* sign = sf ? "0x8000000000000000ULL" : "0x80000000ULL";
+        std::string s2 = "{ uint64_t _a=" + (sf ? Xz(rn) : ("(uint64_t)" + Wz(rn))) +
+                         ", _b=" + (sf ? Xz(rm) : ("(uint64_t)" + Wz(rm))) +
+                         ", _ci=(uint64_t)c->c, _r; ";
+        // SBC is ADC against the inverted operand, which is also what makes the
+        // borrow come out right: carry-clear means borrow.
+        if (op) s2 += sf ? "_b = ~_b; " : "_b = (~_b) & 0xFFFFFFFFULL; ";
+        s2 += "_r = _a + _b + _ci; ";
+        if (!sf) s2 += "_r &= 0xFFFFFFFFULL; ";
+        if (S) {
+            s2 += std::string("c->z = (_r == 0); c->n = (_r & ") + sign + ") ? 1 : 0; ";
+            if (sf) {
+                // Unsigned overflow with a carry-in: the sum wraps either when
+                // it lands below _a, or when it lands exactly on _a with the
+                // carry set (_b == ~0 and _ci == 1).
+                s2 += "c->c = (_r < _a) || (_ci && _r == _a); ";
+            } else {
+                s2 += "c->c = ((_a + _b + _ci) > 0xFFFFFFFFULL); ";
+            }
+            s2 += std::string("c->v = ((~(_a ^ _b) & (_a ^ _r)) & ") + sign + ") ? 1 : 0; ";
+        }
+        if (rd != 31) {
+            s2 += "c->x[" + std::to_string(rd) + "] = _r; ";
+        }
+        s2 += "}";
+        put(s2);
+        return true;
+    }
+
+    // ---- LDPSW ----------------------------------------------------------
+    //
+    // Load pair of 32-bit words, each sign-extended to 64. opc=01 V=0 L=1, so
+    // it sits outside the LDP/STP handler above, which only covers opc 00/10.
+    // 3.1% of the gap, and it turns up wherever a pair of ints is read into
+    // 64-bit registers at once.
+    //
+    // 0110100xx1 ... : signed offset 0x69400000, post-index 0x68C00000,
+    // pre-index 0x69C00000. imm7 is scaled by 4.
+    if ((i & 0xFFC00000) == 0x69400000 || (i & 0xFFC00000) == 0x68C00000 ||
+        (i & 0xFFC00000) == 0x69C00000) {
+        const u32 rt = i & 31, rn = (i >> 5) & 31, rt2 = (i >> 10) & 31;
+        const s32 imm7 = ((s32)(((i >> 15) & 0x7F) << 25) >> 25) * 4;
+        const bool post = (i & 0xFFC00000) == 0x68C00000;
+        const bool pre = (i & 0xFFC00000) == 0x69C00000;
+
+        std::string s2 = "{ uint64_t _base=" + Xsp(rn) + "; uint64_t _addr = _base";
+        if (!post) s2 += " + (int64_t)" + std::to_string(imm7);
+        s2 += "; ";
+        // Both words are read before either register is written: Rn may be Rt
+        // or Rt2, and writing early would corrupt the address for the second
+        // load.
+        s2 += "uint64_t _v1 = (uint64_t)(int64_t)(int32_t)(uint32_t)recomp_load32(c,_addr); ";
+        s2 += "uint64_t _v2 = (uint64_t)(int64_t)(int32_t)(uint32_t)recomp_load32(c,_addr+4); ";
+        if (rt != 31) s2 += "c->x[" + std::to_string(rt) + "] = _v1; ";
+        if (rt2 != 31) s2 += "c->x[" + std::to_string(rt2) + "] = _v2; ";
+        if (post || pre) {
+            s2 += "c->x[" + std::to_string(rn) + "] = _base + (int64_t)" +
+                  std::to_string(imm7) + "; ";
+        }
+        s2 += "}";
+        put(s2);
+        return true;
+    }
+
+    put_unhandled();
+    return true;
 }
 
-inline std::string FuncName(const std::string& mod, u64 v) {
-    char b[64]; snprintf(b, sizeof b, "blk_%s_%016llx", mod.c_str(), (unsigned long long)v); return b;
-}
-
-// Same name, written into a caller-owned buffer. The emit loops call this once
-// per block for the body and twice more per block for the dispatch table, so on
-// a multi-million-block title the returned-std::string form above is millions of
-// heap allocations for a name that is always well under 64 bytes.
-inline size_t FuncNameTo(char (&b)[64], const char* mod, u64 v) {
-    return (size_t)snprintf(b, sizeof b, "blk_%s_%016llx", mod, (unsigned long long)v);
-}
 
 const char* RuntimeH();
 const char* RuntimeC();
 
+/// One bucket of the unhandled-instruction histogram.
+struct UnhandledSite {
+    size_t count = 0;
+    u32 example_insn = 0;   ///< a representative full encoding, for hand-decoding
+    u64 example_pc = 0;     ///< where that example lives, for disassembling in context
+};
+
+/// AArch64 top-level encoding group, from bits 28:25 of the instruction.
+/// Table C4-1 in the ARM ARM. Coarse, but enough to say "the gap is SIMD"
+/// versus "the gap is loads and stores" at a glance.
+inline const char* EncodingGroupName(u32 op0) {
+    switch (op0 & 0xF) {
+    case 0x0: return "reserved/sme";
+    case 0x1: case 0x3: return "unallocated";
+    case 0x2: return "sve";
+    case 0x8: case 0x9: return "dp-immediate";
+    case 0xA: case 0xB: return "branch/exception/system";
+    case 0x4: case 0x6: case 0xC: case 0xE: return "load/store";
+    case 0x5: case 0xD: return "dp-register";
+    case 0x7: case 0xF: return "dp-simd/fp";
+    default: return "unknown";
+    }
+}
+
 // Stats returned to the caller for manifest/reporting.
 struct RecompileStats {
     size_t blocks = 0;
-    size_t instructions = 0;
+    size_t instructions = 0;          ///< n_bytes/4: every word in .text, padding included
     size_t translated_terminators = 0;
+    size_t emitted = 0;               ///< instructions actually walked inside discovered blocks
+    size_t unhandled = 0;             ///< of those, how many fell through to recomp_unhandled
+
+    /// Unhandled counts keyed by encoding group (bits 28:25).
+    std::map<u32, size_t> unhandled_by_group;
+    /// Unhandled counts keyed by the top 10 bits, which usually identifies the
+    /// opcode family while dropping register operands. This is the list that
+    /// says which instruction to implement next.
+    std::map<u32, UnhandledSite> unhandled_by_signature;
+
+    /// Fraction of walked instructions the decoder could not translate.
+    double UnhandledFraction() const {
+        return emitted ? double(unhandled) / double(emitted) : 0.0;
+    }
 };
 
 // Emit a buildable C project that statically recompiles `text` (raw AArch64 .text at `base`).
@@ -1921,6 +3280,22 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rcu += line;
     };
 
+    // Every block's address, so a direct branch can be turned into a direct call
+    // when its target is a block we actually emitted.
+    std::unordered_set<u64> chain_blocks;
+    chain_blocks.reserve(blocks.size() * 2);
+    for (const auto& b : blocks) {
+        chain_blocks.insert(b.vaddr);
+    }
+    g_chain_blocks = &chain_blocks;
+    g_chain_mod = mod.c_str();
+    struct ChainScope {
+        ~ChainScope() {
+            g_chain_blocks = nullptr;
+            g_chain_mod = nullptr;
+        }
+    } chain_scope;
+
     size_t cur_unit = 0;
     for (const auto& b : blocks) {
         const size_t unit = block_index / kBlocksPerUnit;
@@ -1935,11 +3310,78 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rcu += namebuf;
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
+        rcu += "    static const uint32_t _expected[]={";
+        if (EmitGuardGen()) {
+            // GG1 header: word count, module-relative PC low and high.
+            char header[64];
+            snprintf(header, sizeof header, "%uU,0x%08xU,0x%08xU,", b.count,
+                     (unsigned)(b.vaddr & 0xffffffffu), (unsigned)(b.vaddr >> 32));
+            rcu += header;
+        }
+        for (u32 k = 0; k < b.count; ++k) {
+            char word[32]; snprintf(word, sizeof word, "0x%08xU,", p[first + k]); rcu += word;
+        }
+        // Verify each entry, including side entries and direct chains. Do not
+        // cache this in a function-static variable: multiple guest cores can
+        // enter the same generated block. Per-entry verification also handles
+        // process reuse and remapped addresses without an unsafe shared epoch.
+        if (EmitGuardGen()) {
+            // GG1: the same check, skipped while this block's seen word (its
+            // slot of the unit's recomp_gg_seen) matches the module generation.
+            rcu += "};\n    RECOMP_GG_GUARD(_expected,@GG_SLOT@U);\n";
+        } else {
+            rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
+                   "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
+        }
+        rcu += "    if(c->halted) return;\n";
+        // Lookup indexes every emitted instruction, not only block starts. An
+        // indirect transfer can therefore enter the middle of this function.
+        // Direct chains publish their exact target PC before calling, so any
+        // address outside this block is an invariant violation, never a request
+        // to start silently at the first instruction.
+        {
+            char addr[32];
+            rcu += "    { uint64_t _entry=c->pc-g_module_base; if(_entry!=0x";
+            snprintf(addr, sizeof addr, "%llx", (unsigned long long)b.vaddr);
+            rcu += addr;
+            rcu += "ULL){ if(_entry<0x";
+            rcu += addr;
+            rcu += "ULL || _entry>0x";
+            snprintf(addr, sizeof addr, "%llx",
+                     (unsigned long long)(b.vaddr + (u64)(b.count - 1) * 4));
+            rcu += addr;
+            rcu += "ULL || ((_entry-0x";
+            snprintf(addr, sizeof addr, "%llx", (unsigned long long)b.vaddr);
+            rcu += addr;
+            rcu += "ULL)&3ULL)!=0){ recomp_unhandled(c,0U,c->pc); return; } switch((unsigned)((_entry-0x";
+            rcu += addr;
+            rcu += "ULL)>>2)){\n";
+            for (u32 k = 1; k < b.count; ++k) {
+                char entry[96];
+                snprintf(entry, sizeof entry, "      case %uU: goto _recomp_entry_%u;\n", k, k);
+                rcu += entry;
+            }
+            rcu += "      default: recomp_unhandled(c,0U,c->pc); return;\n    } } }\n";
+        }
         bool open = true;
         for (u32 k = 0; k < b.count; ++k) {
             body.clear();
-            open = Translate(p[first + k], b.vaddr + (u64)k * 4, body);
+            const u32 insn = p[first + k];
+            const u64 insn_pc = b.vaddr + (u64)k * 4;
+            bool unhandled = false;
+            open = Translate(insn, insn_pc, body, &unhandled);
             rcu += body;
+            ++stats.emitted;
+            if (unhandled) {
+                ++stats.unhandled;
+                ++stats.unhandled_by_group[(insn >> 25) & 0xF];
+                auto& site = stats.unhandled_by_signature[insn & 0xFFC00000u];
+                if (site.count == 0) {
+                    site.example_insn = insn;
+                    site.example_pc = insn_pc;
+                }
+                ++site.count;
+            }
             if (!open) { ++stats.translated_terminators; break; }
         }
         // A block that ends by running off its own end still has to hand the
@@ -2001,7 +3443,63 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         rc += "};\n";
     }
     rc += "#define _NSEG (sizeof(_segs)/sizeof(_segs[0]))\n"
+          "/* Direct block index.\n"
+          "\n"
+          "   Every block boundary lands in recomp_lookup - tens of millions of\n"
+          "   times a second - and it used to run two binary searches, one over\n"
+          "   segments and one over a segment's entries, which for the main image\n"
+          "   means about twenty probes over 600k entries per dispatch.\n"
+          "\n"
+          "   Guest instructions are 4-byte aligned and a module's blocks span one\n"
+          "   contiguous address range, so (pc - lo) >> 2 indexes a flat array\n"
+          "   directly. One bounds check and one load, no search.\n"
+          "\n"
+          "   Built once from the sorted tables at load time and read-only after,\n"
+          "   so it needs no locking and no per-thread state - a thread-local\n"
+          "   cache was tried instead and cost 34%% in the race phase, because the\n"
+          "   footprint per thread stops being free once the title is actually\n"
+          "   using its threads.\n"
+          "\n"
+          "   Costs one pointer per guest instruction word in the module, so about\n"
+          "   24 MB for a 3M-instruction image. If the allocation fails the binary\n"
+          "   search below still answers, just slowly. */\n"
+          "static BlockFn* _idx = 0;\n"
+          "static uint64_t _idx_lo = 0, _idx_hi = 0;\n"
+          "static int _idx_tried = 0;\n"
+          "static void _build_idx(void){\n"
+          "  size_t i, j, n;\n"
+          "  if(_idx_tried) return;\n"
+          "  _idx_tried = 1;\n"
+          "  if(_NSEG == 0 || *_segn[0] == 0) return;\n"
+          "  _idx_lo = _segs[0][0].va;\n"
+          "  _idx_hi = _seg_hi[_NSEG-1];\n"
+          "  if(_idx_hi < _idx_lo) return;\n"
+          "  n = (size_t)((_idx_hi - _idx_lo) >> 2) + 1;\n"
+          "  _idx = (BlockFn*)calloc(n, sizeof(BlockFn));\n"
+          "  if(!_idx) return;\n"
+          "  for(i=0;i<_NSEG;i++){\n"
+          "    const struct _recomp_ent* t=_segs[i];\n"
+          "    unsigned m=*_segn[i];\n"
+          "    for(j=0;j<m;j++) _idx[(size_t)((t[j].va - _idx_lo) >> 2)] = t[j].fn;\n"
+          "  }\n"
+          "}\n"
+          "/* Called from recomp_image_set_base, which the loader runs once per\n"
+          "   module before any guest thread exists - so the build below is not\n"
+          "   racing anything. */\n"
+          "void recomp_build_index(void){ _build_idx(); }\n"
+          "/* Module-relative view of the block index, for the host dispatcher.\n"
+          "   The index itself is static to this unit, so the exported wrapper in\n"
+          "   recomp_export.c has to come through here. */\n"
+          "int _recomp_index_view(uint64_t* lo, uint64_t* hi, BlockFn** idx){\n"
+          "  _build_idx();\n"
+          "  if(!_idx) return 0;\n"
+          "  *lo = _idx_lo; *hi = _idx_hi; *idx = _idx;\n"
+          "  return 1;\n"
+          "}\n"
+          "\n"
           "BlockFn recomp_lookup(uint64_t pc){\n"
+          "  if(_idx && pc>=_idx_lo && pc<=_idx_hi) return _idx[(size_t)((pc-_idx_lo)>>2)];\n"
+          "  {\n"
           "  unsigned slo=0, shi=(unsigned)_NSEG;\n"
           "  while(slo<shi){ unsigned m=slo+(shi-slo)/2; if(_seg_hi[m]<pc) slo=m+1; else shi=m; }\n"
           "  if(slo>=_NSEG) return 0;\n"
@@ -2010,6 +3508,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "    unsigned n=*_segn[slo], lo=0, hi=n;\n"
           "    while(lo<hi){ unsigned m=lo+(hi-lo)/2; if(t[m].va<pc) lo=m+1; else hi=m; }\n"
           "    return (lo<n && t[lo].va==pc)?t[lo].fn:0;\n"
+          "  }\n"
           "  }\n}\n";
 
     const std::string title_str = display_title.empty() ? mod : display_title;
@@ -2243,9 +3742,25 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#define RECOMP_API __attribute__((visibility(\"default\")))\n"
           "#endif\n\n"
           "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
+          /* Hands the block index out so a host dispatcher can do the lookup
+             itself. Going through recomp_image_lookup costs three nested calls
+             across the shared-object boundary on every block edge; with this it
+             is a bounds check and one load. Addresses are absolute so the caller
+             needs to know nothing about the module base. Only valid once
+             recomp_image_set_base has run, which is when the index is built. */
+          "extern int _recomp_index_view(uint64_t*, uint64_t*, BlockFn**);\n"
+          "RECOMP_API int recomp_image_index(uint64_t* lo, uint64_t* hi, BlockFn** idx){\n"
+          "  if(!_recomp_index_view(lo, hi, idx)) return 0;\n"
+          "  *lo += g_module_base; *hi += g_module_base;\n"
+          "  return 1;\n"
+          "}\n"
+          "\n"
           "/* Tells this image where its module actually got loaded, so the\n"
           "   addresses it computes are real rather than module-relative. */\n"
-          "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base; }\n\n"
+          "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n"
+          "  /* Single-threaded here, which is what makes the index safe to\n"
+          "     build without locking. */\n"
+          "  recomp_build_index(); }\n\n"
           "/* Reports the entry PC so the loader does not have to be told it\n"
           "   separately or parse the image again. */\n"
        << "RECOMP_API uint64_t recomp_image_entry(void){ return 0x"
@@ -2270,8 +3785,120 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     write("recomp_export.c", ex.str());
     write("CMakeLists.txt", cm.str());
 
+    // Coverage report. Without this the exporter cannot describe its own output:
+    // block and instruction counts say how much code was walked, not how much of
+    // it was actually translated, and an export made entirely of fallbacks looks
+    // identical to a complete one. The signature histogram is the actionable
+    // part - it ranks which opcode family to implement next by how often it is
+    // actually hit, rather than by which gaps look important.
+    {
+        std::ostringstream cov;
+        cov << "{\n";
+        cov << "  \"module\": \"" << mod << "\",\n";
+        cov << "  \"blocks\": " << stats.blocks << ",\n";
+        cov << "  \"text_words\": " << stats.instructions << ",\n";
+        cov << "  \"instructions_emitted\": " << stats.emitted << ",\n";
+        cov << "  \"instructions_unhandled\": " << stats.unhandled << ",\n";
+        cov << "  \"unhandled_fraction\": " << std::fixed << std::setprecision(6)
+            << stats.UnhandledFraction() << ",\n";
+        cov.unsetf(std::ios::floatfield);
+
+        cov << "  \"unhandled_by_group\": {";
+        bool first_group = true;
+        for (const auto& [group, count] : stats.unhandled_by_group) {
+            if (!first_group) cov << ",";
+            first_group = false;
+            cov << "\n    \"" << EncodingGroupName(group) << "\": " << count;
+        }
+        cov << (first_group ? "}" : "\n  }") << ",\n";
+
+        // Ranked, because the only question this file exists to answer is
+        // "what should I implement next".
+        std::vector<std::pair<u32, UnhandledSite>> ranked(stats.unhandled_by_signature.begin(),
+                                                          stats.unhandled_by_signature.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+
+        cov << "  \"unhandled_by_signature\": [";
+        bool first_sig = true;
+        size_t shown = 0;
+        for (const auto& [sig, site] : ranked) {
+            if (shown++ >= 64) break;
+            if (!first_sig) cov << ",";
+            first_sig = false;
+            char line[256];
+            snprintf(line, sizeof line,
+                     "\n    { \"signature\": \"0x%08X\", \"count\": %zu, "
+                     "\"share\": %.4f, \"example_insn\": \"0x%08X\", "
+                     "\"example_pc\": \"0x%llX\", \"group\": \"%s\" }",
+                     sig, site.count,
+                     stats.unhandled ? double(site.count) / double(stats.unhandled) : 0.0,
+                     site.example_insn, (unsigned long long)site.example_pc,
+                     EncodingGroupName((site.example_insn >> 25) & 0xF));
+            cov << line;
+        }
+        cov << (first_sig ? "]" : "\n  ]") << ",\n";
+        cov << "  \"distinct_signatures\": " << stats.unhandled_by_signature.size() << "\n";
+        cov << "}\n";
+        write("recomp_coverage.json", cov.str());
+    }
+
     // Bundle text/rodata/data as binary blobs so the exe can load them at startup
     {
+        std::ostringstream cov;
+        cov << "{\n";
+        cov << "  \"module\": \"" << mod << "\",\n";
+        cov << "  \"blocks\": " << stats.blocks << ",\n";
+        cov << "  \"text_words\": " << stats.instructions << ",\n";
+        cov << "  \"instructions_emitted\": " << stats.emitted << ",\n";
+        cov << "  \"instructions_unhandled\": " << stats.unhandled << ",\n";
+        cov << "  \"unhandled_fraction\": " << std::fixed << std::setprecision(6)
+            << stats.UnhandledFraction() << ",\n";
+        cov.unsetf(std::ios::floatfield);
+
+        cov << "  \"unhandled_by_group\": {";
+        bool first_group = true;
+        for (const auto& [group, count] : stats.unhandled_by_group) {
+            if (!first_group) cov << ",";
+            first_group = false;
+            cov << "\n    \"" << EncodingGroupName(group) << "\": " << count;
+        }
+        cov << (first_group ? "}" : "\n  }") << ",\n";
+
+        // Ranked, because the only question this file exists to answer is
+        // "what should I implement next".
+        std::vector<std::pair<u32, UnhandledSite>> ranked(stats.unhandled_by_signature.begin(),
+                                                          stats.unhandled_by_signature.end());
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+
+        cov << "  \"unhandled_by_signature\": [";
+        bool first_sig = true;
+        size_t shown = 0;
+        for (const auto& [sig, site] : ranked) {
+            if (shown++ >= 64) break;
+            if (!first_sig) cov << ",";
+            first_sig = false;
+            char line[256];
+            snprintf(line, sizeof line,
+                     "\n    { \"signature\": \"0x%08X\", \"count\": %zu, "
+                     "\"share\": %.4f, \"example_insn\": \"0x%08X\", "
+                     "\"example_pc\": \"0x%llX\", \"group\": \"%s\" }",
+                     sig, site.count,
+                     stats.unhandled ? double(site.count) / double(stats.unhandled) : 0.0,
+                     site.example_insn, (unsigned long long)site.example_pc,
+                     EncodingGroupName((site.example_insn >> 25) & 0xF));
+            cov << line;
+        }
+        cov << (first_sig ? "]" : "\n  ]") << ",\n";
+        cov << "  \"distinct_signatures\": " << stats.unhandled_by_signature.size() << "\n";
+        cov << "}\n";
+        write("recomp_coverage.json", cov.str());
+    }
+
+    // Bundle text/rodata/data as binary blobs so the exe can load them at startup.
+    // Only for the standalone runner: nothing else reads them.
+    if (g_emit_standalone_runner) {
         std::string data_subdir = out_dir + "/data";
         make_dir(data_subdir);
         // Always write text.bin
@@ -2292,11 +3919,798 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     return stats;
 }
 
-inline const char* RuntimeH() {
-    return R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
+/* Exact-FP accumulator scans, shared by the runtime header below and by the
+   standalone test harnesses, which build a self-contained C file rather than
+   including recomp_runtime.h. One definition so the two cannot drift. */
+inline const char* FPScanHelpers() {
+    return R"FS(
+/* Standalone test harnesses paste this in without recomp_runtime.h. */
+#ifndef RECOMP_INLINE
+#if defined(_MSC_VER)
+#define RECOMP_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_INLINE inline __attribute__((always_inline))
+#else
+#define RECOMP_INLINE inline
+#endif
+#endif
+
+/* The multiply-add and step emitters keep a 9- (single) or 67-word (double)
+   integer accumulator so rounding, subnormals and FPSR are exact. Finding the
+   highest set bit and OR-ing the discarded bits one bit at a time made those
+   two loops the dominant cost of the generated code: sampled at 99 Hz they
+   were ~87-92% of the exclusive cycles of the three hottest attract functions.
+   These do the identical operation a word at a time. Results are unchanged. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+/* Index of the highest set bit of `w`. `w` must be nonzero. */
+RECOMP_INLINE unsigned recomp_bit_index64(uint64_t w) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long i;
+    _BitScanReverse64(&i, w);
+    return (unsigned)i;
+#elif defined(_MSC_VER)
+    /* 32-bit MSVC targets have no _BitScanReverse64. */
+    unsigned long i;
+    uint32_t hi = (uint32_t)(w >> 32);
+    if (hi) {
+        _BitScanReverse(&i, (unsigned long)hi);
+        return (unsigned)i + 32u;
+    }
+    _BitScanReverse(&i, (unsigned long)(uint32_t)w);
+    return (unsigned)i;
+#elif defined(__GNUC__) || defined(__clang__)
+    return 63u - (unsigned)__builtin_clzll(w);
+#else
+    /* Portable fallback: no intrinsic and no new CPU feature requirement. */
+    unsigned n = 0;
+    if (w >> 32) { w >>= 32; n += 32; }
+    if (w >> 16) { w >>= 16; n += 16; }
+    if (w >> 8)  { w >>= 8;  n += 8; }
+    if (w >> 4)  { w >>= 4;  n += 4; }
+    if (w >> 2)  { w >>= 2;  n += 2; }
+    if (w >> 1)  { n += 1; }
+    return n;
+#endif
+}
+
+/* Highest set bit of the little-endian word array `p`, or -1 if it is zero.
+   Equivalent to scanning bit (count*64-1) downwards for the first set bit. */
+RECOMP_INLINE int recomp_fp_top_bit(const uint64_t* p, unsigned count) {
+    unsigned k = count;
+    while (k--) {
+        if (p[k]) {
+            return (int)(k * 64u) + (int)recomp_bit_index64(p[k]);
+        }
+    }
+    return -1;
+}
+
+/* Sticky bit for a rounding position `cut`: the OR of bits [0, cut-1) of `p`,
+   i.e. everything strictly below the round bit, which is bit cut-1 and is
+   deliberately excluded. Equivalent to the per-bit OR loop it replaces. */
+RECOMP_INLINE unsigned recomp_fp_sticky(const uint64_t* p, unsigned count, int cut) {
+    int n = cut - 1;
+    uint64_t agg = 0;
+    unsigned whole, rest, i;
+    if (n <= 0) {
+        return 0u;
+    }
+    whole = (unsigned)n / 64u;
+    if (whole > count) {
+        whole = count;
+    }
+    for (i = 0; i < whole; ++i) {
+        agg |= p[i];
+    }
+    rest = (unsigned)n % 64u;
+    /* A zero remainder must not reach a shift by 64. */
+    if (rest && whole < count) {
+        agg |= p[whole] & ((1ULL << rest) - 1ULL);
+    }
+    return agg != 0;
+}
+)FS";
+}
+
+// Scalar fixed-point helpers, returned as C for the generated runtime.
+// This implements the S/D, W/X non-trapping FPCR/FPSR contract used by the
+// existing runtime; FP16 and alternative-FP extensions are not added here.
+inline const char* FPFixedHelpers() {
+    return R"FX(
+/* Convert a binary32/64 significand directly to signed/unsigned fixed-point.
+   Round toward zero first, then saturate. IOC takes precedence over IXC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_fixed(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias -
+            (int)fraction_bits + (int)fbits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        if (discarded >= 64) {
+            inexact = mantissa != 0;
+        } else {
+            magnitude = mantissa >> discarded;
+            inexact = (mantissa & ((UINT64_C(1) << discarded) - 1)) != 0;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert a binary32/64 value to a signed/unsigned integer in the given
+   rounding mode (0 nearest-even, 1 toward +inf, 2 toward -inf, 3 toward zero,
+   4 nearest-away), as FCVT{N,P,M,Z,A}{S,U}: round, then saturate. IOC takes
+   precedence over IXC; FZ flushes a subnormal input to zero with IDC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_int(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned is_signed, unsigned rmode,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias - (int)fraction_bits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        uint64_t remainder = mantissa, half = 0; /* half 0: below one half */
+        if (discarded < 64) {
+            magnitude = mantissa >> discarded;
+            remainder = mantissa & ((UINT64_C(1) << discarded) - 1);
+            half = UINT64_C(1) << (discarded - 1);
+        }
+        inexact = remainder != 0;
+        if (inexact &&
+            ((rmode == 0 && half && (remainder > half || (remainder == half && (magnitude & 1)))) ||
+             (rmode == 4 && half && remainder >= half) || (rmode == 1 && !negative) ||
+             (rmode == 2 && negative))) {
+            ++magnitude;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert the integer magnitude once, using the guest FPCR rounding mode.
+   All legal S/D fixed-point inputs produce zero or a finite normal result:
+   exponent range is at least -64 and at most 63. No host FP cast is used. */
+static RECOMP_INLINE uint64_t recomp_fixed_to_fp(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const unsigned negative = is_signed && ((bits >> (int_bits - 1)) & 1);
+    uint64_t magnitude, mantissa;
+    unsigned top;
+    int exponent;
+    bits &= integer_mask;
+    magnitude = negative ? (UINT64_C(0) - bits) & integer_mask : bits;
+    if (!magnitude) return 0;
+    top = recomp_bit_index64(magnitude);
+    exponent = (int)top - (int)fbits;
+    if (top <= fraction_bits) {
+        mantissa = magnitude << (fraction_bits - top);
+    } else {
+        const unsigned discarded = top - fraction_bits; /* 1..40 for S/D. */
+        const uint64_t remainder = magnitude & ((UINT64_C(1) << discarded) - 1);
+        const uint64_t halfway = UINT64_C(1) << (discarded - 1);
+        const unsigned mode = (unsigned)((fpcr >> 22) & 3);
+        mantissa = magnitude >> discarded;
+        if (remainder) {
+            *fpsr |= UINT64_C(16);
+            if ((mode == 0 && (remainder > halfway ||
+                              (remainder == halfway && (mantissa & 1)))) ||
+                (mode == 1 && !negative) || (mode == 2 && negative)) {
+                ++mantissa;
+            }
+        }
+        if (mantissa >= (UINT64_C(1) << (fraction_bits + 1))) {
+            mantissa >>= 1;
+            ++exponent;
+        }
+    }
+    return ((uint64_t)negative << (fp_bits - 1)) |
+           ((uint64_t)(exponent + (int)bias) << fraction_bits) |
+           (mantissa & fraction_mask);
+}
+)FX";
+}
+
+// ABI 6 (FM1) header pieces. Each is empty in the ABI 5 text.
+inline const char* FastmemAbiH() {
+    return R"RT(6
+/* ABI 6 adds FM1, direct guest memory access through the host page table.
+   The memory helpers read Common::PageTable's entry array themselves, with its
+   layout folded in as the constants below, and serve an access only when it
+   lies inside one page whose entry holds a real backing pointer. Anything else
+   goes to the unchanged ABI 5 helper. The host enables this per context through
+   fm_table/fm_limit, and only after recomp_image_fastmem_v1 has confirmed these
+   constants and the field offsets for every loaded module. */
+#define RECOMP_FEATURE_FASTMEM_PT1 1u
+#define RECOMP_FM_PAGE_BITS 12
+#define RECOMP_FM_STRIDE_LOG2 5
+#define RECOMP_FM_PTR_MASK (~(uintptr_t)3)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FastmemContextFieldsH() {
+    return R"RT(    /* ABI 6 (FM1). Written only by the host thread that owns this context,
+       before it enters generated code. fm_limit 0 turns the fast path off.
+       Otherwise fm_table is host_mem->page_entries, and fm_limit is page
+       aligned, at most 2^39, and no higher than host_mem->address_space_max. */
+    uint32_t fm_reserved;
+    const unsigned char* fm_table;
+    uint64_t fm_limit;
+)RT";
+}
+
+inline const char* FastmemLayoutPinsH() {
+    return R"RT(typedef char recomp_layout_fm_table[offsetof(GuestContext, fm_table) == 872 ? 1 : -1];
+typedef char recomp_layout_fm_limit[offsetof(GuestContext, fm_limit) == 880 ? 1 : -1];
+)RT";
+}
+
+// ABI 6 feature GG1 (generation code guard). Declared after recomp_code_guard.
+inline const char* GuardGenH() {
+    return R"RT(/* ABI 6 feature GG1: the generation code guard.
+   A block runs the full recomp_code_guard only when its seen word differs from
+   its module's generation word, then records the generation it verified
+   against. The host moves the generation after every event that can change a
+   guarded instruction word or its mapping, and holds it at
+   RECOMP_GG_VERIFY_ALWAYS for anything it cannot prove stable; that value is
+   never stored as a seen word, and seen words start at 0, which the host never
+   uses, so an unnegotiated module verifies on every entry exactly as ABI 5.
+   Ordering: the host stores the word with release; blocks load both words
+   relaxed; recomp_code_guard_gen fences with acquire before reading code and
+   publishes the seen word with release after the check has passed. */
+#define RECOMP_FEATURE_GUARD_GEN1 2u
+#define RECOMP_GG_VERIFY_ALWAYS 0xFFFFFFFFu
+/* Byte offset of the watch word in a host page-table entry. Nonzero marks a
+   code page the host keeps stable; stores to it must go to the host. */
+#define RECOMP_GG_WATCH_OFFSET 24
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define RECOMP_GG_LOAD(x) (*(const volatile uint32_t*)&(x))
+#if defined(_M_ARM64)
+#define RECOMP_GG_ACQUIRE_FENCE() __dmb(_ARM64_BARRIER_ISHLD)
+#define RECOMP_GG_STORE_RELEASE(x,v) __stlr32((volatile unsigned __int32*)&(x),(unsigned __int32)(v))
+#else
+#define RECOMP_GG_ACQUIRE_FENCE() _ReadWriteBarrier()
+#define RECOMP_GG_STORE_RELEASE(x,v) do{ _ReadWriteBarrier(); *(volatile uint32_t*)&(x)=(v); }while(0)
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_LOAD(x) __atomic_load_n(&(x),__ATOMIC_RELAXED)
+#define RECOMP_GG_ACQUIRE_FENCE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define RECOMP_GG_STORE_RELEASE(x,v) __atomic_store_n(&(x),(v),__ATOMIC_RELEASE)
+#else
+#error "GG1 needs 32-bit atomic loads, stores and fences"
+#endif
+/* Hidden where that exists: the word is only ever reached from inside its own
+   image (the host gets its address from the handshake), so blocks address it
+   directly instead of through the GOT. Not __attribute__((cold)) on the miss
+   path: Apple clang then splits a cold fragment out of every block, one
+   symbol and unwind entry each; an unlikely branch keeps the call at the end
+   of the block instead. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_STATIC static inline
+#define RECOMP_GG_UNLIKELY(x) __builtin_expect(!!(x),0)
+#if defined(_WIN32)
+#define RECOMP_GG_HIDDEN
+#else
+#define RECOMP_GG_HIDDEN __attribute__((visibility("hidden")))
+#endif
+#else
+#define RECOMP_GG_STATIC static __inline
+#define RECOMP_GG_UNLIKELY(x) (x)
+#define RECOMP_GG_HIDDEN
+#endif
+extern uint32_t g_recomp_gg_word RECOMP_GG_HIDDEN;
+void recomp_code_guard_gen(GuestContext*,uint64_t,const uint32_t*,uint32_t,int,uint32_t*,uint32_t);
+/* Each unit keeps its blocks' seen words in its own zero-initialised static
+   array, recomp_gg_seen (no file size), so a block reaches its slot at a
+   link-time constant address. Each block's expected words are preceded by a
+   three-word header: word count, then the module-relative PC, low and high.
+   The miss path is one private copy per unit with three register arguments.
+   The generation is loaded there, before recomp_code_guard_gen's acquire
+   fence; a value newer than the one the block compared is equally valid to
+   record. */
+RECOMP_GG_STATIC RECOMP_NOINLINE void recomp_gg_miss(GuestContext* c,uint32_t* seen,const uint32_t* h){
+  recomp_code_guard_gen(c,g_module_base+((uint64_t)h[1]|((uint64_t)h[2]<<32)),h+3,h[0],
+                        g_recomp_guard_host_v2,seen,RECOMP_GG_LOAD(g_recomp_gg_word));
+}
+#define RECOMP_GG_GUARD(hdr,idx) \
+  if(RECOMP_GG_UNLIKELY(RECOMP_GG_LOAD(recomp_gg_seen[idx])!=RECOMP_GG_LOAD(g_recomp_gg_word))) \
+    recomp_gg_miss(c,&recomp_gg_seen[idx],hdr);
+)RT";
+}
+
+// ABI 6 feature FPX1 pieces of the runtime header. Empty unless the option is on.
+// Kept under MSVC's 16380-byte limit per string literal.
+inline const char* FpxAbiH() {
+    return R"RT(6
+/* ABI 6 without FM1 carries only FPX1 below. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FpxH() {
+    return R"RT(
+/* ABI 6 feature FPX1: exact native floating point.
+
+   A covered op (FADD/FSUB/FMUL/FNMUL/FDIV/FMLA-family/FRECPS/FRSQRTS/FSQRT,
+   S and D, scalar and per lane) first computes natively, and keeps that result
+   only when it provably equals the architectural one and adds no FPSR bit:
+   - the gate RECOMP_FPX_OPEN: guest FPCR at its default apart from FZ (RMode
+     RN, no DN, AHP or FZ16, no trap enables, no FEAT_AFP bits) and FPSR.IXC
+     already set;
+   - the result is finite and larger in magnitude than the smallest normal, so
+     it is neither NaN (IOC), infinite (DZC, OFC) nor tiny (UFC); or it is
+     exact: any finite sum, or a finite product or quotient of a zero. What is
+     left is IXC, which is already set;
+   - with FZ clear no input is flushed, so IDC cannot arise. With FZ set
+     (RECOMP_FPX_FZ, passed to every helper) the ARM op flushes a subnormal
+     input to zero and sets IDC, and flushes a result whose unrounded magnitude
+     is below the smallest normal to zero and sets UFC. So under FZ a result is
+     kept only when no input is subnormal (RECOMP_FPX_SUBN) and the result
+     needs no flush: larger in magnitude than the smallest normal (rounding is
+     monotonic, so the unrounded value is at least the smallest normal), or an
+     exact zero or exact zero-operand product or quotient as above. A finite
+     sum is no longer kept unconditionally: one in the subnormal range, or one
+     that rounds to exactly the smallest normal, falls back.
+   IEEE add, subtract, multiply, divide, square root and fused multiply-add are
+   correctly rounded, so under the host FP mode below every such result equals
+   the ARM result bit for bit. Anything else takes the unchanged exact body,
+   which FPX1 sites call out of line (recomp_fpe_*, recomp_runtime.c).
+
+   Host contract, enforced by the host once it has negotiated FPX1 through
+   recomp_image_fpx_v1: on x86-64 MXCSR round-to-nearest with DAZ and FTZ clear
+   and every exception masked; on AArch64 FPCR 0. Bit 32 of fpcr is the host's
+   kill switch (RECOMP_FPX_INHIBIT): the guest register is 32 bits, so MRS/MSR
+   never expose or clear it, and with it set every op takes the exact body.
+
+   x86-64 has no FMA in its baseline, so a single-precision FMA is computed in
+   binary64: the product of two binary32 values is exact there, one rounding
+   follows, and rounding that again to binary32 equals rounding the exact value
+   once unless the binary64 value is itself a binary32 midpoint, which falls
+   back (RECOMP_FPX_MIDPOINT). Because the product is exact, contracting the
+   expression gives the same value. Double-precision FMA needs a hardware FMA
+   (__FMA__); without one it stays exact-body only. */
+#include <float.h>
+#define RECOMP_FEATURE_FPX1 4u
+#define RECOMP_FPX_INHIBIT (UINT64_C(1) << 32)
+/* Every FPCR control bit but FZ (bit 24), which the helpers handle. */
+#define RECOMP_FPX_FPCR_MASK (UINT64_C(0x06C8FF07) | RECOMP_FPX_INHIBIT)
+#define RECOMP_FPX_FZ(c) ((uint32_t)(c)->fpcr & 0x01000000u)
+#if defined(RECOMP_NO_NATIVE_FP) || defined(__FAST_MATH__) || defined(_M_FP_FAST) || \
+    (defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD != 0)
+#define RECOMP_FPX_HOST 0 /* compiled out: every op takes the exact body */
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define RECOMP_FPX_HOST 1 /* the host FPU is the guest's */
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
+#define RECOMP_FPX_HOST 2 /* SSE2 */
+#include <emmintrin.h>
+#else
+#define RECOMP_FPX_HOST 0
+#endif
+#if RECOMP_FPX_HOST == 1 || \
+    (RECOMP_FPX_HOST == 2 && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__)))
+#define RECOMP_FPX_FMA64 1 /* a correctly rounded binary64 FMA instruction */
+#else
+#define RECOMP_FPX_FMA64 0
+#endif
+#ifndef RECOMP_FPX_PROBE
+#define RECOMP_FPX_PROBE(k) ((void)0) /* test and shadow builds count here */
+#endif
+#define RECOMP_FPX_OPEN(c) (((c)->fpsr & 16u) && !((c)->fpcr & RECOMP_FPX_FPCR_MASK))
+#define RECOMP_FPX_FIN32(t) (((t) & 0x7f800000u) != 0x7f800000u)
+#define RECOMP_FPX_BIG32(t) ((uint32_t)(((t) & 0x7fffffffu) - 0x00800001u) < 0x7effffffu)
+#define RECOMP_FPX_ZERO32(x) (((x) & 0x7fffffffu) == 0)
+/* A nonzero subnormal, which FZ flushes (and sets IDC for). */
+#define RECOMP_FPX_SUBN32(x) ((uint32_t)(((uint32_t)(x) << 1) - 1u) < 0x00ffffffu)
+#define RECOMP_FPX_FIN64(t) (((t) & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000))
+#define RECOMP_FPX_BIG64(t) \
+    (((t) & UINT64_C(0x7fffffffffffffff)) - UINT64_C(0x0010000000000001) < UINT64_C(0x7fdfffffffffffff))
+#define RECOMP_FPX_ZERO64(x) (((x) & UINT64_C(0x7fffffffffffffff)) == 0)
+#define RECOMP_FPX_SUBN64(x) ((((uint64_t)(x) << 1) - 1u) < UINT64_C(0x001fffffffffffff))
+/* Products: large, or a finite product of a zero (exact, the zero's sign rule
+   is IEEE's on both). Quotients: large, or a finite quotient of a zero. */
+#define RECOMP_FPX_KEEP32(t, a, b) \
+    (RECOMP_FPX_BIG32(t) || ((RECOMP_FPX_ZERO32(a) || RECOMP_FPX_ZERO32(b)) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEP64(t, a, b) \
+    (RECOMP_FPX_BIG64(t) || ((RECOMP_FPX_ZERO64(a) || RECOMP_FPX_ZERO64(b)) && RECOMP_FPX_FIN64(t)))
+#define RECOMP_FPX_KEEPDIV32(t, a) (RECOMP_FPX_BIG32(t) || (RECOMP_FPX_ZERO32(a) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEPDIV64(t, a) (RECOMP_FPX_BIG64(t) || (RECOMP_FPX_ZERO64(a) && RECOMP_FPX_FIN64(t)))
+/* Under FZ: no subnormal operand. A sum is then exact whenever it is below the
+   smallest normal, so zero is the only such sum it keeps. */
+#define RECOMP_FPX_FZOK32(a, b) (!RECOMP_FPX_SUBN32(a) && !RECOMP_FPX_SUBN32(b))
+#define RECOMP_FPX_FZOK64(a, b) (!RECOMP_FPX_SUBN64(a) && !RECOMP_FPX_SUBN64(b))
+#define RECOMP_FPX_FZSUM32(t, a, b) \
+    (RECOMP_FPX_FZOK32(a, b) && (RECOMP_FPX_BIG32(t) || RECOMP_FPX_ZERO32(t)))
+#define RECOMP_FPX_FZSUM64(t, a, b) \
+    (RECOMP_FPX_FZOK64(a, b) && (RECOMP_FPX_BIG64(t) || RECOMP_FPX_ZERO64(t)))
+/* A binary64 value in the binary32 normal range that lies exactly halfway
+   between two binary32 values. */
+#define RECOMP_FPX_MIDPOINT(s) ((recomp_fpx_db(s) & UINT64_C(0x1fffffff)) == UINT64_C(0x10000000))
+
+static RECOMP_INLINE float recomp_fpx_f(uint64_t x) { uint32_t t = (uint32_t)x; float f; memcpy(&f, &t, 4); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_fb(float f) { uint32_t t; memcpy(&t, &f, 4); return t; }
+static RECOMP_INLINE double recomp_fpx_d(uint64_t x) { double f; memcpy(&f, &x, 8); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_db(double f) { uint64_t t; memcpy(&t, &f, 8); return t; }
+
+/* Each returns 1 and the result bits in *v when the native result may be kept. */
+static RECOMP_INLINE int recomp_fpx_add32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t) && (!fz || RECOMP_FPX_FZSUM32(t, a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t) && (!fz || RECOMP_FPX_FZSUM32(t, a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) * recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEP32(t, a, b) && (!fz || RECOMP_FPX_FZOK32(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) / recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEPDIV32(t, a) && (!fz || RECOMP_FPX_FZOK32(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma32(uint64_t a, uint64_t b, uint64_t z, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(recomp_fpx_f(a), recomp_fpx_f(b), recomp_fpx_f(z)));
+#elif RECOMP_FPX_HOST == 2
+    const double s = (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b) + (double)recomp_fpx_f(z);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_KEEP32(t, a, b) && (!fz || (RECOMP_FPX_FZOK32(a, b) && !RECOMP_FPX_SUBN32(z)))) {
+        *v = t;
+        return 1;
+    }
+#endif
+    (void)a; (void)b; (void)z; (void)fz; (void)v; return 0;
+}
+/* FRECPS: 2 - a*b; FRSQRTS: (3 - a*b)/2, each rounded once. inf*0 gives NaN
+   here, which is never kept; the exact body returns 2.0 or 1.5. */
+static RECOMP_INLINE int recomp_fpx_recps32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 2.0f));
+#elif RECOMP_FPX_HOST == 2
+    const double s = 2.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t) && (!fz || RECOMP_FPX_FZOK32(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts32(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    /* Halving a normal result is exact, and a normal result is all that is kept. */
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 3.0f) * 0.5f);
+#elif RECOMP_FPX_HOST == 2
+    const double s = (3.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b)) * 0.5;
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t) && (!fz || RECOMP_FPX_FZOK32(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+/* Square root of a positive finite input (subnormal included) is normal and
+   finite; of +-0 it is the input. Negative inputs, infinities and NaNs fall
+   back, and under FZ so do subnormal inputs (flushed, IDC). */
+static RECOMP_INLINE int recomp_fpx_sqrt32(uint64_t a, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO32(a)) { *v = a; return 1; }
+    if ((uint32_t)a - 1u >= 0x7f7fffffu || (fz && RECOMP_FPX_SUBN32(a))) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_fb(__builtin_sqrtf(recomp_fpx_f(a)));
+#else
+    *v = recomp_fpx_fb(_mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(recomp_fpx_f(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)fz; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+inline const char* FpxH64() {
+    return R"RT(
+static RECOMP_INLINE int recomp_fpx_add64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) + recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t) && (!fz || RECOMP_FPX_FZSUM64(t, a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) - recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t) && (!fz || RECOMP_FPX_FZSUM64(t, a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) * recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEP64(t, a, b) && (!fz || RECOMP_FPX_FZOK64(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) / recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEPDIV64(t, a) && (!fz || RECOMP_FPX_FZOK64(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma64(uint64_t a, uint64_t b, uint64_t z, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(recomp_fpx_d(a), recomp_fpx_d(b), recomp_fpx_d(z)));
+    if (RECOMP_FPX_KEEP64(t, a, b) && (!fz || (RECOMP_FPX_FZOK64(a, b) && !RECOMP_FPX_SUBN64(z)))) {
+        *v = t;
+        return 1;
+    }
+#endif
+    (void)a; (void)b; (void)z; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_recps64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 2.0));
+    if (RECOMP_FPX_BIG64(t) && (!fz || RECOMP_FPX_FZOK64(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts64(uint64_t a, uint64_t b, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 3.0) * 0.5);
+    if (RECOMP_FPX_BIG64(t) && (!fz || RECOMP_FPX_FZOK64(a, b))) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)fz; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sqrt64(uint64_t a, uint32_t fz, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO64(a)) { *v = a; return 1; }
+    if (a - 1u >= UINT64_C(0x7fefffffffffffff) || (fz && RECOMP_FPX_SUBN64(a))) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_db(__builtin_sqrt(recomp_fpx_d(a)));
+#else
+    *v = recomp_fpx_db(_mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(recomp_fpx_d(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)fz; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+// Instrumentation only (g_emit_fpx_shadow): the runtime half of the shadow
+// build. Per kind (op*2 + double) it counts calls, open gates, kept fast
+// results and mismatches against the exact body, which runs anyway; the first
+// 100 mismatches are logged with their operands. Counts are per thread and
+// folded into the totals every 2^20 calls; mismatches are counted at once.
+// SUYU_RECOMP_FPX_SHADOW_LOG names the log (stderr otherwise); the totals are
+// rewritten to it + ".sum" as they grow and at exit.
+inline const char* FpxShadowC() {
+    return R"RT(
+/* FPX1 shadow instrumentation (never timed). */
+#include <stdio.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_FPX_TLS __declspec(thread)
+#define RECOMP_FPX_ADD(p, v) _InterlockedExchangeAdd64((volatile long long*)(p), (long long)(v))
+#define RECOMP_FPX_OR(p, v) _InterlockedOr64((volatile long long*)(p), (long long)(v))
+#else
+#define RECOMP_FPX_TLS _Thread_local
+#define RECOMP_FPX_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
+#define RECOMP_FPX_OR(p, v) __atomic_fetch_or((p), (v), __ATOMIC_RELAXED)
+#endif
+static uint64_t g_recomp_fpx_sh[16][4];     /* calls, gate open, kept, mismatches */
+static uint64_t g_recomp_fpx_sh_fpsr, g_recomp_fpx_sh_folds;
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh[16][3];
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh_n, t_recomp_fpx_sh_or;
+static void recomp_fpx_shadow_dump(void) {
+  static const char* const names[8] = {"add","sub","mul","div","fma","recps","rsqrts","sqrt"};
+  const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+  char sum[1024];
+  FILE* f = stderr;
+  if (path && *path) {
+    snprintf(sum, sizeof sum, "%s.sum", path);
+    f = fopen(sum, "w");
+    if (!f) return;
+  }
+  fprintf(f, "kind calls gate_open kept mismatches\n");
+  for (unsigned k = 0; k < 16; ++k)
+    fprintf(f, "%s%u %llu %llu %llu %llu\n", names[k / 2], k & 1 ? 64u : 32u,
+            (unsigned long long)g_recomp_fpx_sh[k][0], (unsigned long long)g_recomp_fpx_sh[k][1],
+            (unsigned long long)g_recomp_fpx_sh[k][2], (unsigned long long)g_recomp_fpx_sh[k][3]);
+  fprintf(f, "fpsr_seen 0x%llx\n", (unsigned long long)g_recomp_fpx_sh_fpsr);
+  if (f != stderr) fclose(f);
+}
+static void recomp_fpx_shadow_fold_counts(void) {
+  for (unsigned k = 0; k < 16; ++k)
+    for (unsigned j = 0; j < 3; ++j) {
+      RECOMP_FPX_ADD(&g_recomp_fpx_sh[k][j], t_recomp_fpx_sh[k][j]);
+      t_recomp_fpx_sh[k][j] = 0;
+    }
+  RECOMP_FPX_OR(&g_recomp_fpx_sh_fpsr, t_recomp_fpx_sh_or);
+}
+/* At exit, on the exiting thread: its own unfolded counts, then the totals. */
+static void recomp_fpx_shadow_exit(void) {
+  recomp_fpx_shadow_fold_counts();
+  recomp_fpx_shadow_dump();
+}
+static void recomp_fpx_shadow_fold(void) {
+  static int registered;
+  recomp_fpx_shadow_fold_counts();
+  if (!registered) { registered = 1; atexit(recomp_fpx_shadow_exit); }
+  if ((RECOMP_FPX_ADD(&g_recomp_fpx_sh_folds, 1) & 63) == 0) recomp_fpx_shadow_dump();
+}
+void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast, uint64_t exact,
+                       uint64_t fpsr_before, uint64_t fpsr_after, uint64_t a, uint64_t b) {
+  kind &= 15;
+  ++t_recomp_fpx_sh[kind][0];
+  t_recomp_fpx_sh[kind][1] += gate != 0;
+  t_recomp_fpx_sh[kind][2] += kept != 0;
+  if (kept && (fast != exact || fpsr_before != fpsr_after)) {
+    const uint64_t n = RECOMP_FPX_ADD(&g_recomp_fpx_sh[kind][3], 1);
+    if (n < 100) {
+      const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+      FILE* f = path && *path ? fopen(path, "a") : stderr;
+      if (f) {
+        fprintf(f, "MISMATCH kind=%u a=%016llx b=%016llx fast=%016llx exact=%016llx fpsr %llx->%llx\n",
+                kind, (unsigned long long)a, (unsigned long long)b, (unsigned long long)fast,
+                (unsigned long long)exact, (unsigned long long)fpsr_before,
+                (unsigned long long)fpsr_after);
+        if (f != stderr) fclose(f);
+      }
+    }
+    recomp_fpx_shadow_dump();
+  }
+  t_recomp_fpx_sh_or |= fpsr_after & 0x9f;
+  /* The first call registers the exit report; then every 2^20th folds. */
+  if (!(t_recomp_fpx_sh_n++ & 0xfffff)) recomp_fpx_shadow_fold();
+}
+)RT";
+}
+
+// `fpx`: 0 off, 1 FPX1, 2 FPX1 with the shadow instrumentation.
+inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, int fpx = 0) {
+    std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
+#include <string.h>   /* memcpy, for the memory accessors */
+#include <stdlib.h>   /* calloc, for the block index
+
+   Included here rather than in the generated module source because the module
+   source only pulls in this header and <stdint.h>. Without it calloc is an
+   implicit declaration returning int, the returned pointer is truncated to 32
+   bits, and the first lookup through the index dereferences garbage - which is
+   a crash roughly 20 seconds into boot with nothing in the log to explain it. */
+
+/* The memory accessors below are the hottest code in a generated module, and
+   leaving them to the compiler's discretion is not worth the risk: without a
+   forced inline MSVC declines them at /O2 in the larger translation units,
+   which puts a call back on the path this exists to remove. */
+#if defined(_MSC_VER)
+#define RECOMP_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_INLINE inline __attribute__((always_inline))
+#else
+#define RECOMP_INLINE inline
+#endif
 
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
@@ -2304,6 +4718,47 @@ typedef struct RecompHostMem {
     void* user;
     uint64_t (*load)(void* user, uint64_t va, uint32_t size);
     void (*store)(void* user, uint64_t va, uint32_t size, uint64_t value);
+    /* Exclusive access. Appended rather than inserted so the existing two stay
+       where they are, but note both sides of this struct must still be rebuilt
+       together: a DLL built before these existed would leave them uninitialised
+       and the first LDXR would call through a garbage pointer.
+
+       These have to reach the *emulator's* monitor rather than any private one.
+       The recompiled code and the fallback JIT run guest threads that contend
+       for the same locks, so two monitors means both engines can win the same
+       exclusive and the lock stops being a lock. */
+    uint64_t (*excl_load)(void* user, uint64_t va, uint32_t size);
+    uint32_t (*excl_store)(void* user, uint64_t va, uint32_t size, uint64_t value);
+    void (*clear_excl)(void* user);
+    /* The physical counter. Unlike FPCR this cannot live in the context: it has
+       to advance, and it has to agree with what the HLE kernel and the fallback
+       JIT report, or the guest sees time jump backwards whenever execution
+       crosses between engines. */
+    uint64_t (*read_cntpct)(void* user);
+    /* Exclusive pair forms. `size` is the width of ONE register (4 or 8), so
+       the reservation covers 2*size bytes. Split out rather than widening
+       excl_load/excl_store because the 64-bit pair needs a 128-bit
+       reservation, which no scalar return can carry. */
+    void (*excl_load_pair)(void* user, uint64_t va, uint32_t size, uint64_t* lo,
+                           uint64_t* hi);
+    uint32_t (*excl_store_pair)(void* user, uint64_t va, uint32_t size, uint64_t lo,
+                                uint64_t hi);
+    /* The host page table, so a mapped access resolves inline rather than
+       through `load`/`store`. Mirrors Memory::GetPointerImpl's fast path: mask
+       the address, bounds check, read one entry, extract the backing pointer.
+
+       An entry whose pointer is null means unmapped, debug, or GPU-tracked
+       memory - all of which need the callback, because the rasterizer has to be
+       told about the access. Only a non-null pointer is handled inline, so
+       nothing is bypassed that suyu would have done itself.
+
+       page_entries is null until the emulator hands over a real page table;
+       standalone builds leave it null and take the callback path always. */
+    const void* page_entries;
+    uint64_t page_entry_stride;
+    uint64_t page_bits;
+    uint64_t pointer_mask;
+    uint64_t address_space_max;
 } RecompHostMem;
 
 typedef struct GuestContext {
@@ -2343,6 +4798,21 @@ typedef struct GuestContext {
        turns every C++ thread-local access into a near-null read.
        Appended after host_mem so every pinned offset above stays put. */
     uint64_t tpidrro_el0;
+    /* Floating-point control and status (FPCR/FPSR).
+       Their absence was not a missing feature but a silent wrong answer: the
+       guest sets a rounding mode or reads the exception flags, the value had
+       nowhere to live, and every FP result afterwards used the host default.
+       Worse, the state was dropped again on each transition to the fallback
+       JIT, so the two engines disagreed about rounding mid-computation.
+       Appended after tpidrro_el0 so every pinned offset above is unchanged. */
+    uint64_t fpcr;
+    uint64_t fpsr;
+    /* Blocks a chain of direct calls may still run before returning to the
+       dispatcher. It has to sit immediately after fpsr: Core::ArmRecomp mirrors
+       this struct by hand and its view ends here, so a field placed after
+       save_dir below lands 512 bytes further along on this side than on that
+       one. The layout assertions below are what catch that. */
+    int chain_budget;
     /* Save-data filesystem state */
     char save_dir[512];
     /* Heap break for SVC memory allocation */
@@ -2367,7 +4837,10 @@ typedef char recomp_layout_pc[offsetof(GuestContext, pc) == 256 ? 1 : -1];
 typedef char recomp_layout_svc[offsetof(GuestContext, pending_svc) == 304 ? 1 : -1];
 typedef char recomp_layout_vreg[offsetof(GuestContext, vreg) == 312 ? 1 : -1];
 typedef char recomp_layout_tpidr[offsetof(GuestContext, tpidr_el0) == 824 ? 1 : -1];
+typedef char recomp_layout_fpcr[offsetof(GuestContext, fpcr) == 848 ? 1 : -1];
+typedef char recomp_layout_fpsr[offsetof(GuestContext, fpsr) == 856 ? 1 : -1];
 typedef char recomp_layout_host[offsetof(GuestContext, host_mem) == 832 ? 1 : -1];
+typedef char recomp_layout_chain[offsetof(GuestContext, chain_budget) == 864 ? 1 : -1];
 typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 1 : -1];
 
 /* Where this module is actually loaded in the guest's address space.
@@ -2382,17 +4855,48 @@ extern uint64_t g_module_base;
 
 typedef void (*BlockFn)(GuestContext*);
 BlockFn recomp_lookup(uint64_t pc); void recomp_run(GuestContext* c);
+/* Builds the direct block index. Called once at load, before any
+   guest thread runs. */
+void recomp_build_index(void);
 void recomp_set_flags(GuestContext*,int,uint64_t,uint64_t,uint64_t,int);
 /* High 64 bits of a 64x64 multiply, for SMULH/UMULH. */
 uint64_t recomp_smulh(uint64_t,uint64_t);
 uint64_t recomp_umulh(uint64_t,uint64_t);
 int  recomp_cond(GuestContext*,unsigned);
+/* Guest memory access.
+
+   Defined once per module in recomp_runtime.c rather than inlined here. They
+   resolve the address through the host page table the same way
+   Memory::GetPointerImpl does, falling back to the emulator callback for
+   unmapped, debug or GPU-tracked pages.
+
+   Forcing them inline at every access site was measured and was worse: the
+   generated main image went from 100 MB to 222 MB and the race-phase frame rate
+   dropped 14%. Whatever the call costs, the instruction cache costs more. */
 uint64_t recomp_load8(GuestContext*,uint64_t); uint64_t recomp_load16(GuestContext*,uint64_t);
 uint64_t recomp_load32(GuestContext*,uint64_t); uint64_t recomp_load64(GuestContext*,uint64_t);
 void recomp_store8(GuestContext*,uint64_t,uint64_t); void recomp_store16(GuestContext*,uint64_t,uint64_t);
 void recomp_store32(GuestContext*,uint64_t,uint64_t); void recomp_store64(GuestContext*,uint64_t,uint64_t);
+/* Pair forms, so LDP and STP resolve one address instead of two. */
+void recomp_ldp32(GuestContext*,uint64_t,uint64_t*,uint64_t*);
+void recomp_ldp64(GuestContext*,uint64_t,uint64_t*,uint64_t*);
+void recomp_stp32(GuestContext*,uint64_t,uint64_t,uint64_t);
+void recomp_stp64(GuestContext*,uint64_t,uint64_t,uint64_t);
 void recomp_svc(GuestContext*,unsigned); void recomp_unhandled(GuestContext*,uint32_t,uint64_t);
 void recomp_barrier(void);
+/* AES S-box, forward or inverse. Built on first call. */
+const uint8_t* recomp_aes_sbox(int inverse);
+/* Load-exclusive: marks the address and returns its contents.
+   Store-exclusive: returns 0 on success and 1 if the mark was lost, which is
+   the sense of the status register STXR writes (0 = stored). */
+uint64_t recomp_ldxr(GuestContext* c, uint64_t addr, uint32_t size);
+uint32_t recomp_stxr(GuestContext* c, uint64_t addr, uint32_t size, uint64_t value);
+void recomp_clrex(GuestContext* c);
+/* CNTPCT_EL0: the 19.2 MHz physical counter the guest reads for timing. */
+uint64_t recomp_cntpct(GuestContext* c);
+/* Exclusive pair forms. `size` is the width of one register, 4 or 8. */
+void recomp_ldxp(GuestContext* c, uint64_t addr, uint32_t size, uint64_t* lo, uint64_t* hi);
+uint32_t recomp_stxp(GuestContext* c, uint64_t addr, uint32_t size, uint64_t lo, uint64_t hi);
 /* halted values. 1 is an ordinary stop; 2 asks the host to re-execute the
    current PC on its interpreter fallback because the decoder had no
    translation for the instruction there. */
@@ -2407,13 +4911,41 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
+    if (fastmem || fpx) {
+        // The ABI line stays literal above; ABI 6 replaces it with its own block.
+        static constexpr std::string_view abi5_line = "#define RECOMP_IMAGE_ABI 5\n";
+        text.replace(text.find(abi5_line), abi5_line.size(),
+                     std::string("#define RECOMP_IMAGE_ABI ") + (fastmem ? FastmemAbiH() : FpxAbiH()));
+    }
+    if (fpx) {
+        // After GuestContext, before the include guard closes.
+        static constexpr std::string_view guard_end = "#endif\n";
+        const size_t at = text.rfind(guard_end);
+        text.insert(at, std::string(FpxH()) + FpxH64() + (fpx == 1 ? FpxExactH() : "") +
+                            (fpx == 2 ? "/* FPX1 shadow instrumentation build (never timed). */\n"
+                                        "void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast,\n"
+                                        "    uint64_t exact, uint64_t fpsr_before, uint64_t fpsr_after,\n"
+                                        "    uint64_t a, uint64_t b);\n"
+                                      : ""));
+    }
+    if (fastmem && guard_gen) {
+        static constexpr std::string_view anchor = "void recomp_ic_ivau(GuestContext*,uint64_t,int);\n";
+        text.insert(text.find(anchor) + anchor.size(), GuardGenH());
+    }
+    return text;
 }
 
 inline const char* RuntimeC() {
-    return R"RT(#include "recomp_runtime.h"
+    // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
+    // past that, so it is assembled from two pieces at first use rather than
+    // being a single literal. Adjacent-literal concatenation would not help:
+    // the limit applies to the result as well.
+    static const std::string text = std::string(R"RT(#include "recomp_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* clock()/CLOCKS_PER_SEC for the standalone recomp_cntpct fallback. */
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
@@ -2428,6 +4960,42 @@ inline const char* RuntimeC() {
 #define PATH_SEP '/'
 #endif
 
+/* AES S-box, built once on first use.
+   S(x) = affine(x^-1), and x^-1 is x^254 because x^255 == 1 for non-zero x.
+   Generated rather than tabulated: two 256-byte tables written out as source
+   would be 512 bytes of literal in a runtime already split to stay under
+   MSVC's 16380-byte cap. Checked against FIPS 197 and for round-trip. */
+static uint8_t recomp_gmul(uint8_t a, uint8_t b){
+  uint8_t p=0;
+  while(b){ if(b&1) p^=a; a=(uint8_t)((a<<1)^((a>>7)*0x1B)); b=(uint8_t)(b>>1); }
+  return p;
+}
+static uint8_t recomp_ginv(uint8_t x){
+  uint8_t p=1; int b;
+  if(!x) return 0;
+  for(b=7;b>=0;b--){ p=recomp_gmul(p,p); if((254>>b)&1) p=recomp_gmul(p,x); }
+  return p;
+}
+static uint8_t recomp_rotl8(uint8_t x,int n){ return (uint8_t)((x<<n)|(x>>(8-n))); }
+const uint8_t* recomp_aes_sbox(int inverse){
+  static uint8_t fwd[256], inv[256];
+  static int built = 0;
+  if(!built){
+    int i;
+    for(i=0;i<256;i++){
+      uint8_t b = recomp_ginv((uint8_t)i);
+      fwd[i] = (uint8_t)(b ^ recomp_rotl8(b,1) ^ recomp_rotl8(b,2) ^ recomp_rotl8(b,3)
+                           ^ recomp_rotl8(b,4) ^ 0x63);
+    }
+    for(i=0;i<256;i++){
+      uint8_t b = (uint8_t)(recomp_rotl8((uint8_t)i,1) ^ recomp_rotl8((uint8_t)i,3)
+                            ^ recomp_rotl8((uint8_t)i,6) ^ 0x05);
+      inv[i] = recomp_ginv(b);
+    }
+    built = 1;
+  }
+  return inverse ? inv : fwd;
+}
 static uint8_t* memptr(GuestContext* c, uint64_t va, uint64_t sz){
   uint64_t off=va-c->mem_base_vaddr;
   if(off+sz>c->mem_size) return 0;
@@ -2445,14 +5013,109 @@ static void memstore(GuestContext* c, uint64_t a, uint32_t sz, uint64_t v){
   { uint8_t* p=memptr(c,a,sz); if(p)memcpy(p,&v,sz); }
 }
 
-uint64_t recomp_load8 (GuestContext* c,uint64_t a){return memload(c,a,1);}
-uint64_t recomp_load16(GuestContext* c,uint64_t a){return memload(c,a,2);}
-uint64_t recomp_load32(GuestContext* c,uint64_t a){return memload(c,a,4);}
-uint64_t recomp_load64(GuestContext* c,uint64_t a){return memload(c,a,8);}
-void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,1,v);}
-void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,2,v);}
-void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,4,v);}
-void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){memstore(c,a,8,v);}
+/* Exclusive access.
+
+   Hosted, these go straight to the emulator's exclusive monitor - the same one
+   the fallback JIT uses - so a lock taken by recompiled code is visible to a
+   thread running on the JIT and vice versa.
+
+   Standalone there is exactly one guest thread and nothing else can touch the
+   address, so a single-slot address latch is not an approximation: it gives the
+   same answers a real monitor would. It still tracks the address rather than
+   always succeeding, so code that deliberately fails an STXR (the usual
+   compare-and-swap retry loop) still behaves. */
+static uint64_t g_excl_addr = 0;
+static int g_excl_valid = 0;
+
+uint64_t recomp_ldxr(GuestContext* c, uint64_t addr, uint32_t size){
+  if(c->host_mem && c->host_mem->excl_load) return c->host_mem->excl_load(c->host_mem->user,addr,size);
+  g_excl_addr = addr; g_excl_valid = 1;
+  return memload(c,addr,size);
+}
+
+uint32_t recomp_stxr(GuestContext* c, uint64_t addr, uint32_t size, uint64_t value){
+  if(c->host_mem && c->host_mem->excl_store) return c->host_mem->excl_store(c->host_mem->user,addr,size,value);
+  if(!g_excl_valid || g_excl_addr != addr) return 1;
+  g_excl_valid = 0;
+  memstore(c,addr,size,value);
+  return 0;
+}
+
+void recomp_ldxp(GuestContext* c, uint64_t addr, uint32_t size, uint64_t* lo, uint64_t* hi){
+  if(c->host_mem && c->host_mem->excl_load_pair){
+    c->host_mem->excl_load_pair(c->host_mem->user,addr,size,lo,hi); return;
+  }
+  g_excl_addr = addr; g_excl_valid = 1;
+  *lo = memload(c,addr,size);
+  *hi = memload(c,addr+size,size);
+}
+
+uint32_t recomp_stxp(GuestContext* c, uint64_t addr, uint32_t size, uint64_t lo, uint64_t hi){
+  if(c->host_mem && c->host_mem->excl_store_pair)
+    return c->host_mem->excl_store_pair(c->host_mem->user,addr,size,lo,hi);
+  if(!g_excl_valid || g_excl_addr != addr) return 1;
+  g_excl_valid = 0;
+  memstore(c,addr,size,lo);
+  memstore(c,addr+size,size,hi);
+  return 0;
+}
+
+void recomp_clrex(GuestContext* c){
+  if(c->host_mem && c->host_mem->clear_excl){ c->host_mem->clear_excl(c->host_mem->user); return; }
+  g_excl_valid = 0;
+}
+
+uint64_t recomp_cntpct(GuestContext* c){
+  if(c->host_mem && c->host_mem->read_cntpct) return c->host_mem->read_cntpct(c->host_mem->user);
+  /* Standalone: derive from the host clock at the guest's 19.2 MHz rate. A
+     free-running counter would satisfy code that only measures deltas, but
+     anything converting ticks to seconds would then be wrong by whatever the
+     host happens to run at. */
+  {
+    static uint64_t base_ns = 0;
+    uint64_t now_ns = (uint64_t)(clock() * (1000000000ULL / CLOCKS_PER_SEC));
+    if(!base_ns) base_ns = now_ns;
+    return ((now_ns - base_ns) / 1000ULL) * 19200ULL / 1000ULL;
+  }
+}
+
+/* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
+   does: mask, bounds check, one page-table entry, extract the backing pointer.
+   A null result means unmapped, debug, or GPU-tracked memory, all of which have
+   to go through the emulator callback so the rasterizer is told about the
+   access. Only a real backing pointer is handled here.
+
+   Deliberately not inlined into the generated code. Forcing it inline at every
+   access site was measured: main.dll went from 100 MB to 222 MB and the race
+   phase lost 14%, so whatever the call cost, the instruction cache cost more. */
+static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
+  const RecompHostMem* hm = c->host_mem;
+  uintptr_t raw, p;
+  if(!hm || !hm->page_entries) return 0;
+  va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
+  if(va >= hm->address_space_max) return 0;
+  raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
+                            + (va >> hm->page_bits) * hm->page_entry_stride);
+  p = raw & (uintptr_t)hm->pointer_mask;
+  return p ? (unsigned char*)(p + (uintptr_t)va) : 0;
+}
+
+uint64_t recomp_load8 (GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p) return (uint64_t)*p; return memload(c,a,1);}
+uint64_t recomp_load16(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t v;memcpy(&v,p,2);return (uint64_t)v;} return memload(c,a,2);}
+uint64_t recomp_load32(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t v;memcpy(&v,p,4);return (uint64_t)v;} return memload(c,a,4);}
+uint64_t recomp_load64(GuestContext* c,uint64_t a){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint64_t v;memcpy(&v,p,8);return v;} return memload(c,a,8);}
+void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){*p=(unsigned char)v;return;} memstore(c,a,1,v);}
+void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint16_t t=(uint16_t)v;memcpy(p,&t,2);return;} memstore(c,a,2,v);}
+void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){uint32_t t=(uint32_t)v;memcpy(p,&t,4);return;} memstore(c,a,4,v);}
+void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
+  unsigned char* p=recomp_host_ptr(c,a); if(p){memcpy(p,&v,8);return;} memstore(c,a,8,v);}
 
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable
@@ -2522,7 +5185,44 @@ int recomp_save_write(GuestContext* c, const char* name, const void* data, uint6
   /* Ensure parent dirs exist */
   char parent[1024]; snprintf(parent,sizeof parent,"%s",path);
   char* sl=strrchr(parent,PATH_SEP); if(!sl) sl=strrchr(parent,'/'); if(sl)*sl=0;
-  mkpath(parent);
+)RT") + R"RT(
+/* AES S-box, built once on first use.
+   S(x) = affine(x^-1), and x^-1 is x^254 because x^255 == 1 for non-zero x.
+   Generated rather than tabulated: two 256-byte tables written out as source
+   would be 512 bytes of literal in a runtime already split to stay under
+   MSVC's 16380-byte cap. Checked against FIPS 197 and for round-trip. */
+static uint8_t recomp_gmul(uint8_t a, uint8_t b){
+  uint8_t p=0;
+  while(b){ if(b&1) p^=a; a=(uint8_t)((a<<1)^((a>>7)*0x1B)); b=(uint8_t)(b>>1); }
+  return p;
+}
+static uint8_t recomp_ginv(uint8_t x){
+  uint8_t p=1; int b;
+  if(!x) return 0;
+  for(b=7;b>=0;b--){ p=recomp_gmul(p,p); if((254>>b)&1) p=recomp_gmul(p,x); }
+  return p;
+}
+static uint8_t recomp_rotl8(uint8_t x,int n){ return (uint8_t)((x<<n)|(x>>(8-n))); }
+const uint8_t* recomp_aes_sbox(int inverse){
+  static uint8_t fwd[256], inv[256];
+  static int built = 0;
+  if(!built){
+    int i;
+    for(i=0;i<256;i++){
+      uint8_t b = recomp_ginv((uint8_t)i);
+      fwd[i] = (uint8_t)(b ^ recomp_rotl8(b,1) ^ recomp_rotl8(b,2) ^ recomp_rotl8(b,3)
+                           ^ recomp_rotl8(b,4) ^ 0x63);
+    }
+    for(i=0;i<256;i++){
+      uint8_t b = (uint8_t)(recomp_rotl8((uint8_t)i,1) ^ recomp_rotl8((uint8_t)i,3)
+                            ^ recomp_rotl8((uint8_t)i,6) ^ 0x05);
+      inv[i] = recomp_ginv(b);
+    }
+    built = 1;
+  }
+  return inverse ? inv : fwd;
+}
+)RT" + R"RT(  mkpath(parent);
   FILE* f=fopen(path,"wb");
   if(!f){fprintf(stderr,"[recomp] save write failed: %s\n",path); return 0;}
   fwrite(data,1,(size_t)size,f); fclose(f);
@@ -2755,6 +5455,7 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
+    return text.c_str();
 }
 
 } // namespace suyu::recomp

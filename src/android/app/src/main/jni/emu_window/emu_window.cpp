@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "input_common/drivers/android.h"
+#include "input_common/drivers/tas_input.h"
 #include "input_common/drivers/touch_screen.h"
 #include "input_common/drivers/virtual_amiibo.h"
 #include "input_common/drivers/virtual_gamepad.h"

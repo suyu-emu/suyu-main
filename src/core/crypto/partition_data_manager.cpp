@@ -10,7 +10,6 @@
 #include "common/common_types.h"
 #include "common/hex_util.h"
 #include "common/string_util.h"
-#include "common/swap.h"
 #include "core/crypto/key_manager.h"
 #include "core/crypto/partition_data_manager.h"
 #include "core/crypto/xts_encryption_layer.h"
@@ -66,13 +65,7 @@ PartitionDataManager::PartitionDataManager(const FileSys::VirtualDir& sysdata_di
           FindFileInDirWithNames(sysdata_dir, "BCPKG2-5-Repair-Main"),
           FindFileInDirWithNames(sysdata_dir, "BCPKG2-6-Repair-Sub"),
       }),
-      prodinfo(FindFileInDirWithNames(sysdata_dir, "PRODINFO")),
-      secure_monitor(FindFileInDirWithNames(sysdata_dir, "secmon")),
-      package1_decrypted(FindFileInDirWithNames(sysdata_dir, "pkg1_decr")),
-      secure_monitor_bytes(secure_monitor == nullptr ? std::vector<u8>{}
-                                                     : secure_monitor->ReadAllBytes()),
-      package1_decrypted_bytes(package1_decrypted == nullptr ? std::vector<u8>{}
-                                                             : package1_decrypted->ReadAllBytes()) {
+      prodinfo(FindFileInDirWithNames(sysdata_dir, "PRODINFO")) {
 }
 
 PartitionDataManager::~PartitionDataManager() = default;
@@ -116,14 +109,6 @@ bool PartitionDataManager::HasFuses() const {
 
 FileSys::VirtualFile PartitionDataManager::GetFusesRaw() const {
     return fuses;
-}
-
-std::array<u8, 16> PartitionDataManager::GetSecureBootKey() const {
-    if (!HasFuses())
-        return {};
-    Key128 out{};
-    fuses->Read(out.data(), out.size(), 0xA4);
-    return out;
 }
 
 bool PartitionDataManager::HasKFuses() const {
@@ -244,10 +229,4 @@ FileSys::VirtualFile PartitionDataManager::GetDecryptedProdInfo() const {
     return prodinfo_decrypted;
 }
 
-std::array<u8, 576> PartitionDataManager::GetETicketExtendedKek() const {
-    std::array<u8, 0x240> out{};
-    if (prodinfo_decrypted != nullptr)
-        prodinfo_decrypted->Read(out.data(), out.size(), 0x3890);
-    return out;
-}
 } // namespace Core::Crypto
