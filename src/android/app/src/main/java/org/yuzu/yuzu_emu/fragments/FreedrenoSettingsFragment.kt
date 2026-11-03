@@ -7,33 +7,27 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.fragment.app.Fragment
 import androidx.navigation.fragment.navArgs
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.FreedrenoPresetAdapter
-import org.yuzu.yuzu_emu.adapters.FreedrenoVariableAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentFreedrenoSettingsBinding
 import org.yuzu.yuzu_emu.model.Game
-import org.yuzu.yuzu_emu.utils.NativeFreedrenoConfig
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.FreedrenoScreen
+import org.yuzu.yuzu_emu.utils.FreedrenoPreset
 import org.yuzu.yuzu_emu.utils.FreedrenoPresets
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
-
+import org.yuzu.yuzu_emu.utils.NativeFreedrenoConfig
 
 class FreedrenoSettingsFragment : Fragment() {
-    private var _binding: FragmentFreedrenoSettingsBinding? = null
-    private val binding get() = _binding!!
     private val args by navArgs<FreedrenoSettingsFragmentArgs>()
     private val game: Game? get() = args.game
     private val isPerGameConfig: Boolean get() = game != null
 
-    private lateinit var presetAdapter: FreedrenoPresetAdapter
-    private lateinit var settingsAdapter: FreedrenoVariableAdapter
+    private var variables by mutableStateOf<List<FreedrenoVariable>>(emptyList())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,159 +41,92 @@ class FreedrenoSettingsFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentFreedrenoSettingsBinding.inflate(layoutInflater, container, false)
-        return binding.root
+    ): View = suyuComposeView {
+        FreedrenoScreen(
+            title = getString(
+                if (isPerGameConfig) R.string.freedreno_per_game_title else R.string.freedreno_settings_title
+            ),
+            presets = FreedrenoPresets.ALL_PRESETS,
+            variables = variables,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+            onPreset = ::applyPreset,
+            onDelete = { variable ->
+                NativeFreedrenoConfig.clearFreedrenoEnv(variable.name)
+                loadCurrentSettings()
+            },
+            onAdd = ::addVariable,
+            onClearAll = {
+                NativeFreedrenoConfig.clearAllFreedrenoEnv()
+                showSnackbar(getString(R.string.freedreno_cleared_all))
+                loadCurrentSettings()
+            },
+            onSave = {
+                if (isPerGameConfig) {
+                    NativeFreedrenoConfig.savePerGameConfig(game!!.programIdHex)
+                    showSnackbar(getString(R.string.freedreno_per_game_saved))
+                } else {
+                    NativeFreedrenoConfig.saveFreedrenoConfig()
+                    showSnackbar(getString(R.string.freedreno_saved))
+                }
+            }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-
         NativeFreedrenoConfig.setFreedrenoBasePath(requireContext().cacheDir.absolutePath)
         NativeFreedrenoConfig.initializeFreedrenoConfig()
-
         if (isPerGameConfig) {
             NativeFreedrenoConfig.loadPerGameConfig(game!!.programIdHex)
         } else {
             NativeFreedrenoConfig.reloadFreedrenoConfig()
         }
-
-        setupToolbar()
-        setupAdapters()
         loadCurrentSettings()
-        setupButtonListeners()
-        setupWindowInsets()
-    }
-
-    private fun setupToolbar() {
-        binding.toolbarFreedreno.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
-        binding.toolbarFreedreno.title = getString(
-            if (isPerGameConfig) {
-                R.string.freedreno_per_game_title
-            } else {
-                R.string.freedreno_settings_title
-            }
-        )
-        binding.toolbarFreedreno.subtitle = null
-    }
-
-    private fun setupAdapters() {
-        // Setup presets adapter (horizontal list)
-        presetAdapter = FreedrenoPresetAdapter { preset ->
-            applyPreset(preset)
-        }
-        binding.listFreedrenoPresets.apply {
-            adapter = presetAdapter
-            layoutManager = LinearLayoutManager(requireContext(), LinearLayoutManager.HORIZONTAL, false)
-        }
-        presetAdapter.submitList(FreedrenoPresets.ALL_PRESETS)
-
-        // Setup current settings adapter (vertical list)
-        settingsAdapter = FreedrenoVariableAdapter(requireContext()) { variable, onDelete ->
-            onDelete()
-            loadCurrentSettings() // Refresh list after deletion
-        }
-        binding.listFreedrenoSettings.apply {
-            adapter = settingsAdapter
-            layoutManager = LinearLayoutManager(requireContext())
-        }
     }
 
     private fun loadCurrentSettings() {
         // Load all currently set environment variables
-        val variables = mutableListOf<FreedrenoVariable>()
-
-        // Common variables to check
+        val list = mutableListOf<FreedrenoVariable>()
         val commonVars = listOf(
             "TU_DEBUG", "FD_MESA_DEBUG", "IR3_SHADER_DEBUG",
             "FD_RD_DUMP", "FD_RD_DUMP_FRAMES", "FD_RD_DUMP_TESTNAME",
             "TU_BREADCRUMBS", "FD_DEV_FEATURES"
         )
-
         for (varName in commonVars) {
             if (NativeFreedrenoConfig.isFreedrenoEnvSet(varName)) {
-                val value = NativeFreedrenoConfig.getFreedrenoEnv(varName)
-                variables.add(FreedrenoVariable(varName, value))
+                list.add(FreedrenoVariable(varName, NativeFreedrenoConfig.getFreedrenoEnv(varName)))
             }
         }
-
-        settingsAdapter.submitList(variables)
+        variables = list
     }
 
-    private fun setupButtonListeners() {
-        binding.buttonAddVariable.setOnClickListener {
-            val varName = binding.variableNameInput.text.toString().trim()
-            val varValue = binding.variableValueInput.text.toString().trim()
-
-            if (varName.isEmpty()) {
-                showSnackbar(getString(R.string.freedreno_error_empty_name))
-                return@setOnClickListener
-            }
-
-            if (NativeFreedrenoConfig.setFreedrenoEnv(varName, varValue)) {
-                showSnackbar(getString(R.string.freedreno_variable_added, varName))
-                binding.variableNameInput.text?.clear()
-                binding.variableValueInput.text?.clear()
-                loadCurrentSettings()
-            } else {
-                showSnackbar(getString(R.string.freedreno_error_setting_variable))
-            }
+    private fun addVariable(name: String, value: String): Boolean {
+        if (name.isEmpty()) {
+            showSnackbar(getString(R.string.freedreno_error_empty_name))
+            return false
         }
-
-        binding.buttonClearAll.setOnClickListener {
-            NativeFreedrenoConfig.clearAllFreedrenoEnv()
-            showSnackbar(getString(R.string.freedreno_cleared_all))
+        return if (NativeFreedrenoConfig.setFreedrenoEnv(name, value)) {
+            showSnackbar(getString(R.string.freedreno_variable_added, name))
             loadCurrentSettings()
-        }
-
-        binding.buttonSave.setOnClickListener {
-            if (isPerGameConfig) {
-                NativeFreedrenoConfig.savePerGameConfig(game!!.programIdHex)
-                showSnackbar(getString(R.string.freedreno_per_game_saved))
-            } else {
-                NativeFreedrenoConfig.saveFreedrenoConfig()
-                showSnackbar(getString(R.string.freedreno_saved))
-            }
+            true
+        } else {
+            showSnackbar(getString(R.string.freedreno_error_setting_variable))
+            false
         }
     }
 
-    private fun applyPreset(preset: org.yuzu.yuzu_emu.utils.FreedrenoPreset) {
-        // Clear all first for consistency
+    private fun applyPreset(preset: FreedrenoPreset) {
+        // Clear all first for consistency, then apply every variable in the preset
         NativeFreedrenoConfig.clearAllFreedrenoEnv()
-
-        // Apply all variables in the preset
         for ((varName, varValue) in preset.variables) {
             NativeFreedrenoConfig.setFreedrenoEnv(varName, varValue)
         }
-
         showSnackbar(getString(R.string.freedreno_preset_applied, preset.name))
         loadCurrentSettings()
     }
 
-    private fun setupWindowInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { _, insets ->
-            val barInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = insets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.appbarFreedreno.updateMargins(left = leftInsets, right = rightInsets)
-            binding.scrollFreedreno.updateMargins(left = leftInsets, right = rightInsets)
-            binding.scrollFreedreno.updatePadding(bottom = barInsets.bottom)
-            insets
-        }
-    }
-private fun showSnackbar(message: String) {
-        Snackbar.make(binding.root, message, Snackbar.LENGTH_SHORT).show()
-    }
-
-    override fun onDestroyView() {
-        super.onDestroyView()
-        _binding = null
+    private fun showSnackbar(message: String) {
+        Snackbar.make(requireView(), message, Snackbar.LENGTH_SHORT).show()
     }
 }
 

@@ -22,7 +22,9 @@ import androidx.navigation.fragment.navArgs
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.databinding.FragmentGameInfoBinding
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.GameInfoField
+import org.yuzu.yuzu_emu.ui.compose.screens.GameInfoScreen
 import org.yuzu.yuzu_emu.model.GameVerificationResult
 import org.yuzu.yuzu_emu.model.HomeViewModel
 import org.yuzu.yuzu_emu.utils.GameMetadata
@@ -30,9 +32,6 @@ import org.yuzu.yuzu_emu.utils.ViewUtils.setVisible
 import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
 
 class GameInfoFragment : Fragment() {
-    private var _binding: FragmentGameInfoBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
 
     private val args by navArgs<GameInfoFragmentArgs>()
@@ -52,94 +51,74 @@ class GameInfoFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        _binding = FragmentGameInfoBinding.inflate(inflater)
-        return binding.root
+        val game = args.game
+        val pathString = Uri.parse(game.path).path ?: ""
+        val fields = buildList {
+            add(GameInfoField(R.string.path, pathString))
+            add(GameInfoField(R.string.program_id, game.programIdHex))
+            if (game.developer.isNotEmpty()) {
+                add(GameInfoField(R.string.developer, game.developer))
+            }
+            add(GameInfoField(R.string.version, game.version))
+        }
+        return suyuComposeView {
+            GameInfoScreen(
+                title = game.title,
+                fields = fields,
+                onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+                onCopyField = { copyToClipboard(getString(it.label), it.value) },
+                onCopyAll = {
+                    val details = """
+                        ${game.title}
+                        ${getString(R.string.path)} - $pathString
+                        ${getString(R.string.program_id)} - ${game.programIdHex}
+                        ${getString(R.string.developer)} - ${game.developer}
+                        ${getString(R.string.version)} - ${game.version}
+                    """.trimIndent()
+                    copyToClipboard(game.title, details)
+                },
+                onVerify = ::verifyIntegrity
+            )
+        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(false)
+    }
 
-        binding.apply {
-            toolbarInfo.title = args.game.title
-            toolbarInfo.setNavigationOnClickListener {
-                requireActivity().onBackPressedDispatcher.onBackPressed()
-            }
-
-            val pathString = Uri.parse(args.game.path).path ?: ""
-            path.setHint(R.string.path)
-            pathField.setText(pathString)
-            pathField.setOnClickListener { copyToClipboard(getString(R.string.path), pathString) }
-
-            programId.setHint(R.string.program_id)
-            programIdField.setText(args.game.programIdHex)
-            programIdField.setOnClickListener {
-                copyToClipboard(getString(R.string.program_id), args.game.programIdHex)
-            }
-
-            if (args.game.developer.isNotEmpty()) {
-                developer.setHint(R.string.developer)
-                developerField.setText(args.game.developer)
-                developerField.setOnClickListener {
-                    copyToClipboard(getString(R.string.developer), args.game.developer)
-                }
-            } else {
-                developer.setVisible(false)
-            }
-
-            version.setHint(R.string.version)
-            versionField.setText(args.game.version)
-            versionField.setOnClickListener {
-                copyToClipboard(getString(R.string.version), args.game.version)
-            }
-
-            buttonCopy.setOnClickListener {
-                val details = """
-                    ${args.game.title}
-                    ${getString(R.string.path)} - $pathString
-                    ${getString(R.string.program_id)} - ${args.game.programIdHex}
-                    ${getString(R.string.developer)} - ${args.game.developer}
-                    ${getString(R.string.version)} - ${args.game.version}
-                """.trimIndent()
-                copyToClipboard(args.game.title, details)
-            }
-
-            buttonVerifyIntegrity.setOnClickListener {
-                ProgressDialogFragment.newInstance(
-                    requireActivity(),
-                    R.string.verifying,
-                    true
-                ) { progressCallback, _ ->
-                    val result = GameVerificationResult.from(
-                        NativeLibrary.verifyGameContents(
-                            args.game.path,
-                            progressCallback
-                        )
+    private fun verifyIntegrity() {
+        ProgressDialogFragment.newInstance(
+            requireActivity(),
+            R.string.verifying,
+            true
+        ) { progressCallback, _ ->
+            val result = GameVerificationResult.from(
+                NativeLibrary.verifyGameContents(
+                    args.game.path,
+                    progressCallback
+                )
+            )
+            return@newInstance when (result) {
+                GameVerificationResult.Success ->
+                    MessageDialogFragment.newInstance(
+                        titleId = R.string.verify_success,
+                        descriptionId = R.string.operation_completed_successfully
                     )
-                    return@newInstance when (result) {
-                        GameVerificationResult.Success ->
-                            MessageDialogFragment.newInstance(
-                                titleId = R.string.verify_success,
-                                descriptionId = R.string.operation_completed_successfully
-                            )
 
-                        GameVerificationResult.Failed ->
-                            MessageDialogFragment.newInstance(
-                                titleId = R.string.verify_failure,
-                                descriptionId = R.string.verify_failure_description
-                            )
+                GameVerificationResult.Failed ->
+                    MessageDialogFragment.newInstance(
+                        titleId = R.string.verify_failure,
+                        descriptionId = R.string.verify_failure_description
+                    )
 
-                        GameVerificationResult.NotImplemented ->
-                            MessageDialogFragment.newInstance(
-                                titleId = R.string.verify_no_result,
-                                descriptionId = R.string.verify_no_result_description
-                            )
-                    }
-                }.show(parentFragmentManager, ProgressDialogFragment.TAG)
+                GameVerificationResult.NotImplemented ->
+                    MessageDialogFragment.newInstance(
+                        titleId = R.string.verify_no_result,
+                        descriptionId = R.string.verify_no_result_description
+                    )
             }
-        }
-
-        setInsets()
+        }.show(parentFragmentManager, ProgressDialogFragment.TAG)
     }
 
     private fun copyToClipboard(label: String, body: String) {
@@ -156,22 +135,4 @@ class GameInfoFragment : Fragment() {
             ).show()
         }
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarInfo.updateMargins(left = leftInsets, right = rightInsets)
-            binding.scrollInfo.updateMargins(left = leftInsets, right = rightInsets)
-
-            binding.contentInfo.updatePadding(bottom = barInsets.bottom)
-
-            windowInsets
-        }
 }

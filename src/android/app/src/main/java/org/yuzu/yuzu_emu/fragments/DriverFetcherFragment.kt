@@ -5,15 +5,21 @@ package org.yuzu.yuzu_emu.fragments
 
 import android.os.Bundle
 import androidx.fragment.app.Fragment
+import android.widget.Toast
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.net.toUri
+import java.io.File
+import java.io.FileOutputStream
+import org.yuzu.yuzu_emu.databinding.DialogProgressBinding
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.DriverFetcherScreen
+import org.yuzu.yuzu_emu.utils.FileUtil
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.isVisible
-import androidx.core.view.updatePadding
 import androidx.fragment.app.activityViewModels
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -25,12 +31,9 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.databinding.FragmentDriverFetcherBinding
-import org.yuzu.yuzu_emu.features.fetcher.DriverGroupAdapter
 import org.yuzu.yuzu_emu.model.DriverViewModel
 import org.yuzu.yuzu_emu.model.HomeViewModel
 import org.yuzu.yuzu_emu.utils.GpuDriverHelper
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
 import java.io.IOException
 import java.net.URL
 import java.time.Instant
@@ -39,9 +42,6 @@ import java.time.ZoneId
 import kotlin.getValue
 
 class DriverFetcherFragment : Fragment() {
-    private var _binding: FragmentDriverFetcherBinding? = null
-    private val binding get() = _binding!!
-
     private val client = OkHttpClient()
 
     private val gpuModel: String?
@@ -85,7 +85,8 @@ class DriverFetcherFragment : Fragment() {
         IntRange(900, Int.MAX_VALUE) to "Unsupported"
     )
 
-    private lateinit var driverGroupAdapter: DriverGroupAdapter
+    private var driverGroups by mutableStateOf<List<DriverGroup>>(emptyList())
+    private var loading by mutableStateOf(true)
     private val driverViewModel: DriverViewModel by activityViewModels()
     private val homeViewModel: HomeViewModel by activityViewModels()
 
@@ -129,34 +130,123 @@ class DriverFetcherFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentDriverFetcherBinding.inflate(inflater)
-        binding.badgeRecommendedDriver.text = recommendedDriver
-        binding.badgeGpuModel.text = gpuModel
-
-        return binding.root
+    ): View = suyuComposeView {
+        DriverFetcherScreen(
+            gpuModel = gpuModel,
+            recommendedDriver = recommendedDriver,
+            loading = loading,
+            groups = driverGroups,
+            isInstalled = ::isArtifactInstalled,
+            onInstall = ::installArtifact,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(visible = false)
-        binding.toolbarDrivers.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
-        binding.listDrivers.layoutManager = LinearLayoutManager(context)
-        driverGroupAdapter = DriverGroupAdapter(requireActivity(), driverViewModel)
-        binding.listDrivers.adapter = driverGroupAdapter
-
-        setInsets()
-
         fetchDrivers()
     }
 
-    private fun fetchDrivers() {
-        binding.loadingIndicator.isVisible = true
+    private fun isArtifactInstalled(artifact: Artifact): Boolean = try {
+        // Prefer fast check via ViewModel list; fallback to helper if needed
+        driverViewModel.driverData.any {
+            File(it.first).name.equals(artifact.name, ignoreCase = true)
+        } || GpuDriverHelper.isDriverZipInstalledByName(artifact.name)
+    } catch (_: Exception) {
+        false
+    }
 
-        val driverGroups = arrayListOf<DriverGroup>()
+    private fun installArtifact(artifact: Artifact, onDone: () -> Unit) {
+        val context = requireContext()
+
+        // Double-check just before starting (race-proof)
+        if (GpuDriverHelper.isDriverZipInstalledByName(artifact.name)) {
+            Toast.makeText(context, context.getString(R.string.driver_already_installed), Toast.LENGTH_SHORT).show()
+            onDone()
+            return
+        }
+
+        val dialogBinding = DialogProgressBinding.inflate(LayoutInflater.from(context))
+        dialogBinding.progressBar.isIndeterminate = true
+        dialogBinding.title.text = context.getString(R.string.installing_driver)
+        dialogBinding.status.text = context.getString(R.string.downloading)
+
+        val progressDialog = MaterialAlertDialogBuilder(context)
+            .setView(dialogBinding.root)
+            .setCancelable(false)
+            .create()
+        progressDialog.show()
+
+        CoroutineScope(Dispatchers.Main).launch {
+            try {
+                val request = Request.Builder()
+                    .url(artifact.url)
+                    .header("Accept", "application/octet-stream")
+                    .build()
+
+                val cacheDir = context.externalCacheDir ?: throw IOException(
+                    context.getString(R.string.failed_cache_dir)
+                )
+                cacheDir.mkdirs()
+                val file = File(cacheDir, artifact.name)
+
+                withContext(Dispatchers.IO) {
+                    client.newBuilder()
+                        .followRedirects(true)
+                        .followSslRedirects(true)
+                        .build()
+                        .newCall(request).execute().use { response ->
+                            if (!response.isSuccessful) {
+                                throw IOException("${response.code}")
+                            }
+
+                            response.body?.byteStream()?.use { input ->
+                                FileOutputStream(file).use { output ->
+                                    input.copyTo(output)
+                                }
+                            } ?: throw IOException(context.getString(R.string.empty_response_body))
+                        }
+                }
+
+                if (file.length() == 0L) {
+                    throw IOException(context.getString(R.string.driver_empty))
+                }
+
+                dialogBinding.status.text = context.getString(R.string.installing)
+
+                val driverData = GpuDriverHelper.getMetadataFromZip(file)
+                val driverPath = "${GpuDriverHelper.driverStoragePath}${FileUtil.getFilename(file.toUri())}"
+
+                if (GpuDriverHelper.copyDriverToInternalStorage(file.toUri())) {
+                    driverViewModel.onDriverAdded(Pair(driverPath, driverData))
+
+                    progressDialog.dismiss()
+                    onDone()
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.successfully_installed, driverData.name),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    throw IOException(context.getString(R.string.failed_install_driver, artifact.name))
+                }
+            } catch (e: Exception) {
+                progressDialog.dismiss()
+
+                MaterialAlertDialogBuilder(context)
+                    .setTitle(context.getString(R.string.driver_failed_title))
+                    .setMessage(e.message)
+                    .setPositiveButton(R.string.ok) { dialog, _ -> dialog.cancel() }
+                    .show()
+            }
+        }
+    }
+
+    private fun fetchDrivers() {
+        loading = true
+
+        val fetchedGroups = arrayListOf<DriverGroup>()
 
         repoList.forEach { driver ->
             val name = driver.name
@@ -201,44 +291,23 @@ class DriverFetcherFragment : Fragment() {
                         sort
                     )
 
-                    synchronized(driverGroups) {
-                        driverGroups.add(group)
-                        driverGroups.sortBy {
+                    synchronized(fetchedGroups) {
+                        fetchedGroups.add(group)
+                        fetchedGroups.sortBy {
                             it.sort
                         }
                     }
 
                     withContext(Dispatchers.Main) {
-                        driverGroupAdapter.updateDriverGroups(driverGroups)
+                        driverGroups = fetchedGroups.toList()
 
-                        if (driverGroups.size >= repoList.size) {
-                            binding.loadingIndicator.isVisible = false
+                        if (fetchedGroups.size >= repoList.size) {
+                            loading = false
                         }
                     }
                 }
             }
         }
-    }
-
-    private fun setInsets() = ViewCompat.setOnApplyWindowInsetsListener(
-        binding.root
-    ) { _: View, windowInsets: WindowInsetsCompat ->
-        val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-        val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-        val leftInsets = barInsets.left + cutoutInsets.left
-        val rightInsets = barInsets.right + cutoutInsets.right
-
-        binding.toolbarDrivers.updateMargins(left = leftInsets, right = rightInsets)
-        binding.listDrivers.updateMargins(left = leftInsets, right = rightInsets)
-
-        binding.listDrivers.updatePadding(
-            bottom = barInsets.bottom + resources.getDimensionPixelSize(
-                R.dimen.spacing_bottom_list_fab
-            )
-        )
-
-        windowInsets
     }
 
     data class Artifact(val url: URL, val name: String)

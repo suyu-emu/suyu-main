@@ -224,64 +224,64 @@
     <!-- suyu Theme Colors -->
 
     <!-- Synthwave/Vaporwave Primary Colors -->
-    <color name="neon_primary">#FF0080</color> <!-- Neon magenta -->
-    <color name="neon_primary_variant">#E6006B</color> <!-- Darker magenta -->
-    <color name="neon_secondary">#60D1F6</color> <!-- Electric cyan -->
-    <color name="neon_secondary_variant">#00E6E6</color> <!-- Darker cyan -->
+    <color name="neon_primary">#5EEAD4</color> <!-- Neon magenta -->
+    <color name="neon_primary_variant">#7AEBD9</color> <!-- Darker magenta -->
+    <color name="neon_secondary">#A78BFA</color> <!-- Electric cyan -->
+    <color name="neon_secondary_variant">#C4B5FD</color> <!-- Darker cyan -->
 
     <!-- Background Colors - White -->
-    <color name="neon_background">#FFFFFF</color> <!-- Pure black background -->
-    <color name="neon_surface">#FFFFFF</color> <!-- Card surface -->
-    <color name="neon_surface_variant">#D3D3D3</color> <!-- Elevated surface -->
+    <color name="neon_background">#0B0D12</color> <!-- Pure black background -->
+    <color name="neon_surface">#12151C</color> <!-- Card surface -->
+    <color name="neon_surface_variant">#1A1E28</color> <!-- Elevated surface -->
 
     <!-- Text Colors - High contrast for readability -->
-    <color name="neon_on_background">#000000</color> <!-- Pure black text -->
-    <color name="neon_on_surface">#000000</color> <!-- Pure black text -->
-    <color name="neon_on_primary">#FFFFFF</color> <!-- White on neon -->
-    <color name="neon_on_secondary">#C0C0C0</color> <!-- Milky White on cyan -->
+    <color name="neon_on_background">#ECEFF6</color> <!-- Pure black text -->
+    <color name="neon_on_surface">#ECEFF6</color> <!-- Pure black text -->
+    <color name="neon_on_primary">#04211D</color> <!-- White on neon -->
+    <color name="neon_on_secondary">#1B1233</color> <!-- Milky White on cyan -->
 
     <!-- Synthwave Accent Colors -->
-    <color name="neon_accent_purple">#9D00FF</color> <!-- Electric purple -->
-    <color name="neon_accent_blue">#0080FF</color> <!-- Electric blue -->
-    <color name="neon_accent_orange">#FF8000</color> <!-- Neon orange -->
+    <color name="neon_accent_purple">#A78BFA</color> <!-- Electric purple -->
+    <color name="neon_accent_blue">#93C5FD</color> <!-- Electric blue -->
+    <color name="neon_accent_orange">#FCD34D</color> <!-- Neon orange -->
 
     <!-- Neon Glow Effects -->
-    <color name="neon_glow_pink">#80FF0080</color> <!-- Magenta glow -->
-    <color name="neon_glow_cyan">#8060D1F6</color> <!-- Cyan glow -->
-    <color name="neon_glow_orange">#80FF8000</color> <!-- Orange glow -->
+    <color name="neon_glow_pink">#805EEAD4</color> <!-- Magenta glow -->
+    <color name="neon_glow_cyan">#80A78BFA</color> <!-- Cyan glow -->
+    <color name="neon_glow_orange">#80FCD34D</color> <!-- Orange glow -->
 
     <!-- Neon Border Colors -->
-    <color name="suyu_border">#7c757f</color> <!-- Subtle border -->
-    <color name="suyu_border_light">#948b98</color> <!-- Lighter border -->
-    <color name="suyu_border_gradient_start">#FF0080</color> <!-- Neon magenta -->
-    <color name="suyu_border_gradient_end">#60D1F6</color> <!-- Electric cyan -->
-    <color name="neon_border">#7c757f</color>
-    <color name="neon_border_light">#948b98</color>
-    <color name="neon_border_gradient_start">#FF0080</color>
-    <color name="neon_border_gradient_end">#60D1F6</color>
+    <color name="suyu_border">#2A2F3C</color> <!-- Subtle border -->
+    <color name="suyu_border_light">#3A4152</color> <!-- Lighter border -->
+    <color name="suyu_border_gradient_start">#5EEAD4</color> <!-- Neon magenta -->
+    <color name="suyu_border_gradient_end">#A78BFA</color> <!-- Electric cyan -->
+    <color name="neon_border">#2A2F3C</color>
+    <color name="neon_border_light">#3A4152</color>
+    <color name="neon_border_gradient_start">#5EEAD4</color>
+    <color name="neon_border_gradient_end">#A78BFA</color>
 
     <!-- Synthwave Status Colors -->
-    <color name="neon_error">#FF0040</color> <!-- Neon red -->
-    <color name="neon_success">#00FF80</color> <!-- Neon green -->
-    <color name="neon_warning">#FFFF00</color> <!-- Neon yellow -->
-    <color name="neon_info">#0080FF</color> <!-- Electric blue -->
+    <color name="neon_error">#FF8FA3</color> <!-- Neon red -->
+    <color name="neon_success">#5EEAD4</color> <!-- Neon green -->
+    <color name="neon_warning">#FCD34D</color> <!-- Neon yellow -->
+    <color name="neon_info">#93C5FD</color> <!-- Electric blue -->
 
     <!-- Overlay Colors -->
-    <color name="neon_overlay">#CCFFFFFF</color>
+    <color name="neon_overlay">#CC0B0D12</color>
 
     <!-- Neon Button Colors -->
-    <color name="neon_button_primary_bg">#FF0080</color> <!-- Neon magenta -->
+    <color name="neon_button_primary_bg">#5EEAD4</color> <!-- Neon magenta -->
     <color name="neon_button_secondary_bg">#00000000</color> <!-- Transparent -->
-    <color name="neon_button_secondary_border">#60D1F6</color> <!-- Electric cyan -->
+    <color name="neon_button_secondary_border">#5EEAD4</color> <!-- Electric cyan -->
 
     <!-- Synthwave Card Colors -->
-    <color name="neon_card_background">#F0F0F0</color> <!-- Almost white -->
-    <color name="neon_card_background_elevated">#D8D8D8</color> <!-- Elevated white -->
+    <color name="neon_card_background">#12151C</color> <!-- Almost white -->
+    <color name="neon_card_background_elevated">#1A1E28</color> <!-- Elevated white -->
 
     <!-- Transparent versions for gradients -->
     <color name="neon_transparent">#00000000</color>
-    <color name="neon_primary_transparent">#05FF0080</color>
-    <color name="neon_secondary_transparent">#0500FFFF</color>
+    <color name="neon_primary_transparent">#055EEAD4</color>
+    <color name="neon_secondary_transparent">#05A78BFA</color>
 
     <!-- Common Colors Across All Themes -->
     <color name="yuzu_outlineVariant">#C6C5D0</color>

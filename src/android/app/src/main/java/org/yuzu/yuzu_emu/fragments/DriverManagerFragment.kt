@@ -24,8 +24,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.DriverAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentDriverManagerBinding
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.DriverManagerScreen
 import org.yuzu.yuzu_emu.features.settings.model.Settings
 import org.yuzu.yuzu_emu.features.settings.model.StringSetting
 import org.yuzu.yuzu_emu.features.settings.ui.SettingsSubscreen
@@ -40,9 +42,6 @@ import java.io.File
 import java.io.IOException
 
 class DriverManagerFragment : Fragment() {
-    private var _binding: FragmentDriverManagerBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
     private val driverViewModel: DriverViewModel by activityViewModels()
 
@@ -59,9 +58,44 @@ class DriverManagerFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentDriverManagerBinding.inflate(inflater)
-        return binding.root
+    ): View = suyuComposeView {
+        val drivers by driverViewModel.driverList.collectAsStateWithLifecycle()
+        val showClear by driverViewModel.showClearButton.collectAsStateWithLifecycle()
+        DriverManagerScreen(
+            drivers = drivers,
+            systemDriverTitle = getString(R.string.system_gpu_driver),
+            showUseGlobal = NativeConfig.isPerGameConfigLoaded() && showClear,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+            onUseGlobal = {
+                StringSetting.DRIVER_PATH.global = true
+                driverViewModel.updateDriverList()
+                driverViewModel.showClearButton(false)
+            },
+            onSelect = { position ->
+                driverViewModel.onDriverSelected(position)
+                driverViewModel.showClearButton(!StringSetting.DRIVER_PATH.global)
+                driverViewModel.updateDriverList()
+            },
+            onRemove = { position ->
+                val selected = drivers.indexOfFirst { it.selected }
+                val newSelection = when {
+                    position == selected -> 0
+                    position < selected -> selected - 1
+                    else -> selected
+                }
+                driverViewModel.onDriverRemoved(position, newSelection)
+                driverViewModel.showClearButton(!StringSetting.DRIVER_PATH.global)
+                driverViewModel.updateDriverList()
+            },
+            onInstall = { getDriver.launch(arrayOf("application/zip")) },
+            onFetch = {
+                val action = HomeNavigationDirections.actionGlobalSettingsSubscreenActivity(
+                    SettingsSubscreen.DRIVER_FETCHER,
+                    null
+                )
+                requireView().findNavController().navigate(action)
+            }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
@@ -70,26 +104,7 @@ class DriverManagerFragment : Fragment() {
 
         driverViewModel.onOpenDriverManager(args.game)
         if (NativeConfig.isPerGameConfigLoaded()) {
-            binding.toolbarDrivers.inflateMenu(R.menu.menu_driver_manager)
             driverViewModel.showClearButton(!StringSetting.DRIVER_PATH.global)
-            binding.toolbarDrivers.setOnMenuItemClickListener {
-                when (it.itemId) {
-                    R.id.menu_driver_use_global -> {
-                        StringSetting.DRIVER_PATH.global = true
-                        driverViewModel.updateDriverList()
-                        (binding.listDrivers.adapter as DriverAdapter)
-                            .replaceList(driverViewModel.driverList.value)
-                        driverViewModel.showClearButton(false)
-                        true
-                    }
-
-                    else -> false
-                }
-            }
-
-            driverViewModel.showClearButton.collect(viewLifecycleOwner) {
-                binding.toolbarDrivers.menu.findItem(R.id.menu_driver_use_global).isVisible = it
-            }
         }
 
         driverViewModel.shouldShowDriverShaderDialog.collect(viewLifecycleOwner) { shouldShow ->
@@ -104,32 +119,6 @@ class DriverManagerFragment : Fragment() {
                 DriversLoadingDialogFragment.TAG
             )
         }
-
-        binding.toolbarDrivers.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
-        binding.buttonInstall.setOnClickListener {
-            getDriver.launch(arrayOf("application/zip"))
-        }
-
-        binding.buttonFetch.setOnClickListener {
-            val action = HomeNavigationDirections.actionGlobalSettingsSubscreenActivity(
-                SettingsSubscreen.DRIVER_FETCHER,
-                null
-            )
-            binding.root.findNavController().navigate(action)
-        }
-
-        binding.listDrivers.apply {
-            layoutManager = GridLayoutManager(
-                requireContext(),
-                resources.getInteger(R.integer.grid_columns)
-            )
-            adapter = DriverAdapter(driverViewModel)
-        }
-
-        setInsets()
 
         if (!GpuDriverHelper.supportsCustomDriverLoading()) {
             showDriverWarningDialog()
@@ -148,43 +137,7 @@ class DriverManagerFragment : Fragment() {
 
     private fun refreshDriverList() {
         driverViewModel.reloadDriverData()
-        (binding.listDrivers.adapter as? DriverAdapter)
-            ?.replaceList(driverViewModel.driverList.value)
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarDrivers.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listDrivers.updateMargins(left = leftInsets, right = rightInsets)
-
-            val fabSpacing = resources.getDimensionPixelSize(R.dimen.spacing_fab)
-            binding.buttonInstall.updateMargins(
-                left = leftInsets + fabSpacing,
-                right = rightInsets + fabSpacing,
-                bottom = barInsets.bottom + fabSpacing
-            )
-
-            binding.buttonFetch.updateMargins(
-                left = leftInsets + fabSpacing,
-                right = rightInsets + fabSpacing,
-                bottom = barInsets.bottom + fabSpacing
-            )
-
-            binding.listDrivers.updatePadding(
-                bottom = barInsets.bottom +
-                    resources.getDimensionPixelSize(R.dimen.spacing_bottom_list_fab)
-            )
-
-            windowInsets
-        }
 
     private val getDriver =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { result ->
@@ -223,16 +176,8 @@ class DriverManagerFragment : Fragment() {
                 } else {
                     driverViewModel.onDriverAdded(Pair(driverPath, driverData))
                     withContext(Dispatchers.Main) {
-                        if (_binding != null) {
-                            refreshDriverList()
-                            val adapter = binding.listDrivers.adapter as DriverAdapter
-                            val selectedPosition = adapter.currentList
-                                .indexOfFirst { it.selected }
-                                .let { if (it == -1) 0 else it }
-                            driverViewModel.showClearButton(!StringSetting.DRIVER_PATH.global)
-                            binding.listDrivers
-                                .smoothScrollToPosition(selectedPosition)
-                        }
+                        refreshDriverList()
+                        driverViewModel.showClearButton(!StringSetting.DRIVER_PATH.global)
                     }
                 }
                 return@newInstance Any()

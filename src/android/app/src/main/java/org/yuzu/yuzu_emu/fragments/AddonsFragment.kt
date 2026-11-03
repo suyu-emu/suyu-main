@@ -19,10 +19,13 @@ import androidx.navigation.fragment.navArgs
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.AddonAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentAddonsBinding
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.AddonsScreen
 import org.yuzu.yuzu_emu.model.AddonViewModel
 import org.yuzu.yuzu_emu.model.HomeViewModel
+import org.yuzu.yuzu_emu.model.PatchType
 import org.yuzu.yuzu_emu.utils.AddonUtil
 import org.yuzu.yuzu_emu.utils.FileUtil.copyFilesTo
 import org.yuzu.yuzu_emu.utils.InstallableActions
@@ -31,9 +34,6 @@ import org.yuzu.yuzu_emu.utils.collect
 import java.io.File
 
 class AddonsFragment : Fragment() {
-    private var _binding: FragmentAddonsBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
     private val addonViewModel: AddonViewModel by activityViewModels()
 
@@ -51,29 +51,33 @@ class AddonsFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentAddonsBinding.inflate(inflater)
-        return binding.root
+    ): View = suyuComposeView {
+        val addons by addonViewModel.addonList.collectAsStateWithLifecycle()
+        AddonsScreen(
+            title = getString(R.string.addons_game, args.game.title),
+            addons = addons,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+            onToggle = { patch, checked ->
+                if (PatchType.from(patch.type) == PatchType.Update && checked) {
+                    addonViewModel.enableOnlyThisUpdate(patch)
+                } else {
+                    patch.enabled = checked
+                }
+            },
+            onDelete = { addonViewModel.setAddonToDelete(it) },
+            onInstall = {
+                ContentTypeSelectionDialogFragment().show(
+                    parentFragmentManager,
+                    ContentTypeSelectionDialogFragment.TAG
+                )
+            }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(false)
 
-        binding.toolbarAddons.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
-        binding.toolbarAddons.title = getString(R.string.addons_game, args.game.title)
-
-        binding.listAddons.apply {
-            layoutManager = LinearLayoutManager(requireContext())
-            adapter = AddonAdapter(addonViewModel)
-        }
-
-        addonViewModel.addonList.collect(viewLifecycleOwner) {
-            (binding.listAddons.adapter as AddonAdapter).submitList(it)
-        }
         addonViewModel.showModInstallPicker.collect(
             viewLifecycleOwner,
             resetState = { addonViewModel.showModInstallPicker(false) }
@@ -114,15 +118,6 @@ class AddonsFragment : Fragment() {
         ) { _, _ ->
             installGameUpdate.launch(arrayOf("*/*"))
         }
-
-        binding.buttonInstall.setOnClickListener {
-            ContentTypeSelectionDialogFragment().show(
-                parentFragmentManager,
-                ContentTypeSelectionDialogFragment.TAG
-            )
-        }
-
-        setInsets()
     }
 
     override fun onResume() {
@@ -191,32 +186,5 @@ class AddonsFragment : Fragment() {
                 documents = documents,
                 programId = args.game.programId
             )
-        }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarAddons.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listAddons.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listAddons.updatePadding(
-                bottom = barInsets.bottom +
-                    resources.getDimensionPixelSize(R.dimen.spacing_bottom_list_fab)
-            )
-
-            val fabSpacing = resources.getDimensionPixelSize(R.dimen.spacing_fab)
-            binding.buttonInstall.updateMargins(
-                left = leftInsets + fabSpacing,
-                right = rightInsets + fabSpacing,
-                bottom = barInsets.bottom + fabSpacing
-            )
-
-            windowInsets
         }
 }

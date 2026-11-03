@@ -44,7 +44,14 @@ import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.drawerlayout.widget.DrawerLayout
+import org.yuzu.yuzu_emu.ui.compose.emulation.InGameMenu
+import org.yuzu.yuzu_emu.ui.compose.emulation.InGameMenuState
+import org.yuzu.yuzu_emu.ui.compose.theme.SuyuTheme
 import androidx.drawerlayout.widget.DrawerLayout.DrawerListener
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
@@ -83,6 +90,7 @@ import org.yuzu.yuzu_emu.features.settings.utils.SettingsFile
 import org.yuzu.yuzu_emu.model.DriverViewModel
 import org.yuzu.yuzu_emu.model.EmulationViewModel
 import org.yuzu.yuzu_emu.model.Game
+import org.yuzu.yuzu_emu.ui.compose.games.GameMeta
 import org.yuzu.yuzu_emu.overlay.model.OverlayControl
 import org.yuzu.yuzu_emu.overlay.model.OverlayLayout
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
@@ -143,6 +151,34 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     private var deferGameSetupUntilStopCompletes = false
 
     private var perfStatsRunnable: Runnable? = null
+
+    // Session FPS average shown in the library (Author: Ghael_V - Lemon Switch Emu - Suyu Team)
+    private var fpsSampleSum = 0.0
+    private var fpsSampleCount = 0
+    private val fpsSampleRunnable = object : Runnable {
+        override fun run() {
+            if (emulationViewModel.emulationStarted.value &&
+                !emulationViewModel.isEmulationStopping.value
+            ) {
+                val fps = NativeLibrary.getPerfStats()[1]
+                if (fps > 1.0) {
+                    fpsSampleSum += fps
+                    fpsSampleCount++
+                }
+            }
+            perfStatsUpdateHandler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun flushFpsSamples() {
+        perfStatsUpdateHandler.removeCallbacks(fpsSampleRunnable)
+        val current = game
+        if (current != null && fpsSampleCount >= 10) {
+            GameMeta.recordAverageFps(current, (fpsSampleSum / fpsSampleCount).toFloat())
+        }
+        fpsSampleSum = 0.0
+        fpsSampleCount = 0
+    }
     private var socRunnable: Runnable? = null
     private var isAmiiboPickerOpen = false
     private var amiiboLoadJob: Job? = null
@@ -153,6 +189,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     var shouldUseCustom = false
     private var isQuickSettingsMenuOpen = false
+    private var menuState by mutableStateOf(InGameMenuState())
     private val quickSettings = QuickSettings(this)
 
     private val loadAmiiboLauncher =
@@ -613,6 +650,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        perfStatsUpdateHandler.removeCallbacks(fpsSampleRunnable)
+        perfStatsUpdateHandler.postDelayed(fpsSampleRunnable, 1000)
         if (requireActivity().isFinishing) {
             return
         }
@@ -730,8 +769,10 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
         updateGameTitle()
 
-        binding.inGameMenu.menu.findItem(R.id.menu_quick_settings)?.isVisible =
-            BooleanSetting.ENABLE_QUICK_SETTINGS.getBoolean()
+        menuState = menuState.copy(
+            quickSettingsVisible = BooleanSetting.ENABLE_QUICK_SETTINGS.getBoolean(),
+            overlayVisible = BooleanSetting.SHOW_INPUT_OVERLAY.getBoolean()
+        )
 
         binding.pausedIcon.setOnClickListener {
             if (this::emulationState.isInitialized && emulationState.isPaused) {
@@ -739,29 +780,12 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
             }
         }
 
-        binding.inGameMenu.menu.findItem(R.id.menu_lock_drawer).apply {
-            val lockMode = IntSetting.LOCK_DRAWER.getInt()
-            val titleId = if (lockMode == DrawerLayout.LOCK_MODE_LOCKED_CLOSED) {
-                R.string.unlock_drawer
-            } else {
-                R.string.lock_drawer
-            }
-            val iconId = if (lockMode == DrawerLayout.LOCK_MODE_UNLOCKED) {
-                R.drawable.ic_unlock
-            } else {
-                R.drawable.ic_lock
-            }
+        menuState = menuState.copy(
+            drawerLocked = IntSetting.LOCK_DRAWER.getInt() == DrawerLayout.LOCK_MODE_LOCKED_CLOSED
+        )
 
-            title = getString(titleId)
-            icon = ResourcesCompat.getDrawable(
-                resources,
-                iconId,
-                requireContext().theme
-            )
-        }
-
-        binding.inGameMenu.setNavigationItemSelectedListener {
-            when (it.itemId) {
+        val onMenuItem: (Int) -> Boolean = { itemId ->
+            when (itemId) {
                 R.id.menu_pause_emulation -> {
                     if (emulationState.isPaused) {
                         resumeEmulationFromUi()
@@ -833,22 +857,12 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                     when (IntSetting.LOCK_DRAWER.getInt()) {
                         DrawerLayout.LOCK_MODE_UNLOCKED -> {
                             IntSetting.LOCK_DRAWER.setInt(DrawerLayout.LOCK_MODE_LOCKED_CLOSED)
-                            it.title = resources.getString(R.string.unlock_drawer)
-                            it.icon = ResourcesCompat.getDrawable(
-                                resources,
-                                R.drawable.ic_lock,
-                                requireContext().theme
-                            )
+                            menuState = menuState.copy(drawerLocked = true)
                         }
 
                         DrawerLayout.LOCK_MODE_LOCKED_CLOSED -> {
                             IntSetting.LOCK_DRAWER.setInt(DrawerLayout.LOCK_MODE_UNLOCKED)
-                            it.title = resources.getString(R.string.lock_drawer)
-                            it.icon = ResourcesCompat.getDrawable(
-                                resources,
-                                R.drawable.ic_unlock,
-                                requireContext().theme
-                            )
+                            menuState = menuState.copy(drawerLocked = false)
                         }
                     }
                     binding.inGameMenu.requestFocus()
@@ -867,6 +881,15 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                 }
 
                 else -> true
+            }
+        }
+
+        binding.inGameMenu.setViewCompositionStrategy(
+            ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
+        )
+        binding.inGameMenu.setContent {
+            SuyuTheme {
+                InGameMenu(state = menuState, onItem = { onMenuItem(it) })
             }
         }
 
@@ -964,15 +987,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                 initializeOverlayAutoHide()
 
                 // Re update binding when the specs values get initialized properly
-                binding.inGameMenu.getHeaderView(0).apply {
-                    val titleView = findViewById<TextView>(R.id.text_game_title)
-                    val cpuBackendLabel = findViewById<TextView>(R.id.cpu_backend)
-                    val vendorLabel = findViewById<TextView>(R.id.gpu_vendor)
-
-                    titleView.text = game?.title ?: ""
-                    cpuBackendLabel.text = NativeLibrary.getCpuBackend()
-                    vendorLabel.text = NativeLibrary.getGpuDriver()
-                }
+                menuState = menuState.copy(
+                    title = game?.title ?: "",
+                    cpuBackend = NativeLibrary.getCpuBackend(),
+                    gpuDriver = NativeLibrary.getGpuDriver()
+                )
 
                 val position = IntSetting.PERF_OVERLAY_POSITION.getInt()
                 updateStatsPosition(position)
@@ -1080,10 +1099,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     private fun updateGameTitle() {
         game?.let {
-            binding.inGameMenu.getHeaderView(0).apply {
-                val titleView = findViewById<TextView>(R.id.text_game_title)
-                titleView.text = it.title
-            }
+            menuState = menuState.copy(title = it.title)
         }
     }
 
@@ -1223,44 +1239,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     }
 
     private fun updateQuickOverlayMenuEntry(isVisible: Boolean) {
-        val b = _binding ?: return
-        val item = b.inGameMenu.menu.findItem(R.id.menu_quick_overlay) ?: return
-
-        if (isVisible) {
-            item.title = getString(R.string.emulation_hide_overlay)
-            item.icon = ResourcesCompat.getDrawable(
-                resources,
-                R.drawable.ic_controller_disconnected,
-                requireContext().theme
-            )
-        } else {
-            item.title = getString(R.string.emulation_show_overlay)
-            item.icon = ResourcesCompat.getDrawable(
-                resources,
-                R.drawable.ic_controller,
-                requireContext().theme
-            )
-        }
+        menuState = menuState.copy(overlayVisible = isVisible)
     }
 
     private fun updatePauseMenuEntry(isPaused: Boolean) {
-        val b = _binding ?: return
-        val pauseItem = b.inGameMenu.menu.findItem(R.id.menu_pause_emulation) ?: return
-        if (isPaused) {
-            pauseItem.title = getString(R.string.emulation_unpause)
-            pauseItem.icon = ResourcesCompat.getDrawable(
-                resources,
-                R.drawable.ic_play,
-                requireContext().theme
-            )
-        } else {
-            pauseItem.title = getString(R.string.emulation_pause)
-            pauseItem.icon = ResourcesCompat.getDrawable(
-                resources,
-                R.drawable.ic_pause,
-                requireContext().theme
-            )
-        }
+        menuState = menuState.copy(paused = isPaused)
     }
 
     private fun pauseEmulationAndCaptureFrame() {
@@ -1433,6 +1416,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         super.onDestroyView()
         amiiboLoadJob?.cancel()
         amiiboLoadJob = null
+        flushFpsSamples()
         perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
         socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
         handler.removeCallbacksAndMessages(null)
@@ -1972,7 +1956,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     }
 
     private fun showOverlayOptions() {
-        val anchor = binding.inGameMenu.findViewById<View>(R.id.menu_overlay_controls)
+        val anchor: View = binding.inGameMenu
         val popup = PopupMenu(requireContext(), anchor)
 
         popup.menuInflater.inflate(R.menu.menu_overlay_options, popup.menu)
