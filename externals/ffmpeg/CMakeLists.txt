@@ -4,8 +4,6 @@
 # SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-# TODO(crueter, MaranBr): Externals FFmpeg 8.0
-
 set(FFmpeg_HWACCEL_LIBRARIES)
 set(FFmpeg_HWACCEL_FLAGS)
 set(FFmpeg_HWACCEL_INCLUDE_DIRS)
@@ -31,11 +29,13 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
             --extra-ldflags="-nostdlib"
         )
         set(FFmpeg_IS_CROSS_COMPILING TRUE)
-    # User attempts to do a FFmpeg cross compilation because...
-    # Here we just quickly test against host/system processors not matching
-    # TODO: Test for versions not matching as well?
-    elseif (NOT (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES CMAKE_SYSTEM_PROCESSOR
-    AND CMAKE_HOST_SYSTEM_NAME MATCHES CMAKE_SYSTEM_NAME))
+    # Use CMake's own authoritative cross-compiling flag rather than comparing
+    # CMAKE_HOST_SYSTEM_PROCESSOR/CMAKE_SYSTEM_PROCESSOR by hand: on some native Linux
+    # hosts (e.g. GitHub Actions' Ubuntu runners) CMAKE_HOST_SYSTEM_PROCESSOR comes back
+    # as "unknown" (from `uname -p`) while CMAKE_SYSTEM_PROCESSOR is correctly "x86_64",
+    # which made that comparison spuriously detect a native build as cross-compiling and
+    # pass FFmpeg's configure `--enable-cross-compile --sysroot=""`, breaking the build.
+    elseif (CMAKE_CROSSCOMPILING)
         string(TOLOWER "${CMAKE_SYSTEM_NAME}" FFmpeg_SYSTEM_NAME)
         if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm")
             set(FFmpeg_SYSTEM_NAME "none")
@@ -250,6 +250,10 @@ else()
 
     find_program(BASH_PROGRAM bash REQUIRED)
 
+    # GNU make is called `gmake` on BSD/Solaris (where the system `make` is not GNU make),
+    # but is simply `make` on Linux. Look for either so this works cross-platform.
+    find_program(FFmpeg_MAKE_PROGRAM NAMES gmake make REQUIRED)
+
     # `configure` parameters builds only exactly what yuzu needs from FFmpeg
     # `--disable-vdpau` is needed to avoid linking issues
     set(FFmpeg_CC ${CMAKE_C_COMPILER_LAUNCHER}  ${CMAKE_C_COMPILER})
@@ -274,7 +278,6 @@ else()
                 --enable-pic
                 --cc=${FFmpeg_CC}
                 --cxx=${FFmpeg_CXX}
-                --ld=${CMAKE_LINKER}
                 --extra-cflags=${CMAKE_C_FLAGS}
                 --extra-cxxflags=${CMAKE_CXX_FLAGS}
                 --extra-ldflags=${CMAKE_C_LINK_FLAGS}
@@ -309,7 +312,7 @@ else()
         OUTPUT
             ${FFmpeg_BUILD_LIBRARIES}
         COMMAND
-            gmake ${FFmpeg_MAKE_ARGS}
+            ${FFmpeg_MAKE_PROGRAM} ${FFmpeg_MAKE_ARGS}
         WORKING_DIRECTORY
             ${FFmpeg_BUILD_DIR}
     )

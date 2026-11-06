@@ -14,29 +14,21 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 
 <p align="center">
   <a href="#status">Status</a> |
-  <a href="#static-recompilation">Static recompilation</a> |
-  <a href="#performance">Performance</a> |
-  <a href="docs/releases/v14.1.0.md">Changes in v14.1.0</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
 
 ---
 
-> **Current release: [suyu v14.1.0](https://github.com/suyu-emu/suyu-main/releases/tag/v14.1.0)**
+> **This is the final public release of suyu — v0.04. This repository is a public archive.**
 >
-> [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
-> archive and no further development was planned there. This repository picks it up
-> from commit `d1d09321d7` and continues development, now at **v14.1.0**.
+> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
 >
-> Tagged builds identify their exact release, such as `suyu v14.1.0`.
-> Development snapshots identify their commit and branch. See
-> [PROVENANCE.md](PROVENANCE.md) for the repository lineage.
->
-> The default development branch is `mk8-recomp`. Recompiler work is also maintained in
-> [mk8-recomp](https://github.com/dougchansan/mk8-recomp) — a project statically
-> recompiling Switch titles using this recompiler. General emulator and launcher
-> fixes are maintained here alongside that work.
+> **Note:** a small number of fixes were later pulled in from a community
+> continuation of this codebase, after users reported that installed
+> updates/DLC, service handler registration, and RomFS registration were all
+> broken in the archived build. Those fixes are folded in here as bug fixes to
+> suyu itself; this remains the same final v0.04 release, not new development.
 
 ## About
 
@@ -49,217 +41,9 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-**v14.1.0 corrects NVIDIA pipeline-library rendering and macOS character geometry**,
-following v14.0.1. Versions use major.minor.patch numbering. Official packages are
-built by the [tagged release workflow](https://github.com/suyu-emu/suyu-main/actions/workflows/release.yml),
-which checks platform builds and final package contents before publishing.
+Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
 
-Graphics pipeline libraries and Fast GPU Time are **off by default**. Graphics →
-Advanced exposes the graphics hacks and Vulkan extension controls, supports global
-and per-game settings, and scrolls on smaller windows. Explicit user opt-ins are
-preserved. See the [release notes](docs/releases/v14.1.0.md).
-
-### Released platforms
-
-| Target | Official downloads | Current validation |
-| --- | --- | --- |
-| Windows x86-64 | GUI/CLI ZIP; libretro ZIP | Radeon RX 9070 XT: bounded MK8D/TOTK Static checks with optional graphics settings off and on |
-| Linux x86-64 | Tarball; Ubuntu 24.04 AppImage; libretro tarball | RTX 3090: bounded MK8D/TOTK Static checks; package/source and AppImage startup checks |
-| macOS arm64 | Application ZIP; libretro ZIP | Apple M5: TOTK JIT and MK8D/TOTK native Static opening checks using MoltenVK |
-| Android arm64 | APK; libretro ZIP | Platform build and package checks; real-device gameplay remains unqualified |
-
-[Download v14.1.0](https://github.com/suyu-emu/suyu-main/releases/tag/v14.1.0).
-Project, dependency and AppImage corresponding-source archives accompany the
-downloads. Official packages contain no games, keys or firmware.
-
-iOS has experimental no-JIT source/probe support. FreeBSD and Linux arm64 have
-platform code paths, but none of these has an official package or a qualifying
-job in the current release workflow. Their presence in the source does not imply
-the same support level as the released targets.
-
-Windows Static opening-scene checks passed for Mario Kart 8 Deluxe, Super Mario
-Odyssey, Tears of the Kingdom and Xenoblade Chronicles 3: rendering and input
-response were reviewed, with clean exits and zero JIT transitions. These are
-bounded compatibility checks; see [Performance](#performance) for their FPS scope.
-
-## Static recompilation
-
-**File > Export Game** turns a game into its own package. On Windows, a **Build**
-export is a program with your settings, optional shader cache and automatic
-controller setup, and can be added to Steam directly. Linux and macOS exports are
-Source only. The default Reference package reads your original game file at launch
-using the keys installed in suyu. The optional Portable package copies encrypted
-game, update and DLC files into the local export, bound to the same console's keys;
-it still requires those keys. Keys and firmware are never copied into an export.
-Hybrid and Static exports, including Source output, contain translated game code.
-An export is a local package; official suyu releases contain no game material. See the
-[Export Game guide](docs/user/GameExport.md).
-
-Static and Hybrid execution remain experimental. Windows opening checks cover
-four games; native Linux and macOS checks cover MK8D and TOTK. Full playthroughs,
-additional drivers and runtime-generated game code need further validation.
-Historical measurements are listed separately under [Performance](#performance).
-
-| Mode (in Export Game order) | Purpose |
-|---|---|
-| suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible. |
-| suyu Hybrid JIT + AOT | Static code with JIT fallback. Performance varies by game; compare it with the Dynarmic JIT export. |
-| suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; for a host with Dynarmic entirely absent, build with `-DSUYU_NO_JIT=ON`. |
-
-Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
-
-**Re-export Static and Hybrid games for v14.1.0.** Existing exports embed their own
-CPU/HLE host; updating the GUI alone does not apply these graphics fixes. Generated images use ABI 6 by
-default, with page-table memory access, guard-generation checks and floating-point
-fast paths. Compatibility output can use ABI 5. Automatic title bundles validate
-manifests, image hashes, ABI and instruction bytes. Hosted library launches use the
-current bundle rather than stale detached launchers.
-
-A strict-static MK8D v4.0.0 TAS replay reaches a rendered, controllable race segment with zero JIT fallbacks. Full-race validation remains open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
-
-See [current release notes](docs/releases/v14.1.0.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
-
-## Performance
-
-### v14.1.0 graphics validation
-
-Native Static opening replays completed with normal exits, all four translated
-modules active, zero JIT transitions and zero unresolved imports for MK8D 4.0.0
-(6,001 frames) and TOTK 1.4.3 (12,001 frames) on Linux RTX 3090, Windows Radeon
-RX 9070 XT and macOS Apple M5. Linux checks verified the NVIDIA fix; Windows
-Radeon checks covered the same change as a regression test. The later Mac cases
-also verified the MoltenVK fix. The final Mac-only change rebuilt
-successfully on Windows. These checks reviewed captured rendering and do not
-establish full-game compatibility or a release-to-release performance gain.
-
-On Apple M5, later MK8D race samples were around 60 FPS. TOTK cave samples were
-around 16 FPS with Fast GPU Time off and 9–10 FPS with Medium enabled. These are
-observations from separate functional sessions, not a controlled benchmark.
-Fast GPU Time remains off by default. This MoltenVK driver does not support
-graphics pipeline libraries, so requests use the normal pipeline fallback.
-
-### v14.0.1 functional observations
-
-These Windows Static opening sessions used a Ryzen 9 9950X3D and Radeon RX 9070 XT
-(AMD driver 2.0.395), with pipeline libraries off. These were functional playtests,
-not controlled benchmarks. The following averages include loading, menus and shader activity;
-zero-FPS samples and dips are retained. They describe these sessions and do not
-establish stable frame rates, a JIT comparison or a release-to-release speedup.
-
-| Game | Version | Opening area | Whole-session mean FPS | Minimum FPS |
-| --- | --- | --- | ---: | ---: |
-| Mario Kart 8 Deluxe | 4.0.0 | Mario Kart Stadium | 55.99 | 0 |
-| Super Mario Odyssey | 1.3.0 | Cap Kingdom | 47.16 | 0 |
-| Tears of the Kingdom | 1.4.3 | Beneath Hyrule Castle | 28.14 | 0 |
-| Xenoblade Chronicles 3 | 1.0.0 | Opening battle and Everblight Plain | 27.92 | 0 |
-
-The sampled MK8D race window averaged **59.99 FPS**, with a **59.94 FPS** minimum.
-The reviewed Odyssey gameplay window averaged **56.94 FPS**, with a **2.50 FPS**
-minimum. TOTK and XC3 whole-session medians were **29.98 FPS**. These windows
-have different boundaries; shader creation and system load can still cause
-stutters. The checks confirmed rendering, controls and clean shutdown, rather
-than completion of an entire race or game.
-
-### Historical measurements
-
-- [v0.0.11 performance notes](docs/releases/v0.0.11.md#performance) report MK8D
-  Windows Static improving from 23.7 to 56.1 FPS with the documented compiler
-  and hardware setup.
-- [v0.0.13 notes](docs/releases/v0.0.13.md) report uncapped TOTK 1.4.3 gains from
-  largest-L3-cache affinity on a 9950X3D (about 40% Static and 60% JIT), plus
-  earlier Static and Hybrid improvements.
-
-Those results belong to their recorded builds and settings. They are not new
-v14.1.0 benchmark results. Controlled comparisons need matching games, saves,
-mods, caches and work, with interleaved runs on an idle machine; see
-[the measurement safeguards](docs/static-campaign.md).
-
-### Further development
-
-The main validation gaps are longer races and playthroughs, more GPU/driver
-coverage, real Android hardware, and qualification of experimental platforms.
-Native export packaging beyond Windows and controlled recompiler performance
-comparisons remain areas for further work.
-
-## Changes in recent updates
-
-v14.1.0 fixes corrupted NVIDIA frames when pipeline libraries are enabled and
-stretched character geometry on macOS MoltenVK. v14.0.1 adds safer graphics
-defaults, complete advanced graphics controls and a working Fast GPU Time switch.
-v0.0.14 fixed startup/export-close crashes and Source
-exports with complex title names, corrected release version display, and added
-the Linux AppImage. See the [release history](docs/releases/) for details.
-
-Earlier correctness fixes and recompiler additions include:
-
-### Fixes
-
-- **Installed updates and DLC in NAND were never indexed.** `GetFileAtID` tried
-  eight storage-layout variants but skipped every odd index except 7, so the
-  `.cnmt.nca` suffix was only ever looked for at the cache root — never inside a
-  `000000XX/` directory, which is exactly where meta NCAs are stored and what
-  `InstallEntry` writes. Every meta NCA in NAND was therefore unreachable and no
-  installed update or DLC ever entered the cache, silently: a miss is
-  indistinguishable from nothing being installed, which is why the frontend's
-  installed-title listing reported zero. A second defect behind it let an older
-  update overwrite a newer one, because the metadata map is keyed by title id
-  with no version comparison — now the higher `GetTitleVersion()` wins.
-
-- **Service handler registration dropped most commands.** A
-  `FunctionInfoTyped<T>` array was walked through a `FunctionInfoBase*` with a
-  different member layout. `sizeof()` agrees, so a size assertion passes and
-  tells you nothing, but every element after the first was read from the wrong
-  offset. `IpcController` registered 2 of its 6 handlers;
-  `QueryPointerBufferSize` was among the lost, and it is part of CMIF session
-  setup — so titles stalled in early service initialisation.
-
-- **RomFS registration was silently dropped.** `emplace` where
-  `insert_or_assign` was meant, so re-registration kept the stale entry and the
-  title panicked on boot.
-
-- **AOT image dispatch resolved every PC to the wrong module.** Double base
-  subtraction made every lookup underflow, and a four-entry module table
-  mismapped any title with more than one subsdk.
-
-- **The AOT exporter read the base ExeFS, not the update's.** `PatchManager`
-  replaces the ExeFS wholesale when an update is present, so the exported image
-  diverged from live execution on any updated title.
-
-### Additions
-
-- **AArch64 → C recompiler work.** Exclusives now route through
-  `Core::ExclusiveMonitor` (previously a plain load/store with `STXR` always
-  reporting success, which makes every compare-and-swap non-atomic under real
-  threads); FPCR/FPSR are modelled; the counter and `CTR_EL0` are read from the
-  emulator's own sources so the two engines cannot disagree across a transition.
-  Plus EXTR/ROR, ADC/SBC, LDPSW, exclusive pair forms, PRFM, and the DC
-  cache-maintenance family.
-
-- **A build with no dynamic recompiler in it.** `-DSUYU_NO_JIT=ON` drops
-  dynarmic from every target. The exclusive monitor, which every process builds
-  regardless of engine and which dynarmic previously owned the only
-  implementation of, now has a standalone one; `ArmRecomp` holds the
-  `Core::ExclusiveMonitor` interface rather than dynarmic's implementation of
-  it. See [Static recompilation](#static-recompilation).
-
-- **Static and runtime coverage instrumentation** — per-module JSON of
-  emitted/unhandled counts, and runtime histograms of blocks executed,
-  transitions by cause, unimplemented opcodes and SVCs.
-
-- **`suyu-cmd --probe-isa-list`** reports each title's CPU architecture without
-  booting it, reading the update's NPDM as well as the base's. An update can
-  change the answer: a title can ship a 32-bit base and a later 64-bit update.
-
-- **Diagnostics** — the NPDM log line carries a content hash, because size is not
-  an identity - two updates of one title can share a `main.npdm` size while
-  differing in architecture - and `PatchExeFS` names which provider slot
-  answered for an update.
-
-Full change set:
-
-```
-git diff d1d09321d7ab84252291e05b3efbc8a8dfa57481..mk8-recomp
-```
+Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
 
 ## Legal Notice
 

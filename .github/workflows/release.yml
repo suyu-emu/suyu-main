@@ -302,9 +302,110 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Package-policy validation failed for the Windows archive' }
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ matrix.variant }}
-          path: ${{ matrix.archive }}
-          if-no-files-found: error
+          name: windows
+          path: suyu-windows-x64.zip
+
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools \
+            qt6-base-dev qt6-base-private-dev \
+            qt6-multimedia-dev qt6-tools-dev qt6-svg-dev qt6-webengine-dev \
+            qt6-charts-dev \
+            libssl-dev libusb-1.0-0-dev libpulse-dev \
+            libvulkan-dev gamemode-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxkbcommon-dev libxtst-dev \
+            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
+            libegl-dev libdrm-dev libgbm-dev \
+            nasm autoconf pkg-config libva-dev libvdpau-dev \
+            libboost-all-dev file
+      - name: Configure
+        run: |
+          cmake --version
+          set -o pipefail
+          # Build FFmpeg statically from source (-DYUZU_USE_EXTERNAL_FFMPEG=ON) instead of
+          # linking Ubuntu's system FFmpeg, and link Boost statically too
+          # (-DBoost_USE_STATIC_LIBS=ON): a binary dynamically linked against Ubuntu's
+          # libavcodec/libavutil/libboost_*/etc. sonames won't run on other distros (e.g.
+          # Fedora) that ship different versions of these libraries with incompatible sonames.
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_EXTERNAL_FFMPEG=ON -DBoost_USE_STATIC_LIBS=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-linux
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu suyu-cmd -j4
+      - name: Package
+        run: |
+          # Flat AppDir layout (binary/desktop-file/icon all next to each other) rather than
+          # a usr/bin,usr/share tree: linuxdeployqt auto-switches to a stricter "FHS-like" mode
+          # for the latter that expects a real system root and silently exits otherwise.
+          rm -rf _pkg && mkdir -p _pkg
+          cp build/bin/suyu _pkg/
+          cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
+          cp dist/dev.suyu_emu.suyu.desktop _pkg/
+          cp dist/qt_themes/default/icons/256x256/suyu.png _pkg/dev.suyu_emu.suyu.png
+
+          # Bundle Qt (and its own risky transitive deps like ICU/glib/pcre, whose sonames are
+          # just as version-locked as FFmpeg's/Boost's) next to the binary with linuxdeployqt,
+          # instead of relying on the target distro's system Qt6: Ubuntu's Qt6 packages and
+          # Fedora's can differ enough in practice that we'd rather ship a known-good Qt than
+          # assume compatibility. It patches RUNPATH to $ORIGIN-relative paths and writes a
+          # qt.conf, so _pkg/suyu keeps working when the tarball is extracted anywhere and run
+          # directly (no AppImage runtime/FUSE needed for this, and no system Qt needed either).
+          #
+          # linuxdeployqt also unconditionally collects each bundled library's copyright file
+          # starting from usr/share/doc/libc6/copyright *relative to the AppDir*, and silently
+          # exits(1) with no error message if that doesn't exist - create it as a marker first.
+          mkdir -p _pkg/usr/share/doc/libc6
+          cp /usr/share/doc/libc6/copyright _pkg/usr/share/doc/libc6/copyright
+
+          # Pinned to release 11 (not the "continuous" tag) for reproducibility.
+          wget -q https://github.com/probonopd/linuxdeployqt/releases/download/11/linuxdeployqt-continuous-x86_64.AppImage -O linuxdeployqt.AppImage
+          chmod +x linuxdeployqt.AppImage
+          ./linuxdeployqt.AppImage --appimage-extract
+          ./squashfs-root/AppRun _pkg/dev.suyu_emu.suyu.desktop \
+            -qmake=/usr/bin/qmake6 \
+            -executable=_pkg/suyu-cmd \
+            -bundle-non-qt-libs -no-translations -unsupported-allow-new-glibc -verbose=2
+
+          tar -czf suyu-linux-x64.tar.gz -C _pkg .
+
+          # Also package the same AppDir as a single-file AppImage for convenience. Running an
+          # AppImage directly needs FUSE (libfuse2), which some distros - Fedora among them -
+          # don't ship by default; the tarball above stays as a guaranteed-to-work fallback for
+          # that case (or use `./suyu-linux-x64.AppImage --appimage-extract-and-run`, which
+          # doesn't need FUSE either).
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          rm -rf squashfs-root
+          ./appimagetool.AppImage --appimage-extract
+          # Pre-fetch the runtime instead of letting appimagetool download it mid-build.
+          wget -q https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 -O runtime-x86_64
+          ARCH=x86_64 ./squashfs-root/AppRun --runtime-file runtime-x86_64 _pkg suyu-linux-x64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            suyu-linux-x64.tar.gz
+            suyu-linux-x64.AppImage
 
   build-macos:
     if: github.event.deleted != true
@@ -387,8 +488,73 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: out/suyu-macos-arm64.zip
-          if-no-files-found: error
+          path: suyu-macos-arm64.tar.gz
+
+  build-freebsd:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y cmake ninja qt6-base qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
+          run: |
+            f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+            if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+              printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+            fi
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+            cmake --build build --target suyu suyu-cmd -j4
+            rm -rf _pkg && mkdir _pkg
+            cp build/bin/suyu _pkg/
+            cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
+            tar -czf suyu-freebsd-x64.tar.gz -C _pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd
+          path: suyu-freebsd-x64.tar.gz
+
+  build-android:
+    name: Android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '17'
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+      - name: Build APKs
+        working-directory: src/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleLegacyRelease assembleMainlineRelease assembleChromeOSRelease assembleGenshinSpoofRelease --stacktrace
+      - name: Collect APKs
+        run: |
+          rm -rf _pkg && mkdir _pkg
+          find src/android -name '*.apk' -exec cp {} _pkg/ \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: _pkg/*.apk
 
   build-libretro:
     if: github.event.deleted != true
@@ -537,80 +703,60 @@ jobs:
           path: ${{ matrix.archive }}
           if-no-files-found: error
 
-  build-android:
-    if: github.event.deleted != true
-    name: Android (arm64)
+  build-libretro-android:
+    name: Libretro Android
     runs-on: ubuntu-24.04
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
-          fetch-depth: 0
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: Install Android SDK packages
+      - name: Init submodules
         run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" "platforms;android-36" "ndk;28.2.13676358" "cmake;3.31.6"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools nasm
-      - name: Build APK
-        # Signed with the release key when the ANDROID_KEYSTORE_* secrets are
-        # set; otherwise with the public test key in the repository.
-        env:
-          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          GIT_TAG_NAME: ${{ github.ref_name }}
+          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
         run: |
-          if [ -z "$ANDROID_KEYSTORE_B64" ]; then
-            unset ANDROID_KEYSTORE_B64 ANDROID_KEYSTORE_PASS ANDROID_KEY_ALIAS
-            echo "::warning::No release keystore secret; the APK is signed with the public test key."
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
           fi
-          sh .ci/android/build.sh -t standard -b Release
-          mkdir -p out
-          cp artifacts/app-mainline-release.apk out/suyu-android-arm64.apk
-      - name: Build libretro core
-        # Reuses the NDK configuration Gradle generated for the APK, switched to
-        # the libretro core (no app JNI glue, OpenSSL built with no-asm).
+      - name: Install native deps
         run: |
-          cache="$(find src/android/app/.cxx -path '*arm64-v8a/CMakeCache.txt' -print -quit)"
-          test -n "$cache"
-          dir="$(dirname "$cache")"
-          CMAKE="$ANDROID_HOME/cmake/3.31.6/bin/cmake"
-          "$CMAKE" -S . -B "$dir" \
-            -DSUYU_BUILD_LIBRETRO_CORE=ON -DSUYU_ANDROID_LIBRETRO=ON \
-            -DYUZU_USE_BUNDLED_OPENSSL=OFF
-          "$CMAKE" --build "$dir" --target suyu_libretro
-          core="$(find src/android/app -name suyu_libretro.so -path '*arm64-v8a*' -print -quit)"
-          test -n "$core"
-          mkdir -p _pkg
-          "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-            --strip-debug -o _pkg/suyu_libretro_android.so "$core"
-          # The APK itself is left unchanged: it does not carry the license
-          # notices; the release ships THIRD-PARTY-NOTICES.txt in the other
-          # packages and the dependency-sources asset.
-          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
-          (cd _pkg && zip -qr ../out/suyu-libretro-android-arm64.zip .)
-      - name: Validate package policy
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+      - name: Install Android NDK
         run: |
-          python3 tools/package_policy/scan_release.py --kind android-apk out/suyu-android-arm64.apk
-          python3 tools/package_policy/scan_release.py --kind libretro-android out/suyu-libretro-android-arm64.zip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-libretro-android
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu_libretro -j4
+      - name: Package
+        run: |
+          rm -rf _pkg && mkdir _pkg
+          find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
+          tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
       - uses: actions/upload-artifact@v4
         with:
-          name: android
-          path: |
-            out/suyu-android-arm64.apk
-            out/suyu-libretro-android-arm64.zip
-          if-no-files-found: error
+          name: libretro-android
+          path: suyu-libretro-core-android-arm64.tar.gz
 
-  source:
-    if: github.event.deleted != true
-    name: Source archive
+  release:
+    name: Publish Release
+    if: always()
+    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
