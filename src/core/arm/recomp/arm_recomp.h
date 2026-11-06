@@ -21,7 +21,7 @@ namespace Core {
 
 class System;
 class DynarmicExclusiveMonitor;
-class ExclusiveMonitor;
+class ArmRecompProcessState;
 
 /**
  * Signature of a recompiled block produced by suyu::recomp::EmitProject.
@@ -39,6 +39,11 @@ struct RecompGuestRegs {
 
 using RecompBlockFn = void (*)(void*);
 using RecompLookupFn = RecompBlockFn (*)(u64 pc);
+constexpr std::size_t RecompBuildIdSize = 0x20;
+constexpr std::size_t RecompSha256Size = 0x20;
+using RecompBuildIdFn = const u8* (*)();
+using RecompTextHashFn = const u8* (*)();
+using RecompTextSizeFn = u64 (*)();
 
 /**
  * Registers the lookup function of a loaded recompiled image.
@@ -97,19 +102,26 @@ RecompFpxLayout GetRecompFpxLayout();
 void SetRecompFpxReady(bool ready);
 bool IsRecompFpxReady();
 
-/// Called once per loaded module when a process starts, so each recompiled
-/// image can be told where its module actually landed. Addresses baked in by
-/// the static pass are module-relative - the loader picks the real base at run
-/// time - so without this every pointer the guest computes is short by that
-/// base and lands near null.
-/// `index` is the module's position in load order, lowest base first, and
-/// `build_id` its build ID as 64 lower-case hex digits (empty if unknown). The
-/// build ID is what identifies a module: names do not (a game's main NSO is
-/// named after the game, "cross2_Release.nss", its others "nnSdk" and
-/// "multimedia"), and neither does a position among the images, because an
-/// export may leave modules out. See RecompGaps::MatchImage.
-using RecompBaseFn = void (*)(size_t index, const char* module, const char* build_id, u64 base);
-void SetRecompBaseSetter(RecompBaseFn setter);
+/// Identifies each loaded NSO by its immutable 32-byte build ID, mapped-text
+/// size, and live-text SHA-256. A true return stages either one unique matching
+/// image or, where allowed below, an explicit JIT-fallback entry. Matching image
+/// bases are published only when the complete batch has been accepted; a
+/// rejected batch fails closed before guest memory is modified.
+///
+/// `index`, `count`, and `module` describe one ordered batch. A binder must not
+/// publish any matched module bases until all `count` loaded identities have
+/// been examined, so a rejected batch cannot expose a partially bound image
+/// set. In a multi-NSO batch, a loaded NSO with no available recompiled image
+/// may be accepted as an explicit JIT-fallback entry; a single-NSO batch must
+/// match, and matched images must remain unique within the batch.
+/// `index` and `module` are otherwise diagnostic hints, not identities:
+/// filenames and embedded module names routinely differ, while load order is
+/// not sufficient to distinguish two unrelated single-module titles.
+using RecompBindFn = bool (*)(std::size_t index, std::size_t count, const char* module, u64 base,
+                               const u8* build_id, std::size_t build_id_size,
+                               const u8* text_sha256, std::size_t text_sha256_size,
+                               u64 text_size);
+void SetRecompBinder(RecompBindFn binder);
 
 /// Called once per process after the base setter has seen every loaded module
 /// and before the first block runs. Logs any registered image left without a
@@ -165,6 +177,16 @@ RecompExecutionStats GetRecompExecutionStats();
 std::array<u64, 4> GetRecompCurrentPcs();
 
 /**
+ * Creates the initialization state shared by every ArmRecomp core belonging
+ * to one guest process.
+ *
+ * The definition stays private to the backend; KProcess owns one handle and
+ * passes it to each core so module registration and relocation happen once
+ * for that process rather than once per core (or once globally).
+ */
+std::shared_ptr<ArmRecompProcessState> CreateArmRecompProcessState();
+
+/**
  * CPU backend that executes statically recompiled AArch64 rather than JITing
  * it.
  *
@@ -192,7 +214,8 @@ public:
     /// debugger that is not attached and the game hangs on a black screen with
     /// no forward progress.
     explicit ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup,
-                       Kernel::KProcess* process, ExclusiveMonitor* exclusive_monitor,
+                       std::shared_ptr<ArmRecompProcessState> process_state,
+                       Kernel::KProcess* process, DynarmicExclusiveMonitor* exclusive_monitor,
                        std::size_t core_index);
     ~ArmRecomp() override;
 
@@ -224,11 +247,11 @@ friend bool PrepareRecompProcess(Kernel::KProcess&, const RecompModules&);
 private:
     /// Builds the JIT fallback if needed and marks this thread as running on
     /// it. Returns false when no JIT can be built (no process/monitor).
-    bool EnterFallback();
-    /// Runs the JIT fallback for one scheduling slice, syncing guest state in
-    /// and back out, and returns to recompiled execution once the PC is covered
-    /// again.
-    HaltReason RunFallback(Kernel::KThread* thread);
+    bool EnterFallback(Kernel::KThread* thread);
+    /// Runs the JIT fallback, syncing guest state in and back out. A full
+    /// scheduling slice returns to recompiled execution once the PC is covered
+    /// again; single-step mode executes exactly one JIT instruction.
+    HaltReason RunFallback(Kernel::KThread* thread, bool single_step = false);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

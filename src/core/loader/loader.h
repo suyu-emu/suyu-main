@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <iosfwd>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -336,7 +338,12 @@ public:
         return ResultStatus::ErrorNotImplemented;
     }
 
-    using Modules = std::map<VAddr, std::string>;
+    struct NsoModuleInfo {
+        std::string name;
+        std::array<u8, 0x20> build_id{};
+    };
+
+    using Modules = std::map<VAddr, NsoModuleInfo>;
 
     virtual ResultStatus ReadNSOModules(Modules& modules) {
         return ResultStatus::ErrorNotImplemented;

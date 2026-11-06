@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <atomic>
 #include <array>
-#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -13,14 +12,16 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <regex>
-#include <set>
-#include <sstream>
-#include <stdexcept>
 #include <string>
-#include <stop_token>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <fmt/ostream.h>
 #include <nlohmann/json.hpp>
@@ -202,60 +203,12 @@ struct SuyuRecompStaticModule {
     const char* name;
     void (*(*lookup)(u64))(void*);
     void (*set_base)(u64);
-    void (*run_slice)(void*);
-    unsigned (*image_abi)();
+    const u8* (*build_id)();
+    const u8* (*text_sha256)();
+    u64 (*text_size)();
 };
 #ifdef SUYU_CMD_STATIC_RECOMP
-const SuyuRecompStaticModule* suyu_recomp_static_modules_v4(unsigned* count);
-// Each registered module's build ID (lower-case hex), parallel to the module
-// list, so an image is bound to the loaded module it was built from rather
-// than to a position. Registrations from before it have none; under MSVC (and
-// so in the export build kit, whose host objects are linked against any
-// export's registry) a default that reports none stands in for the missing
-// symbol, and other compilers are told by suyu_cmd/CMakeLists.txt.
-#ifdef _MSC_VER
-const char* const* suyu_recomp_static_build_ids_v1_absent(unsigned* count) {
-    *count = 0;
-    return nullptr;
-}
-#pragma comment(linker, "/alternatename:suyu_recomp_static_build_ids_v1=suyu_recomp_static_build_ids_v1_absent")
-#ifndef SUYU_RECOMP_BUILD_IDS_V1
-#define SUYU_RECOMP_BUILD_IDS_V1 1
-#endif
-#endif
-#ifdef SUYU_RECOMP_BUILD_IDS_V1
-const char* const* suyu_recomp_static_build_ids_v1(unsigned* count);
-#endif
-#ifdef SUYU_RECOMP_GUARD_V2
-int suyu_recomp_static_guard_v2(unsigned version);
-#endif
-#ifdef SUYU_RECOMP_FASTMEM_V1
-// ABI 6 registrations: 1 only if every module reports FM1 and accepts this
-// host's layout (see Core::GetRecompFastmemLayout).
-int suyu_recomp_static_fastmem_v1(u32 page_bits, u32 stride_log2, u64 pointer_mask,
-                                  u32 off_table, u32 off_limit);
-#endif
-#ifdef SUYU_RECOMP_FEATURES_V1
-// ABI 6 registrations: the OR of every module's recomp_image_features().
-unsigned suyu_recomp_static_features_v1(void);
-#endif
-#ifdef SUYU_RECOMP_GUARD_GEN_V1
-// ABI 6 GG1 registrations: every module's recomp_image_guard_gen_v1 result, in
-// load order. Returns the number filled, or 0 if any module refused.
-struct SuyuRecompGuardGenModule {
-    u32* word;
-    const u64* base;
-    u64 code_lo;
-    u64 code_end;
-};
-unsigned suyu_recomp_static_guard_gen_v1(u32 host_version, SuyuRecompGuardGenModule* out,
-                                         unsigned max);
-#endif
-#ifdef SUYU_RECOMP_FPX_V1
-// FPX1 registrations: nonzero (the modules' recomp_image_fpx_v1 answer) only if
-// every module reports FPX1 and accepts this host's view (Core::GetRecompFpxLayout).
-unsigned suyu_recomp_static_fpx_v1(u32 off_fpcr, u32 off_fpsr, u64 inhibit_bit);
-#endif
+const SuyuRecompStaticModule* suyu_recomp_static_modules_v2(unsigned* count);
 #endif
 }
 
@@ -290,13 +243,76 @@ static void PrintHelp(const char* argv0) {
                  "-l, "
                  "--applet-params="
                  "\"program_id,applet_id,applet_type,launch_type,prog_index,prev_prog_index\"\n"
-                 "                      Numerical parameters for launching an applet. If no\n"
+                 "                      Decimal parameters for launching an applet. If no\n"
                  "                      game is provided, then the applet will launch off of\n"
                  "                      the applet_id.\n";
 }
 
 static void PrintVersion() {
     std::cout << "suyu" << Common::g_scm_branch << " " << Common::g_scm_desc << std::endl;
+}
+
+template <typename T>
+static bool ParseDecimalInteger(std::string_view text, T& value) {
+    if (text.empty()) {
+        return false;
+    }
+
+    T parsed{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed, 10);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        return false;
+    }
+
+    value = parsed;
+    return true;
+}
+
+static std::optional<Service::AM::FrontendAppletParameters> ParseAppletParameters(
+    std::string_view text) {
+    std::array<std::string_view, 6> fields{};
+    std::size_t offset{};
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        const std::size_t separator = text.find(',', offset);
+        if ((i + 1 < fields.size() && separator == std::string_view::npos) ||
+            (i + 1 == fields.size() && separator != std::string_view::npos)) {
+            return std::nullopt;
+        }
+
+        const std::size_t end = separator == std::string_view::npos ? text.size() : separator;
+        fields[i] = text.substr(offset, end - offset);
+        offset = end + 1;
+    }
+
+    u64 program_id{};
+    u32 applet_id{};
+    s32 applet_type{};
+    s32 launch_type{};
+    s32 program_index{};
+    s32 previous_program_index{};
+    if (!ParseDecimalInteger(fields[0], program_id) ||
+        !ParseDecimalInteger(fields[1], applet_id) ||
+        !ParseDecimalInteger(fields[2], applet_type) ||
+        !ParseDecimalInteger(fields[3], launch_type) ||
+        !ParseDecimalInteger(fields[4], program_index) ||
+        !ParseDecimalInteger(fields[5], previous_program_index) ||
+        program_id == 0 || applet_id == static_cast<u32>(Service::AM::AppletId::None) ||
+        program_index < 0 ||
+        applet_type < static_cast<s32>(Service::AM::AppletType::Application) ||
+        applet_type > static_cast<s32>(Service::AM::AppletType::SystemApplet) ||
+        launch_type < static_cast<s32>(Service::AM::LaunchType::FrontendInitiated) ||
+        launch_type > static_cast<s32>(Service::AM::LaunchType::ApplicationInitiated)) {
+        return std::nullopt;
+    }
+
+    return Service::AM::FrontendAppletParameters{
+        .program_id = program_id,
+        .applet_id = static_cast<Service::AM::AppletId>(applet_id),
+        .applet_type = static_cast<Service::AM::AppletType>(applet_type),
+        .launch_type = static_cast<Service::AM::LaunchType>(launch_type),
+        .program_index = program_index,
+        .previous_program_index = previous_program_index,
+    };
 }
 
 static void OnStateChanged(const Network::RoomMember::State& state) {
@@ -407,6 +423,103 @@ void SaveNativeControls() {
         g_sdl_config->SaveAllValues();
     }
 }
+
+#ifdef SUYU_CMD_STATIC_RECOMP
+static std::filesystem::path GetStaticExportDirectory() {
+#ifdef _WIN32
+    wchar_t executable_path[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable_path,
+                                            static_cast<DWORD>(std::size(executable_path)));
+    if (length == 0 || length >= std::size(executable_path)) {
+        return {};
+    }
+    return std::filesystem::path{executable_path}.parent_path();
+#elif defined(__linux__)
+    std::error_code ec;
+    const auto executable_path = std::filesystem::canonical("/proc/self/exe", ec);
+    return ec ? std::filesystem::path{} : executable_path.parent_path();
+#elif defined(__APPLE__)
+    uint32_t path_size{};
+    if (_NSGetExecutablePath(nullptr, &path_size) != -1 || path_size == 0) {
+        return {};
+    }
+    std::vector<char> executable_path(path_size);
+    if (_NSGetExecutablePath(executable_path.data(), &path_size) != 0) {
+        return {};
+    }
+    std::error_code ec;
+    const auto canonical_path =
+        std::filesystem::weakly_canonical(std::filesystem::path{executable_path.data()}, ec);
+    return ec ? std::filesystem::path{} : canonical_path.parent_path();
+#else
+    return {};
+#endif
+}
+
+static bool ConfigureStaticExportPaths() {
+    namespace FS = Common::FS;
+
+    const auto executable_directory = GetStaticExportDirectory();
+    if (executable_directory.empty() || !executable_directory.is_absolute()) {
+        std::cerr << "Unable to resolve the static export executable directory\n";
+        return false;
+    }
+    const auto user_root = executable_directory / "user";
+#ifdef _WIN32
+    const auto keys_root = FS::GetAppDataRoamingDirectory() / "suyu" / "keys";
+#else
+    const auto keys_root = FS::GetDataDirectory("XDG_DATA_HOME") / "suyu" / "keys";
+#endif
+    if (keys_root.empty() || !keys_root.is_absolute()) {
+        std::cerr << "Unable to resolve an external keys directory\n";
+        return false;
+    }
+
+    const auto ensure_directory = [](const std::filesystem::path& path,
+                                     std::string_view description) {
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+        if (ec || !std::filesystem::is_directory(path, ec)) {
+            std::cerr << "Unable to create " << description << " directory: " << path.string()
+                      << "\n";
+            return false;
+        }
+        return true;
+    };
+
+    if (!ensure_directory(user_root, "static export user") ||
+        !ensure_directory(keys_root, "external keys")) {
+        return false;
+    }
+    for (const char* sub : {"config", "cache", "cache/shader", "log", "nand", "sdmc", "dump",
+                             "load", "screenshots", "play_time", "crash_dumps", "amiibo", "tas",
+                             "icons", "themes"}) {
+        if (!ensure_directory(user_root / sub, "static export data")) {
+            return false;
+        }
+    }
+
+    FS::SetSuyuPath(FS::SuyuPath::EdenDir, user_root);
+    FS::SetSuyuPath(FS::SuyuPath::ConfigDir, user_root / "config");
+    FS::SetSuyuPath(FS::SuyuPath::CacheDir, user_root / "cache");
+    FS::SetSuyuPath(FS::SuyuPath::ShaderDir, user_root / "cache" / "shader");
+    FS::SetSuyuPath(FS::SuyuPath::LogDir, user_root / "log");
+    FS::SetSuyuPath(FS::SuyuPath::NANDDir, user_root / "nand");
+    FS::SetSuyuPath(FS::SuyuPath::SaveDir, user_root / "nand");
+    FS::SetSuyuPath(FS::SuyuPath::SDMCDir, user_root / "sdmc");
+    FS::SetSuyuPath(FS::SuyuPath::DumpDir, user_root / "dump");
+    FS::SetSuyuPath(FS::SuyuPath::LoadDir, user_root / "load");
+    FS::SetSuyuPath(FS::SuyuPath::ScreenshotsDir, user_root / "screenshots");
+    FS::SetSuyuPath(FS::SuyuPath::PlayTimeDir, user_root / "play_time");
+    FS::SetSuyuPath(FS::SuyuPath::CrashDumpsDir, user_root / "crash_dumps");
+    FS::SetSuyuPath(FS::SuyuPath::AmiiboDir, user_root / "amiibo");
+    FS::SetSuyuPath(FS::SuyuPath::TASDir, user_root / "tas");
+    FS::SetSuyuPath(FS::SuyuPath::IconsDir, user_root / "icons");
+    FS::SetSuyuPath(FS::SuyuPath::ThemesDir, user_root / "themes");
+    FS::SetSuyuPath(FS::SuyuPath::KeysDir, keys_root);
+    return true;
+}
+#endif
 
 /// Application entry point
 /// mk8-recomp: report each title's CPU architecture without booting it.
@@ -1391,6 +1504,9 @@ int main(int argc, char** argv) {
         freopen("CONOUT$", "wb", stdout);
         freopen("CONOUT$", "wb", stderr);
     }
+    // Match the GUI frontend: large titles can keep well over the CRT's
+    // default 512 stdio streams open while loading RomFS assets.
+    _setmaxstdio(8192);
 #endif
 
     try {
@@ -1405,51 +1521,10 @@ int main(int argc, char** argv) {
     // KeysDir under <exe>/user/keys instead, so prod.keys/title.keys are
     // never bundled with a distributed export.
     // Must run before Log::Initialize(), which opens a file under LogDir.
-    // A JIT baseline package is a plain copy of this executable rather than a
-    // static build, so an export is also recognised at runtime by the README
-    // the exporter writes beside every package launcher. Without that, the
-    // user/ folder the data bundling step creates still switches on the FS
-    // layer's auto-detection, which then looks for keys in the empty user/keys.
-    // The export carries no system firmware; it reads the installed one, like its keys.
-    // Both stay empty when this executable is not an exported package.
-    std::filesystem::path installed_nand;
-    std::filesystem::path installed_load;
-    std::filesystem::path export_user_root;
-    // Logged once logging is up: which recorded locations led back into the package.
-    bool ignored_package_suyu = false;
-    bool ignored_package_nand = false;
-    {
-        namespace FS = Common::FS;
-#ifdef _WIN32
-        wchar_t exe_w[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
-        const std::filesystem::path exe_dir = std::filesystem::path(exe_w).parent_path();
-#elif defined(__APPLE__)
-        // argv[0] has no directory when started through PATH, which would make
-        // the checks below look in the working directory instead.
-        char exe_buf[PATH_MAX]{};
-        std::uint32_t exe_size = sizeof(exe_buf);
-        const std::filesystem::path exe_dir = _NSGetExecutablePath(exe_buf, &exe_size) == 0
-                                                  ? std::filesystem::path(exe_buf).parent_path()
-                                                  : std::filesystem::path{};
-#else
-        std::error_code exe_ec;
-        const std::filesystem::path exe_dir =
-            std::filesystem::canonical("/proc/self/exe", exe_ec).parent_path();
-#endif
-        const std::filesystem::path user_root = exe_dir / "user";
 #ifdef SUYU_CMD_STATIC_RECOMP
-        // Never a "user" folder relative to wherever this was started from.
-        if (exe_dir.empty()) {
-            std::fprintf(stderr, "Cannot locate this executable's folder for its user data\n");
-            return EXIT_FAILURE;
-        }
-        constexpr bool portable_export = true;
-#else
-        std::error_code readme_ec;
-        const bool portable_export =
-            !exe_dir.empty() &&
-            std::filesystem::is_regular_file(exe_dir / "README_NATIVE_EXPORT.txt", readme_ec);
+    if (!ConfigureStaticExportPaths()) {
+        return -1;
+    }
 #endif
         if (portable_export) {
             std::filesystem::create_directories(user_root);
@@ -1599,7 +1674,7 @@ int main(int argc, char** argv) {
         {"fullscreen", no_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
         {"game", required_argument, 0, 'g'},
-        {"applet-params", optional_argument, 0, 'l'},
+        {"applet-params", required_argument, 0, 'l'},
         {"multiplayer", required_argument, 0, 'm'},
         {"program", optional_argument, 0, 'p'},
         {"tas", no_argument, 0, 't'},
@@ -1616,7 +1691,7 @@ int main(int argc, char** argv) {
     };
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "g:fhvp::c:d:u:l::tV:N:B:U:PD:", long_options, &option_index);
+        int arg = getopt_long(argc, argv, "g:fhvp::c:u:l:", long_options, &option_index);
         if (arg != -1) {
             switch (static_cast<char>(arg)) {
             case 'B':
@@ -1662,24 +1737,13 @@ int main(int argc, char** argv) {
                 Settings::values.external_content_dirs.emplace_back(optarg);
                 break;
             case 'l': {
-                std::string str_arg(argv[optind++]);
-                str_arg.append(",0"); // FALLBACK: if string is partially completed ("1234,3")
-                                      // this will set all those unset to 0. otherwise we get
-                                      // all 3s.
-                std::stringstream stream(str_arg);
-                std::string sub;
-                std::getline(stream, sub, ',');
-                load_parameters.program_id = std::stoull(sub);
-                std::getline(stream, sub, ',');
-                load_parameters.applet_id = static_cast<Service::AM::AppletId>(std::stoul(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.applet_type = static_cast<Service::AM::AppletType>(std::stoi(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.launch_type = static_cast<Service::AM::LaunchType>(std::stoi(sub));
-                std::getline(stream, sub, ',');
-                load_parameters.program_index = std::stoi(sub);
-                std::getline(stream, sub, ',');
-                load_parameters.previous_program_index = std::stoi(sub);
+                const auto parsed = ParseAppletParameters(optarg != nullptr ? optarg : "");
+                if (!parsed) {
+                    std::cerr << "Invalid --applet-params: expected six comma-separated decimal "
+                                 "integers\n";
+                    return -1;
+                }
+                load_parameters = *parsed;
                 break;
             }
             case 'm': {
@@ -1728,32 +1792,9 @@ int main(int argc, char** argv) {
             case 'v':
                 PrintVersion();
                 return 0;
-            case 'V': {
-                // <numeric>[:<display>]. The numeric part is what the guest sees through
-                // the application version, the display part is the string a title prints
-                // for itself.
-                const std::string str_arg(optarg);
-                const auto colon = str_arg.find(':');
-                const std::string numeric = str_arg.substr(0, colon);
-                try {
-                    app_version_override = static_cast<u32>(std::stoul(numeric));
-                } catch (const std::exception&) {
-                    std::cout << "Invalid --app-version: " << str_arg
-                              << " (expected <number>[:<display>])\n";
-                    return 0;
-                }
-                if (colon != std::string::npos) {
-                    app_display_version_override = str_arg.substr(colon + 1);
-                }
-                break;
-            }
-            case 'N':
-                if (app_name_override || !optarg || !*optarg) {
-                    LOG_ERROR(Frontend, "Invalid or repeated --app-name argument");
-                    return 2;
-                }
-                app_name_override = optarg;
-                break;
+            case '?':
+                PrintHelp(argv[0]);
+                return -1;
             }
         } else {
 #ifdef _WIN32
@@ -1786,6 +1827,15 @@ int main(int argc, char** argv) {
 #endif
     SdlConfig config{config_path};
     g_sdl_config = &config;
+
+#ifdef SUYU_CMD_STATIC_RECOMP
+    // A copied config can contain absolute paths from a different machine or
+    // package location. Reassert the export-local data roots after config
+    // loading, while keeping keys in the external application data directory.
+    if (!ConfigureStaticExportPaths()) {
+        return -1;
+    }
+#endif
 
     // apply the log_filter setting
     // the logger was initialized before and doesn't pick up the filter on its own
@@ -1928,42 +1978,20 @@ int main(int argc, char** argv) {
     struct RecompModule {
         Core::RecompBlockFn (*lookup)(u64){};
         void (*set_base)(u64){};
-        Core::RecompBlockFn run_slice{};
-        unsigned image_abi{};
-        unsigned (*guard_v2)(unsigned){};
-        std::string name;     // export name: rtld, main, subsdk0, sdk
-        std::string build_id; // empty for registrations from before build IDs
-        bool bound{};         // given its loaded module's base
+        Core::RecompBuildIdFn build_id{};
+        Core::RecompTextHashFn text_sha256{};
+        Core::RecompTextSizeFn text_size{};
+        u64 base{};
+    };
+    struct PendingRecompBinding {
+        RecompModule* module{};
+        u64 base{};
+        std::size_t index{};
+        std::string name;
     };
     static std::vector<RecompModule> s_recomp_modules;
-    bool recomp_guard_ready = false;
-    // ABI 5 and ABI 6 (FM1 fast path) images are both accepted, but never
-    // mixed: ABI 6 extends the shared GuestContext, so one bundle has one ABI.
-    unsigned recomp_bundle_abi = 0;
-    // FPX1 (exact native FP) is all or nothing across a bundle: its kill
-    // switch is a context bit that only FPX1 modules keep from the guest.
-    // Nonzero: the handshake answer, whose low byte is the compiled fast path.
-    unsigned recomp_fpx = 0;
-    [[maybe_unused]] int recomp_fpx_modules = -1;
-    [[maybe_unused]] const auto fpx_layout = Core::GetRecompFpxLayout();
-    [[maybe_unused]] const auto accept_recomp_abi = [&recomp_bundle_abi](unsigned abi) {
-        if (abi != 5 && abi != 6) {
-            LOG_CRITICAL(Frontend, "Recompiled image ABI {} is not 5 or 6; re-export all modules",
-                         abi);
-            return false;
-        }
-        if (recomp_bundle_abi != 0 && abi != recomp_bundle_abi) {
-            LOG_CRITICAL(Frontend,
-                         "Recompiled images mix ABI {} and {}; re-export all modules together",
-                         recomp_bundle_abi, abi);
-            return false;
-        }
-        recomp_bundle_abi = abi;
-        return true;
-    };
-    [[maybe_unused]] const auto fastmem_layout = Core::GetRecompFastmemLayout();
-    // ABI 6 GG1: filled by the handshakes below, handed over after SetRecompLookup.
-    std::vector<Core::RecompGuardGen::Module> recomp_guard_gen_modules;
+    static std::vector<PendingRecompBinding> s_pending_recomp_bindings;
+    static std::size_t s_pending_recomp_count{};
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
@@ -1971,99 +1999,19 @@ int main(int argc, char** argv) {
 #ifdef SUYU_CMD_STATIC_RECOMP
     if (std::getenv("SUYU_ENABLE_STATIC_RECOMP") != nullptr) {
         unsigned count = 0;
-        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v4(&count);
-        unsigned build_id_count = 0;
-        const char* const* build_ids = nullptr;
-#ifdef SUYU_RECOMP_BUILD_IDS_V1
-        build_ids = suyu_recomp_static_build_ids_v1(&build_id_count);
-#endif
-        if (!build_ids || build_id_count != count) {
-            build_ids = nullptr;
-            LOG_WARNING(Frontend, "Static recompiled modules carry no build IDs (registration "
-                                  "predates them); binding images by NSO slot name");
-        }
+        const SuyuRecompStaticModule* mods = suyu_recomp_static_modules_v2(&count);
         for (unsigned i = 0; i < count; ++i) {
-            if (!mods[i].image_abi) {
-                LOG_CRITICAL(Frontend, "Static image predates correctness ABI 5; re-export all modules");
-                return EXIT_FAILURE;
+            if (mods == nullptr || mods[i].lookup == nullptr || mods[i].set_base == nullptr ||
+                mods[i].build_id == nullptr || mods[i].text_sha256 == nullptr ||
+                mods[i].text_size == nullptr) {
+                LOG_ERROR(Frontend, "Ignoring invalid static recompiled module registration [{}]",
+                          i);
+                break;
             }
-            if (!accept_recomp_abi(mods[i].image_abi())) {
-                return EXIT_FAILURE;
-            }
-            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].run_slice,
-                                        mods[i].image_abi(), nullptr,
-                                        mods[i].name ? mods[i].name : "",
-                                        build_ids && build_ids[i] ? build_ids[i] : ""});
-            LOG_INFO(Frontend, "Static recompiled module [{}] {} build_id={} — ArmRecomp active",
-                     i, mods[i].name ? mods[i].name : "?",
-                     s_recomp_modules.back().build_id.substr(0, 16));
-        }
-#ifdef SUYU_RECOMP_GUARD_V2
-        recomp_guard_ready = suyu_recomp_static_guard_v2(2) != 0;
-#endif
-        if (recomp_bundle_abi == 6) {
-            // A feature bit is a requirement on the host: refuse any this host
-            // does not implement before trusting any other handshake.
-            bool features_known = false;
-            unsigned features = 0;
-#ifdef SUYU_RECOMP_FEATURES_V1
-            features = suyu_recomp_static_features_v1();
-            features_known = true;
-#endif
-            if (!features_known) {
-                LOG_CRITICAL(Frontend, "ABI 6 static modules predate the feature registry; "
-                                       "re-export all modules with this build");
-                return EXIT_FAILURE;
-            }
-            if (const u32 unknown = Core::RecompImageFeature::Unsupported(features)) {
-                LOG_CRITICAL(Frontend,
-                             "Static recompiled modules require image features {:#x} that this "
-                             "host does not implement; update suyu or re-export with this build",
-                             unknown);
-                return EXIT_FAILURE;
-            }
-            // GG1 images complete the FM1 handshake only after this one.
-            if (features & Core::RecompImageFeature::GuardGen1) {
-                bool guard_gen_ok = false;
-#ifdef SUYU_RECOMP_GUARD_GEN_V1
-                std::vector<SuyuRecompGuardGenModule> gg(count);
-                const unsigned filled = suyu_recomp_static_guard_gen_v1(
-                    Core::RecompGuardGen::kHostVersion, gg.data(), count);
-                guard_gen_ok = filled == count;
-                for (unsigned i = 0; guard_gen_ok && i < filled; ++i) {
-                    recomp_guard_gen_modules.push_back(
-                        {gg[i].word, gg[i].base, gg[i].code_lo, gg[i].code_end});
-                }
-#endif
-                if (!guard_gen_ok) {
-                    LOG_CRITICAL(Frontend, "ABI 6 static modules refused the generation guard "
-                                           "handshake; re-export all modules with this build");
-                    return EXIT_FAILURE;
-                }
-            }
-            bool fastmem_ok = false;
-#ifdef SUYU_RECOMP_FASTMEM_V1
-            fastmem_ok = suyu_recomp_static_fastmem_v1(
-                             fastmem_layout.page_bits, fastmem_layout.stride_log2,
-                             fastmem_layout.pointer_mask, fastmem_layout.off_table,
-                             fastmem_layout.off_limit) == 1;
-#endif
-            if (!fastmem_ok) {
-                LOG_CRITICAL(Frontend, "ABI 6 static modules do not match this host's fastmem "
-                                       "layout; re-export all modules with this build");
-                return EXIT_FAILURE;
-            }
-            if (features & Core::RecompImageFeature::ExactFpX1) {
-#ifdef SUYU_RECOMP_FPX_V1
-                recomp_fpx = suyu_recomp_static_fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
-                                                       fpx_layout.inhibit_bit);
-#endif
-                if (!recomp_fpx) {
-                    LOG_CRITICAL(Frontend, "FPX1 static modules are mixed or do not match this "
-                                           "host's FP layout; re-export all modules with this build");
-                    return EXIT_FAILURE;
-                }
-            }
+            s_recomp_modules.push_back({mods[i].lookup, mods[i].set_base, mods[i].build_id,
+                                        mods[i].text_sha256, mods[i].text_size, 0});
+            LOG_INFO(Frontend, "Static recompiled module [{}] {} — ArmRecomp active", i,
+                     mods[i].name ? mods[i].name : "?");
         }
     }
 #endif
@@ -2101,92 +2049,20 @@ int main(int argc, char** argv) {
             using SetBaseFn = void (*)(u64);
             auto lkp = reinterpret_cast<LookupFn>(GetProcAddress(h, "recomp_image_lookup"));
             auto sbf = reinterpret_cast<SetBaseFn>(GetProcAddress(h, "recomp_image_set_base"));
-            if (lkp) {
-                auto run_slice = reinterpret_cast<Core::RecompBlockFn>(
-                    GetProcAddress(h, "recomp_image_run_slice"));
-                auto image_abi = reinterpret_cast<unsigned (*)()>(
-                    GetProcAddress(h, "recomp_image_abi"));
-                const unsigned abi = image_abi ? image_abi() : 0;
-                if (!accept_recomp_abi(abi)) {
-                    FreeLibrary(h);
-                    return EXIT_FAILURE;
-                }
-                if (abi == 6) {
-                    auto features = reinterpret_cast<unsigned (*)()>(
-                        GetProcAddress(h, "recomp_image_features"));
-                    auto fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
-                        GetProcAddress(h, "recomp_image_fastmem_v1"));
-                    // A feature bit is a requirement on the host: refuse any
-                    // this host does not implement.
-                    if (const u32 unknown = features ? Core::RecompImageFeature::Unsupported(
-                                                           features())
-                                                     : 0) {
-                        LOG_CRITICAL(Frontend,
-                                     "{} requires image features {:#x} that this host does not "
-                                     "implement; update suyu or re-export with this build",
-                                     Common::UTF16ToUTF8(dll_name), unknown);
-                        FreeLibrary(h);
-                        return EXIT_FAILURE;
-                    }
-                    // GG1 images complete the FM1 handshake only after this one.
-                    if (features && (features() & Core::RecompImageFeature::GuardGen1)) {
-                        using GuardGenFn = u32* (*)(u32, u64*, u64*, const u64**);
-                        auto guard_gen_v1 = reinterpret_cast<GuardGenFn>(
-                            GetProcAddress(h, "recomp_image_guard_gen_v1"));
-                        Core::RecompGuardGen::Module gg{};
-                        gg.word = guard_gen_v1 ? guard_gen_v1(Core::RecompGuardGen::kHostVersion,
-                                                              &gg.code_lo, &gg.code_end, &gg.base)
-                                               : nullptr;
-                        if (!gg.word) {
-                            LOG_CRITICAL(Frontend,
-                                         "{} refused the generation guard handshake; re-export "
-                                         "all modules with this build",
-                                         Common::UTF16ToUTF8(dll_name));
-                            FreeLibrary(h);
-                            return EXIT_FAILURE;
-                        }
-                        recomp_guard_gen_modules.push_back(gg);
-                    }
-                    if (!features || !(features() & 1u) || !fastmem_v1 ||
-                        fastmem_v1(fastmem_layout.page_bits, fastmem_layout.stride_log2,
-                                   fastmem_layout.pointer_mask, fastmem_layout.off_table,
-                                   fastmem_layout.off_limit) != 1) {
-                        LOG_CRITICAL(Frontend,
-                                     "{} does not match this host's fastmem layout; re-export "
-                                     "all modules with this build",
-                                     Common::UTF16ToUTF8(dll_name));
-                        FreeLibrary(h);
-                        return EXIT_FAILURE;
-                    }
-                    const bool has_fpx = (features() & Core::RecompImageFeature::ExactFpX1) != 0;
-                    unsigned fpx = 0;
-                    if (has_fpx) {
-                        auto fpx_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64)>(
-                            GetProcAddress(h, "recomp_image_fpx_v1"));
-                        fpx = fpx_v1 ? fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
-                                              fpx_layout.inhibit_bit)
-                                     : 0;
-                    }
-                    if ((has_fpx && !fpx) ||
-                        (recomp_fpx_modules >= 0 && recomp_fpx_modules != (has_fpx ? 1 : 0))) {
-                        LOG_CRITICAL(Frontend,
-                                     "{} does not match this host's FP layout or the FPX1 "
-                                     "feature of the other modules; re-export all modules "
-                                     "with this build",
-                                     Common::UTF16ToUTF8(dll_name));
-                        FreeLibrary(h);
-                        return EXIT_FAILURE;
-                    }
-                    recomp_fpx_modules = has_fpx ? 1 : 0;
-                    recomp_fpx = fpx;
-                }
-                auto guard = reinterpret_cast<unsigned (*)(unsigned)>(GetProcAddress(h, "recomp_image_guard_v2"));
-                std::string module_name = Common::UTF16ToUTF8(dll_name);
-                module_name = module_name.substr(11, module_name.size() - 15); // recompiled_*.dll
-                s_recomp_modules.push_back({lkp, sbf, run_slice, abi, guard,
-                                            module_name == "image" ? "main" : module_name});
+            auto bid = reinterpret_cast<Core::RecompBuildIdFn>(
+                GetProcAddress(h, "recomp_image_build_id"));
+            auto tsh = reinterpret_cast<Core::RecompTextHashFn>(
+                GetProcAddress(h, "recomp_image_text_sha256"));
+            auto tsz = reinterpret_cast<Core::RecompTextSizeFn>(
+                GetProcAddress(h, "recomp_image_text_size"));
+            if (lkp && sbf && bid && tsh && tsz) {
+                s_recomp_modules.push_back({lkp, sbf, bid, tsh, tsz, 0});
                 LOG_INFO(Frontend, "Native recompiled module [{}] loaded from {} — ArmRecomp active",
                          s_recomp_modules.size() - 1, Common::UTF16ToUTF8(dll_name));
+            } else {
+                LOG_WARNING(Frontend, "Ignoring incomplete recompiled image {}",
+                            Common::UTF16ToUTF8(dll_name));
+                FreeLibrary(h);
             }
         }
         recomp_guard_ready = !s_recomp_modules.empty();
@@ -2200,82 +2076,119 @@ int main(int argc, char** argv) {
 #endif
 
     if (!s_recomp_modules.empty()) {
-        // Combined lookup: try each module's lookup until one returns non-null.
+        // Dispatch only through an image whose build ID was matched and whose
+        // runtime base has therefore been established.
         Core::SetRecompLookup([](u64 pc) -> Core::RecompBlockFn {
+            const RecompModule* owner = nullptr;
             for (const auto& m : s_recomp_modules) {
-                if (auto fn = m.lookup(pc)) return m.run_slice ? m.run_slice : fn;
+                if (m.base != 0 && m.base <= pc && (!owner || m.base > owner->base)) {
+                    owner = &m;
+                }
             }
-            return nullptr;
+            return owner != nullptr ? owner->lookup(pc) : nullptr;
         });
-        const bool long_slices = std::all_of(
-            s_recomp_modules.cbegin(), s_recomp_modules.cend(), [](const RecompModule& module) {
-                return module.image_abi >= 4 && module.run_slice != nullptr;
-            });
-        Core::SetRecompLongSlices(long_slices);
-        Core::SetRecompCodeGuardReady(recomp_guard_ready);
-        LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
-                 recomp_guard_ready ? "ready" : "not negotiated");
-        // Every ABI 6 module passed the handshake above, or loading stopped.
-        Core::SetRecompFastmemReady(recomp_bundle_abi == 6);
-        LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", recomp_bundle_abi,
-                 recomp_bundle_abi == 6 ? "negotiated" : "not used");
-        // After SetRecompLookup, which forgets any earlier modules, and before
-        // the process exists. Logs its own outcome.
-        Core::SetRecompGuardGenModules(std::move(recomp_guard_gen_modules));
-        // Every FPX1 module passed its handshake above, or loading stopped.
-        Core::SetRecompFpxReady(recomp_fpx != 0);
-        LOG_INFO(Frontend, "Recompiled FPX1 native FP: {} (handshake {:#x})",
-                 recomp_fpx ? "negotiated" : "not used", recomp_fpx);
-        // Bind each loaded module to the image built from it, by build ID (see
-        // RecompGaps::MatchImage). Never by position: a Hybrid export that
-        // leaves main to the JIT registers [rtld, subsdk0, sdk], and handing
-        // those the bases of loaded modules 0, 1, 2 gave subsdk0's image main's
-        // base and sdk's image multimedia's. A module with no image runs on the
-        // JIT (or, strict, stops there); an image with no module stays unbound.
-        Core::SetRecompBaseSetter([](size_t index, const char* module, const char* build_id,
-                                     u64 base) {
-            std::vector<Core::RecompGaps::ImageIdentity> images;
-            for (const auto& m : s_recomp_modules) {
-                images.push_back({m.name, m.build_id});
+        Core::SetRecompBinder([](size_t index, size_t count, const char* module, u64 base,
+                                 const u8* build_id, size_t build_id_size,
+                                 const u8* text_sha256, size_t text_sha256_size,
+                                 u64 text_size) -> bool {
+            const char* module_name = module != nullptr ? module : "?";
+            if (index == 0) {
+                s_pending_recomp_bindings.clear();
+                s_pending_recomp_count = 0;
+                for (auto& candidate : s_recomp_modules) {
+                    candidate.base = 0;
+                    candidate.set_base(0);
+                }
             }
-            const std::string_view id = build_id ? build_id : "";
-            const auto image = Core::RecompGaps::MatchImage(images, index, module ? module : "", id);
-            if (!image || !s_recomp_modules[*image].set_base) {
-                LOG_WARNING(Frontend,
-                            "No recompiled image for module '{}' (#{}, build_id={}, base {:#x})",
-                            module ? module : "?", index, id.substr(0, 16), base);
-                return;
+            const auto reject_batch = [] {
+                s_pending_recomp_bindings.clear();
+                s_pending_recomp_count = 0;
+                return false;
+            };
+            if (count == 0 || index >= count || index != s_pending_recomp_bindings.size() ||
+                (index != 0 && count != s_pending_recomp_count) || base == 0) {
+                LOG_ERROR(Frontend,
+                          "Invalid recompiled module batch at index {} (batch {}, available {})",
+                          index, count, s_recomp_modules.size());
+                return reject_batch();
             }
-            auto& m = s_recomp_modules[*image];
-            m.set_base(base);
-            m.bound = true;
-            // Misses in this module are gaps a re-export can close.
-            Core::RecompGaps::NoteImage(base, m.name);
-            LOG_INFO(Frontend, "Recompiled image '{}' bound to module '{}' (#{}, build_id={}, base {:#x})",
-                     m.name, module ? module : "?", index, id.substr(0, 16), base);
-        });
-        // Before the first block: an image left unbound runs with base 0, so its
-        // first module-relative address faults instead of saying why.
-        Core::SetRecompBindCheck([]() -> size_t {
-            std::string unbound;
-            size_t loaded = 0;
-            for (const auto& m : s_recomp_modules) {
-                if (m.bound) {
+            if (index == 0) {
+                s_pending_recomp_count = count;
+            }
+            if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
+                text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
+                LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
+                          module_name, index);
+                return reject_batch();
+            }
+
+            RecompModule* matched = nullptr;
+            for (auto& candidate : s_recomp_modules) {
+                const u8* candidate_build_id =
+                    candidate.build_id != nullptr ? candidate.build_id() : nullptr;
+                const u8* candidate_text_sha256 =
+                    candidate.text_sha256 != nullptr ? candidate.text_sha256() : nullptr;
+                if (candidate_build_id == nullptr || candidate_text_sha256 == nullptr ||
+                    candidate.text_size == nullptr || candidate.text_size() != text_size ||
+                    !std::equal(build_id, build_id + Core::RecompBuildIdSize,
+                                candidate_build_id) ||
+                    !std::equal(text_sha256, text_sha256 + Core::RecompSha256Size,
+                                candidate_text_sha256)) {
                     continue;
                 }
-                const bool module_loaded = Core::RecompGaps::HasLoadedModule(m.build_id, m.name);
-                loaded += module_loaded ? 1 : 0;
-                unbound += fmt::format("{}{} (build_id={}{})", unbound.empty() ? "" : ", ",
-                                       m.name, m.build_id.substr(0, 16),
-                                       module_loaded ? ", its module is loaded" : "");
+                if (matched != nullptr) {
+                    LOG_ERROR(Frontend,
+                              "Multiple recompiled images match module '{}' (#{}) identity",
+                              module_name, index);
+                    return reject_batch();
+                }
+                matched = &candidate;
             }
-            if (!unbound.empty()) {
-                LOG_WARNING(Frontend,
-                            "Recompiled image(s) not bound to any loaded module, so their code "
-                            "cannot run statically: {}",
-                            unbound);
+            if (matched == nullptr) {
+                if (count == 1) {
+                    LOG_WARNING(
+                        Frontend,
+                        "No recompiled image matches single module '{}' (text {:#x}, base {:#x})",
+                        module_name, text_size, base);
+                    return reject_batch();
+                }
+                LOG_WARNING(
+                    Frontend,
+                    "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x}); "
+                    "using JIT fallback for this NSO",
+                    module_name, index, text_size, base);
+            } else if (matched->set_base == nullptr) {
+                LOG_ERROR(Frontend,
+                          "Matched recompiled image for module '{}' has no base setter",
+                          module_name);
+                return reject_batch();
+            } else if (std::any_of(s_pending_recomp_bindings.begin(),
+                                   s_pending_recomp_bindings.end(),
+                                   [matched](const PendingRecompBinding& pending) {
+                                       return pending.module == matched;
+                                   })) {
+                LOG_ERROR(Frontend,
+                          "Recompiled image matched more than one loaded NSO in the same batch");
+                return reject_batch();
             }
-            return loaded;
+
+            s_pending_recomp_bindings.push_back(
+                PendingRecompBinding{matched, base, index, module_name});
+            if (s_pending_recomp_bindings.size() != count) {
+                return true;
+            }
+            for (const PendingRecompBinding& pending : s_pending_recomp_bindings) {
+                if (pending.module == nullptr) {
+                    continue;
+                }
+                pending.module->base = pending.base;
+                pending.module->set_base(pending.base);
+                LOG_INFO(Frontend, "Build-ID matched recompiled module '{}' (#{}) at {:#x}",
+                         pending.name, pending.index, pending.base);
+            }
+            s_pending_recomp_bindings.clear();
+            s_pending_recomp_count = 0;
+            return true;
         });
         // A window running native recompiled code is a standalone game export,
         // not the suyu dev frontend — the window chrome (title/icon) should
@@ -2485,6 +2398,7 @@ int main(int argc, char** argv) {
         emu_window = std::make_unique<EmuWindow_SDL2_VK>(&input_subsystem, system, fullscreen);
         break;
     }
+    emu_window->SetConfigSaveCallback([&config] { config.SaveAllValues(); });
 
     if (tas_playback) {
         emu_window->EnableTasPlayback();
@@ -2549,33 +2463,41 @@ int main(int argc, char** argv) {
     }
 
     if (static_cast<u32>(load_parameters.applet_id)) {
-        // code below based off of suyu/main.cpp : GMainWindow::OnHomeMenu()
-        // Inline minimal mapping (AppletIdToProgramId is in an anonymous namespace)
-        const auto applet_id_to_prog_id = [](Service::AM::AppletId id) -> Service::AM::AppletProgramId {
-            using namespace Service::AM;
-            switch (id) {
-            case AppletId::QLaunch:        return AppletProgramId::QLaunch;
-            case AppletId::Starter:        return AppletProgramId::Starter;
-            case AppletId::Auth:           return AppletProgramId::Auth;
-            case AppletId::OverlayDisplay: return AppletProgramId::OverlayDisplay;
-            default:                       return static_cast<AppletProgramId>(0);
+        if (filepath.empty()) {
+            // code below based off of suyu/main.cpp : GMainWindow::OnHomeMenu()
+            // Inline minimal mapping (AppletIdToProgramId is in an anonymous namespace)
+            const auto applet_id_to_prog_id =
+                [](Service::AM::AppletId id) -> Service::AM::AppletProgramId {
+                using namespace Service::AM;
+                switch (id) {
+                case AppletId::QLaunch:
+                    return AppletProgramId::QLaunch;
+                case AppletId::Starter:
+                    return AppletProgramId::Starter;
+                case AppletId::Auth:
+                    return AppletProgramId::Auth;
+                case AppletId::OverlayDisplay:
+                    return AppletProgramId::OverlayDisplay;
+                default:
+                    return static_cast<AppletProgramId>(0);
+                }
+            };
+            const Service::AM::AppletProgramId applet_prog_id =
+                applet_id_to_prog_id(load_parameters.applet_id);
+            auto sysnand = system.GetFileSystemController().GetSystemNANDContents();
+            if (!sysnand) {
+                LOG_CRITICAL(Frontend, "Failed to load applet: Firmware not installed.");
+                return -1;
             }
-        };
-        Service::AM::AppletProgramId applet_prog_id = applet_id_to_prog_id(load_parameters.applet_id);
-        auto sysnand = system.GetFileSystemController().GetSystemNANDContents();
-        if (!sysnand) {
-            LOG_CRITICAL(Frontend, "Failed to load applet: Firmware not installed.");
-            return -1;
-        }
 
-        auto user_applet_nca = sysnand->GetEntry(static_cast<u64>(applet_prog_id),
-                                                 FileSys::ContentRecordType::Program);
-        if (!user_applet_nca) {
-            LOG_CRITICAL(Frontend, "Failed to load applet: applet cannot be found.");
-            return -1;
-        }
-        if (filepath.empty())
+            auto user_applet_nca = sysnand->GetEntry(static_cast<u64>(applet_prog_id),
+                                                     FileSys::ContentRecordType::Program);
+            if (!user_applet_nca) {
+                LOG_CRITICAL(Frontend, "Failed to load applet: applet cannot be found.");
+                return -1;
+            }
             filepath = user_applet_nca->GetFullPath();
+        }
     } else {
         load_parameters.applet_id = Service::AM::AppletId::Application;
     }

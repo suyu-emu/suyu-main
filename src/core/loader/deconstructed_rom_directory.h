@@ -18,10 +18,17 @@ class System;
 namespace Loader {
 
 /**
+ * Resolves the RomFS belonging to a loose ExeFS directory. Packed RomFS files take precedence;
+ * otherwise, an extracted romfs directory is exposed as a lazy virtual image.
+ */
+FileSys::VirtualFile ResolveDeconstructedRomFS(const FileSys::VirtualDir& exefs_dir);
+
+/**
  * This class loads a "deconstructed ROM directory", which are the typical format we see for Switch
  * game dumps. The path should be a "main" NSO, which must be in a directory that contains the other
  * standard ExeFS NSOs (e.g. rtld, sdk, etc.). It will automatically find and load these.
- * Furthermore, it will look for the first .romfs file (optionally) and use this for the RomFS.
+ * Furthermore, it will use a romfs.bin/romfs file beside the NSOs or ExeFS, or build a virtual
+ * RomFS from an extracted romfs directory beside ExeFS.
  */
 class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:

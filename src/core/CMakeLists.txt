@@ -27,6 +27,18 @@ add_library(core STATIC
     arm/symbols.h
     constants.cpp
     constants.h
+    recompiler/nso_dynamic.cpp
+    recompiler/nso_dynamic.h
+    recompiler/nso_image.cpp
+    recompiler/nso_image.h
+    recompiler/nso_relocation_transaction.cpp
+    recompiler/nso_relocation_transaction.h
+    recompiler/nso_relocations.cpp
+    recompiler/nso_relocations.h
+    recompiler/nso_symbols.cpp
+    recompiler/nso_symbols.h
+    recompiler/npdm_info.cpp
+    recompiler/npdm_info.h
     core.cpp
     core.h
     libretro_wrapper.cpp
@@ -1245,6 +1257,7 @@ else()
 endif()
 
 target_link_libraries(core PRIVATE
+    Boost::regex
     OpenSSL::SSL
     fmt::fmt
     nlohmann_json::nlohmann_json

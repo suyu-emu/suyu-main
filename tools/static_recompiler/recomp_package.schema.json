@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:suyu:recomp-package:1",
+  "$comment": "SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project; SPDX-License-Identifier: GPL-2.0-or-later",
+  "title": "suyu local deconstructed recompiler package",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "format_version",
+    "local_only",
+    "static_module_abi",
+    "generator",
+    "program",
+    "launch",
+    "modules",
+    "artifacts"
+  ],
+  "properties": {
+    "format": {
+      "const": "suyu-deconstructed-recomp-package"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "local_only": {
+      "const": true
+    },
+    "static_module_abi": {
+      "const": 2
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "source_dirty",
+        "recompiler_sha256",
+        "host_provenance"
+      ],
+      "properties": {
+        "source_revision": {
+          "type": "string",
+          "pattern": "^(unknown|[0-9a-f]{40})$"
+        },
+        "source_dirty": {
+          "type": "boolean"
+        },
+        "recompiler_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "host_provenance": {
+          "enum": [
+            "built",
+            "provided"
+          ]
+        }
+      }
+    },
+    "program": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "program_id",
+        "npdm_sha256",
+        "exefs_path",
+        "romfs"
+      ],
+      "properties": {
+        "program_id": {
+          "$ref": "#/$defs/program_id"
+        },
+        "npdm_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "exefs_path": {
+          "const": "exefs"
+        },
+        "romfs": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/romfs"
+            }
+          ]
+        }
+      }
+    },
+    "launch": {
+      "$ref": "#/$defs/launch"
+    },
+    "modules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 13,
+      "items": {
+        "$ref": "#/$defs/module"
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executable",
+        "executable_size",
+        "executable_sha256",
+        "checksums"
+      ],
+      "properties": {
+        "executable": {
+          "const": "suyu-recompiled.exe"
+        },
+        "executable_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "executable_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "checksums": {
+          "const": "SHA256SUMS"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "program_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "romfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "layout",
+        "path"
+      ],
+      "properties": {
+        "layout": {
+          "enum": [
+            "directory",
+            "packed"
+          ]
+        },
+        "path": {
+          "enum": [
+            "romfs",
+            "exefs/romfs.bin"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "layout": {
+                "const": "directory"
+              }
+            },
+            "required": [
+              "layout"
+            ]
+          },
+          "then": {
+            "properties": {
+              "path": {
+                "const": "romfs"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "path": {
+                "const": "exefs/romfs.bin"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "applet_id",
+        "applet_type",
+        "launch_type",
+        "program_index",
+        "previous_program_index"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "application",
+            "applet"
+          ]
+        },
+        "applet_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "applet_type": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "launch_type": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "program_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "previous_program_index": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "application"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "applet_id": {
+                "const": 1
+              },
+              "applet_type": {
+                "const": 0
+              },
+              "launch_type": {
+                "const": 0
+              },
+              "program_index": {
+                "const": 0
+              },
+              "previous_program_index": {
+                "const": -1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "build_id",
+        "nso_sha256",
+        "nso_size",
+        "decoded_text_size",
+        "mapped_text_size",
+        "mapped_text_sha256",
+        "required_hashes_verified"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "rtld",
+            "main",
+            "subsdk0",
+            "subsdk1",
+            "subsdk2",
+            "subsdk3",
+            "subsdk4",
+            "subsdk5",
+            "subsdk6",
+            "subsdk7",
+            "subsdk8",
+            "subsdk9",
+            "sdk"
+          ]
+        },
+        "build_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "nso_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "nso_size": {
+          "type": "integer",
+          "minimum": 256
+        },
+        "decoded_text_size": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "mapped_text_size": {
+          "type": "integer",
+          "minimum": 4096,
+          "multipleOf": 4096
+        },
+        "mapped_text_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "required_hashes_verified": {
+          "const": true
+        }
+      }
+    }
+  }
+}

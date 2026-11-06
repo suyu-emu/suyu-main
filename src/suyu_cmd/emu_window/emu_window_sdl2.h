@@ -3,8 +3,7 @@
 
 #pragma once
 
-#include <set>
-#include <string>
+#include <functional>
 #include <utility>
 
 #include "core/frontend/emu_window.h"
@@ -44,14 +43,8 @@ public:
     /// Wait for the next event on the main thread.
     void WaitEvent();
 
-    void RefreshWindowStatus();
-
-    /// Hand connected gamepads to player slots; see SuyuCmd::AssignControllers.
-    void AutoAssignControllers();
-
-    /// Replay the TAS script from the user TAS directory instead of waiting for
-    /// a hotkey, and quit once it runs out. Call before the system is run.
-    void EnableTasPlayback();
+    /// Supplies the frontend configuration writer used by the F12 controls panel.
+    void SetConfigSaveCallback(std::function<void()> callback);
 
     // Sets the window icon from suyu.bmp
     void SetWindowIcon();
@@ -150,6 +143,9 @@ protected:
 
     /// suyu core instance
     Core::System& system;
+
+    /// Persists live input changes made through the F12 controls panel.
+    std::function<void()> config_save_callback;
 };
 
 class DummyContext : public Core::Frontend::GraphicsContext {};

@@ -13,8 +13,6 @@
 #pragma once
 
 #include <algorithm>
-#include <iomanip>
-#include <utility>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -23,9 +21,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
-#include <unordered_set>
+#include <iomanip>
+#include <limits>
+#include <locale>
 #include <map>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -468,566 +469,13 @@ inline std::string Xsp(u32 r) {
     return "c->x[" + std::to_string(r) + "]";
 }
 
-// Append C for one instruction. Returns false if the instruction terminates the block.
-/// Translate one AArch64 instruction to C.
-///
-/// Returns true if the block stays open. `unhandled`, when supplied, reports
-/// whether this instruction fell through the decoder to recomp_unhandled -
-/// which the return value cannot express, because an unhandled instruction is
-/// stepped over and leaves the block open exactly like a translated one. Without
-/// this signal the emitter cannot tell a full translation from a stream of
-/// fallbacks, which is how a whole module of misdecoded ARM32 once passed for a
-/// successful export.
-// Emit one baseline S/D addition/subtraction from raw uint64_t _a/_b to _v.
-// Three guard bits plus sticky alignment preserve exact rounding, including
-// cancellation. No host FP arithmetic or host FP state is involved.
-// The integer value emitter is the reference on every host. With FPX1 each
-// covered op first tries recomp_fpx_<op> (recomp_runtime.h), which computes
-// natively and answers 0 unless the result is provably exact (see the FPX1
-// block of the runtime header); the exact body is the fallback. FPX1 sites call
-// it out of line (EmitFPOutlined). Inline, as the shadow build keeps it, the
-// prefix opens a do{ ... }while(0) whose break skips the exact body, and
-// EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div,
-// fma, recps, rsqrts (raw inputs _aa/_bb) or sqrt (input _a). Every helper
-// also takes the guest's FPCR.FZ bit (RECOMP_FPX_FZ), which the gate leaves
-// open: under FZ it keeps a result only when flushing cannot change it.
-inline std::string FpxArgs(const char* op) {
-    if (!std::strcmp(op, "fma")) return "_a,_b,_z";
-    if (!std::strcmp(op, "recps") || !std::strcmp(op, "rsqrts")) return "_aa,_bb";
-    if (!std::strcmp(op, "sqrt")) return "_a";
-    return "_a,_b";
-}
-inline std::string EmitFPNativeValue(bool dbl, const char* op) {
-    if (!g_emit_fpx) return {};
-    const std::string call =
-        std::string("recomp_fpx_") + op + (dbl ? "64(" : "32(") + FpxArgs(op) + ",RECOMP_FPX_FZ(c)";
-    if (g_emit_fpx_shadow) {
-        return "do{uint64_t _fxv=0,_fxs=c->fpsr;int _fxg=RECOMP_FPX_OPEN(c),_fxk=_fxg&&" + call +
-               ",&_fxv);";
-    }
-    return "do{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(" + call +
-           ",&_v))){RECOMP_FPX_PROBE(1);break;}RECOMP_FPX_PROBE(2);";
-}
-// FPX1 sites call the exact body out of line: recomp_fpe_<op>{32,64}, defined
-// once per module in the runtime C (FpxExactC). Inlining it per site made the
-// exact bodies about 55% of a large title's code (TotK main: 672k sites at
-// ~1.4 KB each, past the 2 GB image limit), and that code only runs when the
-// gate is closed or the native result is not provably exact. The fast path
-// stays inline and unchanged. The shadow build keeps the bodies inline.
-inline bool FpxOutline() {
-    return g_emit_fpx && !g_emit_fpx_shadow;
-}
-// The outlined site: `_v` and the operands are declared by the caller. FMUL's
-// exact body is the multiply-add with the caller's sign-matched zero addend.
-inline std::string EmitFPOutlined(bool dbl, const char* op) {
-    const char* exact = std::strcmp(op, "mul") ? op : "fma";
-    const char* width = dbl ? "64(" : "32(";
-    return std::string("{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(recomp_fpx_") + op + width +
-           FpxArgs(op) + ",RECOMP_FPX_FZ(c),&_v))){RECOMP_FPX_PROBE(1);}else{RECOMP_FPX_PROBE(2);_v=recomp_fpe_" + exact +
-           width + "c," + FpxArgs(exact) + ");}}";
-}
-inline std::string EmitFPNativeSuffix(bool dbl, const char* op) {
-    if (!g_emit_fpx) return {};
-    if (g_emit_fpx_shadow) {
-        static const char* const kinds[] = {"add", "sub", "mul", "div", "fma", "recps", "rsqrts", "sqrt"};
-        unsigned kind = 0;
-        while (kind < 8 && std::strcmp(kinds[kind], op)) ++kind;
-        const std::string args = FpxArgs(op);
-        const std::string first = args.substr(0, args.find(','));
-        const std::string second = args.find(',') == std::string::npos
-            ? std::string("0") : args.substr(args.find(',') + 1, args.find(',', args.find(',') + 1) -
-                                                                   args.find(',') - 1);
-        return "recomp_fpx_shadow(" + std::to_string(kind * 2 + (dbl ? 1 : 0)) +
-               "u,_fxg,_fxk,_fxv,_v,_fxs,c->fpsr," + first + "," + second + ");}while(0);";
-    }
-    return "}while(0);";
-}
-
-// `exact_only`: the bare exact body, for the out-of-line helpers.
-inline std::string EmitFPAddSubValue(bool dbl, bool subtract, bool exact_only = false) {
-    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, subtract ? "sub" : "add");
-    return (exact_only ? std::string() : EmitFPNativeValue(dbl, subtract ? "sub" : "add")) +
-        "{ const unsigned _f=" + std::string(dbl?"52":"23") +
-        ";const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
-        (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
-        (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
-        "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
-        "if(c->fpcr&(1ULL<<24)){if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}"
-        "if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}}"
-        "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-        "unsigned _sa=!!(_a&_sign),_sb="+std::string(subtract?"!(_b&_sign)":"!!(_b&_sign)")+";"
-        "if(_an||_bn){int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-        "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs){c->fpsr|=1;}"
-        "if(c->fpcr&(1ULL<<25)){_v=_exp|_quiet;}}"
-        "else if((_a&_exp)==_exp||(_b&_exp)==_exp){"
-        "if((_a&_exp)==_exp&&(_b&_exp)==_exp&&_sa!=_sb){_v=_exp|_quiet;c->fpsr|=1;}"
-        "else _v=_exp|(((_a&_exp)==_exp?_sa:_sb)?_sign:0);}"
-        "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
-        "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
-        "if(!_ea){_ea=1;}if(!_eb){_eb=1;}"
-        "if(_ea<_eb||(_ea==_eb&&_ma<_mb)){unsigned _t=_ea;_ea=_eb;_eb=_t;_t=_sa;_sa=_sb;_sb=_t;"
-        "uint64_t _u=_ma;_ma=_mb;_mb=_u;}"
-        "_ma<<=3;_mb<<=3;unsigned _distance=_ea-_eb;"
-        "if(_distance>=64)_mb=!!_mb;else if(_distance)_mb=(_mb>>_distance)|!!(_mb&((1ULL<<_distance)-1));"
-        "uint64_t _magnitude=_sa==_sb?_ma+_mb:_ma-_mb;"
-        "if(!_magnitude)_v=(_sa==_sb?_sa:_mode==2)?_sign:0;"
-        "else {if(_magnitude>=(_hidden<<4)){_magnitude=(_magnitude>>1)|(_magnitude&1);++_ea;}"
-        "while(_magnitude<(_hidden<<3)&&_ea>1){_magnitude<<=1;--_ea;}"
-        "int _tiny=_ea==1&&_magnitude<(_hidden<<3);"
-        "if(_tiny&&(c->fpcr&(1ULL<<24))){c->fpsr|=8;_v=0;}"
-        "else {unsigned _lost=(unsigned)(_magnitude&7);uint64_t _rounded=_magnitude>>3;"
-        "if(_lost){c->fpsr|=16;if(_tiny)c->fpsr|=8;"
-        "if((_mode==0&&(_lost>4||(_lost==4&&(_rounded&1))))||(_mode==1&&!_sa)||(_mode==2&&_sa))++_rounded;}"
-        "if(_rounded>=(_hidden<<1)){_rounded>>=1;++_ea;}"
-        "if(_ea>=(unsigned)(_exp>>_f)){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_sa)||(_mode==2&&_sa))?_exp:_exp-1;}"
-        "else _v=((_rounded>=_hidden?(uint64_t)_ea:0)<<_f)|(_rounded&_frac);}"
-        "if(_sa)_v|=_sign;}}}" + (exact_only ? std::string() : EmitFPNativeSuffix(dbl, subtract ? "sub" : "add"));
-}
-
-// Generated exact product/addend lattice. Inputs _a,_b,_z and output _v are
-// IEEE bit patterns. A multiply supplies a same-sign zero addend so its zero
-// result has the product sign in every rounding mode.
-inline std::string EmitFPDivideValue(bool dbl, bool exact_only = false) {
-    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, "div");
-    return (exact_only ? std::string() : EmitFPNativeValue(dbl, "div")) +
-        "{ const unsigned _f="+std::string(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+R"C(;
-const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
-const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
-const unsigned _mode=(unsigned)(c->fpcr>>22)&3;unsigned _negative=!!((_a^_b)&_sign);
-if(c->fpcr&(1ULL<<24)) {
- if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}
- if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}
-}
-int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);
-int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);
-int _ai=(_a&~_sign)==_exp,_bi=(_b&~_sign)==_exp,_az=!(_a&~_sign),_bz=!(_b&~_sign);
-if(_an||_bn){_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs)c->fpsr|=1;
- if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;
-}else if((_ai&&_bi)||(_az&&_bz)){_v=_exp|_quiet;c->fpsr|=1;}
-else if(_ai||_bz){_v=_exp|(_negative?_sign:0);if(!_ai)c->fpsr|=2;}
-else if(_az||_bi)_v=_negative?_sign:0;
-else {
- unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);
- uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);
- int _ae=_ea?(int)_ea-(int)_bias:1-(int)_bias,_be=_eb?(int)_eb-(int)_bias:1-(int)_bias;
- while(_ma<_hidden){_ma<<=1;--_ae;}while(_mb<_hidden){_mb<<=1;--_be;}
- int _e=_ae-_be,_emin=1-(int)_bias;if(_ma<_mb){_ma<<=1;--_e;}
- if(_e<_emin&&(c->fpcr&(1ULL<<24))){_v=_negative?_sign:0;c->fpsr|=8;}
- else {
-  int _bits=(int)_f+(_e<_emin?_e-_emin:0);uint64_t _mant=0,_rem=_ma-_mb;
-  unsigned _roundbit=0,_sticky=0;
-  if(_bits>=0){_mant=1;for(int _j=0;_j<_bits;++_j){_mant<<=1;_rem<<=1;if(_rem>=_mb){++_mant;_rem-=_mb;}}
-   _rem<<=1;_roundbit=_rem>=_mb;if(_roundbit)_rem-=_mb;_sticky=_rem!=0;
-  }else{_roundbit=_bits==-1;_sticky=_bits<-1||_rem!=0;}
-  unsigned _lost=_roundbit|_sticky;if(_lost){c->fpsr|=16;if(_e<_emin)c->fpsr|=8;
-   if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}
-  if(_e<_emin){_e=_emin;}if(_mant>=(_hidden<<1)){_mant>>=1;++_e;}
-  if(_e>(int)_bias){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}
-  else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);
-  if(_negative)_v|=_sign;
- }
-}
-}
-)C" + (exact_only ? std::string() : EmitFPNativeSuffix(dbl, "div"));
-}
-
-// Architectural reciprocal estimate. The estimate is deliberately computed
-// with the integer table algorithm from the ARM pseudocode.
-inline std::string EmitFPRecipEstimateValue(bool dbl) {
-    std::string s = "{ const unsigned _f=" + std::string(dbl ? "52" : "23") +
-                    ",_bias=" + (dbl ? "1023" : "127") + ";";
-    s += R"C(
-const int _emin=1-(int)_bias;const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
-const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
-unsigned _eraw=(unsigned)((_x&_exp)>>_f);uint64_t _fb=_x&_frac;unsigned _negative=!!(_x&_sign);
-if(_eraw==2*_bias+1){
- if(_fb){if(!(_x&_quiet))c->fpsr|=1;_v=_x|_quiet;if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;}
- else _v=_negative?_sign:0;
-}else if(!_eraw&&!_fb){c->fpsr|=2;_v=(_x&_sign)|_exp;}
-else if(!_eraw&&_fb&&(c->fpcr&(1ULL<<24))){c->fpsr|=130;_v=(_x&_sign)|_exp;}
-else {
- uint64_t _mant;int _e;
- if(_eraw){_mant=_hidden|_fb;_e=(int)_eraw-(int)_bias;}
- else{_mant=_fb;_e=_emin;while(!(_mant&_hidden)){_mant<<=1;--_e;}}
- if(_e<_emin-2){
-  unsigned _mode=(unsigned)(c->fpcr>>22)&3;
-  unsigned _to_inf=_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative);
-  c->fpsr|=20;_v=(_x&_sign)|(_to_inf?_exp:_exp-1);
- }else if((c->fpcr&(1ULL<<24))&&_e>=-_emin){c->fpsr|=8;_v=_x&_sign;}
- else {
-  unsigned _index=(unsigned)(_mant>>(_f-8));uint64_t _q=_index*2+1;
-  uint64_t _estimate=(uint8_t)((((1ULL<<19)/_q)+1)/2);_estimate<<=_f-8;
-  int _re=-(_e+1);
-  if(_re<_emin){if(_re==_emin-1){_estimate|=_hidden;_estimate>>=1;}
-   else{_estimate|=_hidden;_estimate>>=2;++_re;}}
-  _v=(_x&_sign)|((uint64_t)(_re+(int)_bias)<<_f)|(_estimate&_frac);
- }
-}
-}
-)C";
-    return s;
-}
-
-// Architectural reciprocal-square-root estimate. The estimate is deliberately
-// computed with the integer table algorithm from the ARM pseudocode: host
-// rsqrt instructions do not guarantee the same eight result bits.
-inline std::string EmitFPRSqrtEstimateValue(bool dbl) {
-    std::string s = "{ const unsigned _f=" + std::string(dbl ? "52" : "23") +
-                    ",_bias=" + (dbl ? "1023" : "127") + ";";
-    s += R"C(
-const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
-const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
-unsigned _eraw=(unsigned)((_x&_exp)>>_f);uint64_t _fb=_x&_frac;
-if(!_eraw&&!_fb){c->fpsr|=2;_v=(_x&_sign)|_exp;}
-else if(!_eraw&&_fb&&(c->fpcr&(1ULL<<24))){c->fpsr|=130;_v=(_x&_sign)|_exp;}
-else if(_eraw==2*_bias+1){
- if(_fb){if(!(_x&_quiet))c->fpsr|=1;_v=_x|_quiet;if(c->fpcr&(1ULL<<25))_v=_exp|_quiet;}
- else if(_x&_sign){c->fpsr|=1;_v=_exp|_quiet;}else _v=0;
-}else if(_x&_sign){c->fpsr|=1;_v=_exp|_quiet;}
-else {
- uint64_t _mant;int _e;
- if(_eraw){_mant=_hidden|_fb;_e=(int)_eraw-(int)_bias;}
- else{_mant=_fb;_e=1-(int)_bias;while(!(_mant&_hidden)){_mant<<=1;--_e;}}
- unsigned _index=(unsigned)(_mant>>(_f-((_e%2)==0?7:8)));
- uint64_t _q=_index<256?_index*2+1:(_index|1)*2,_b=512;
- while(_q*(_b+1)*(_b+1)<(1ULL<<28))++_b;
- uint64_t _estimate=(uint8_t)((_b+1)/2);int _re=(-(_e+1))>>1;
- _v=((uint64_t)(_re+(int)_bias)<<_f)|((_estimate<<(_f-8))&_frac);
-}
-}
-)C";
-    return s;
-}
-
-// `mul` marks a multiply (FMUL/FNMUL), whose addend is the sign-matched zero
-// the caller supplies: the fast path then needs no fused multiply-add.
-inline std::string EmitFPMulAddValue(bool dbl, bool mul = false, bool exact_only = false) {
-    if (!exact_only && FpxOutline()) return EmitFPOutlined(dbl, mul ? "mul" : "fma");
-    std::string s=(exact_only ? std::string() : EmitFPNativeValue(dbl, mul ? "mul" : "fma"))+
-        "{ const unsigned _f="+std::string(dbl?"52":"23")+
-        ",_bias="+(dbl?"1023":"127")+",_count="+(dbl?"67":"9")+
-        "; const int _base="+(dbl?"-2148":"-298")+"; uint64_t _p["+
-        (dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};";
-    s+=R"C(
-const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1;
-const uint64_t _exp=((uint64_t)(2*_bias+1))<<_f,_sign=1ULL<<(_f+(_f==52?11:8));
-unsigned _mode=(unsigned)(c->fpcr>>22)&3;
-if(c->fpcr&(1ULL<<24)) {
- if(!(_a&_exp)&&(_a&_frac)){_a&=_sign;c->fpsr|=128;}
- if(!(_b&_exp)&&(_b&_frac)){_b&=_sign;c->fpsr|=128;}
- if(!(_z&_exp)&&(_z&_frac)){_z&=_sign;c->fpsr|=128;}
-}
-int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac),_zn=(_z&_exp)==_exp&&(_z&_frac);
-int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet),_zs=_zn&&!(_z&_quiet);
-int _ai=(_a&~_sign)==_exp,_bi=(_b&~_sign)==_exp,_zi=(_z&~_sign)==_exp;
-int _az=!(_a&~_sign),_bz=!(_b&~_sign),_zz=!(_z&~_sign),_badproduct=(_ai&&_bz)||(_bi&&_az);
-unsigned _ps=!!((_a^_b)&_sign),_cs=!!(_z&_sign);
-if(_an||_bn||_zn) {
- _v=(_zs?_z:_as?_a:_bs?_b:_zn?_z:_an?_a:_b)|_quiet;
- if(_as||_bs||_zs)c->fpsr|=1;
- if((c->fpcr&(1ULL<<25))||(_zn&&!_zs&&_badproduct))_v=_exp|_quiet;
- if(_zn&&!_zs&&_badproduct)c->fpsr|=1;
-}else if(_badproduct||(_zi&&(_ai||_bi)&&_ps!=_cs)){_v=_exp|_quiet;c->fpsr|=1;}
-else if(_zi||_ai||_bi)_v=_exp|((_zi?_cs:_ps)?_sign:0);
-else {
- unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f),_ez=(unsigned)((_z&_exp)>>_f);
- uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0),_mz=(_z&_frac)|(_ez?_hidden:0);
- uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;
- uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);
- uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;
- unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;
- _p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);
- if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);
- _shift=(_ez?_ez-1:0)+_bias+_f-1;_j=_shift/64;_s=_shift%64;
- _c[_j]=_mz<<_s;if(_s)_c[_j+1]=_mz>>(64-_s);
- unsigned _negative=_ps;
- if(_ps!=_cs) {
-  int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k){if(_p[_k]!=_c[_k]){_compare=_p[_k]>_c[_k]?1:-1;break;}}
-  _negative=_compare>=0?_ps:_cs;uint64_t _borrow=0;
-  for(unsigned _k=0;_k<_count;++_k){uint64_t _left=_compare>=0?_p[_k]:_c[_k],_right=_compare>=0?_c[_k]:_p[_k];
-   uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);_p[_k]=_diff-_borrow;_borrow=_next;}
- }else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k){uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];
-  uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}
- int _top=recomp_fp_top_bit(_p,_count);
- if(_top<0)_v=((_zz&&(_az||_bz)&&_ps==_cs)?_ps:_mode==2)?_sign:0;
- else {int _e=_top+_base,_emin=1-(int)_bias;
-  if(_e<_emin&&(c->fpcr&(1ULL<<24))){c->fpsr|=8;_v=_negative?_sign:0;}
-  else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;
-   unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;
-   uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);
-   unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);
-   unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);
-   unsigned _lost=_roundbit|_sticky;if(_lost){c->fpsr|=16;if(_e<_emin)c->fpsr|=8;
-    if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}
-   if(_e<_emin){_e=_emin;}if(_mant>=(_hidden<<1)){_mant>>=1;++_e;}
-   if(_e>(int)_bias){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}
-   else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);
-   if(_negative)_v|=_sign;
-  }
- }
-}
-}
-)C";
-    if (!exact_only) s += EmitFPNativeSuffix(dbl, mul ? "mul" : "fma");
-    return s;
-}
-
-// FRECPS/FRSQRTS S/D, evaluated exactly before one rounding: 2 - a*b, or
-// (3 - a*b)/2 for FRSQRTS (`half`). Inputs are the raw operand bits _aa and
-// _bb; the result bits are left in _v, which this text declares. A fixed
-// multiword product lattice covers every finite input exponent. This
-// deliberately favors correctness over speed; no host fma or intermediate
-// halve can introduce double rounding. Baseline FP modes only: exception/
-// access trap delivery and FEAT_AFP remain unsupported. The line breaks match
-// what put() emits, so the scalar text is unchanged by sharing it.
-inline std::string EmitFPStepValue(bool dbl, bool half, bool exact_only = false) {
-    if (!exact_only && FpxOutline()) {
-        return "uint64_t _v=0;" + EmitFPOutlined(dbl, half ? "rsqrts" : "recps");
-    }
-    std::string s = std::string("const unsigned _f=")+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
-            ",_count="+(dbl?"67":"9")+";const int _base="+
-            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
-            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
-            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
-            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
-            // FPNeg precedes NaN processing in the architectural pseudocode.
-            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;"+
-            (exact_only ? std::string() : EmitFPNativeValue(dbl,half?"rsqrts":"recps"))+
-            "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
-            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
-            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
-            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
-            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
-            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
-            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
-                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
-            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
-            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
-            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
-            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
-            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
-            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
-            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
-            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
-            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
-            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
-            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
-    if(half)s+="--_bit;_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
-    s+="unsigned _negative=0;"
-            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
-            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
-            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
-            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
-            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
-            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
-            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
-            "int _top=recomp_fp_top_bit(_p,_count);"
-            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
-            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
-            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
-            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
-            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
-            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
-            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
-            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
-            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
-            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
-            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
-            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
-            "if(_negative)_v|=_sign;}}}"+
-            (exact_only ? std::string() : EmitFPNativeSuffix(dbl,half?"rsqrts":"recps"));
-    return s;
-}
-
-// FSQRT/FABD lane text from raw uint64_t _a/_b to _v, after the FPX prefix:
-// constants, FZ input flushing and NaN propagation. FSQRT continues with
-// EmitFPSqrtTail, FABD with an exact subtraction.
-inline std::string EmitFPSqrtAbdHead(bool dbl, bool sqrt) {
-    return std::string(" const unsigned _f=") + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
-           " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-           ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
-           ",_quiet=_hidden>>1; " + std::string(sqrt ? "unsigned _mode=(unsigned)(c->fpcr>>22)&3;" : "") +
-           " if(c->fpcr&(1ULL<<24)) {"
-           " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign;c->fpsr|=128; }"
-           " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign;c->fpsr|=128; } }"
-           " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-           " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-           " if(_an||_bn) { _v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;"
-           " if(_as||_bs) { c->fpsr|=1; } if(c->fpcr&(1ULL<<25)) { _v=_exp|_quiet; } }";
-}
-inline std::string EmitFPSqrtTail(bool dbl) {
-    return std::string("else if(!(_a&~_sign))_v=_a;"
-           " else if(_a&_sign) { _v=_exp|_quiet;c->fpsr|=1; }"
-           " else if((_a&_exp)==_exp)_v=_a;"
-           " else { const int _bias=") + (dbl ? "1023" : "127") +
-           "; uint64_t _magnitude=_a&_frac;"
-           " int _e=(int)((_a&_exp)>>_f)-(int)_bias;"
-           " if(_a&_exp)_magnitude|=_hidden; else { ++_e;"
-           " while(_magnitude<_hidden) { _magnitude<<=1;--_e; } }"
-           " if(_e%2) { _magnitude<<=1;--_e; }"
-           // Restoring square root of magnitude * 2^fraction_bits.
-           // The radicand can exceed 64 bits, but only two bits are
-           // consumed each step; root and remainder fit uint64_t.
-           " uint64_t _root=0,_rem=0;"
-           " for(int _k=(int)_f;_k>=0;--_k) { int _shift=2*_k-(int)_f;"
-           " uint64_t _pair=(_shift>=0?_magnitude>>_shift:_magnitude<<(-_shift))&3;"
-           " _rem=(_rem<<2)|_pair;uint64_t _trial=(_root<<2)|1;_root<<=1;"
-           " if(_rem>=_trial) { _rem-=_trial;_root|=1; } }"
-           " if(_rem) { c->fpsr|=16;"
-           " if(_mode==1||(_mode==0&&_rem>_root))++_root; }"
-           " _e=_e/2+(int)_bias;"
-           " if(_root>=(_hidden<<1)) { _root>>=1;++_e; }"
-           " _v=((uint64_t)_e<<_f)|(_root&_frac); }";
-}
-
-// The out-of-line exact bodies FPX1 sites call (EmitFPOutlined): one function
-// per op and width, in the runtime C, so once per module (once per image when
-// the static build shares the runtime). Each takes the raw operand bits the
-// inline body read, returns the result bits and updates c->fpsr exactly as the
-// inline body did; the text is the same emitter output. FMUL uses fma.
-inline std::string FpxExactC() {
-    std::string s = R"RT(
-/* FPX1: the exact bodies, out of line. The native fast path stays inline at
-   each site; these run only when its gate is closed or its result is not
-   provably exact, so they are kept out of the hot code. */
-#if defined(__GNUC__) || defined(__clang__)
-#define RECOMP_FPE_COLD __attribute__((noinline, cold))
-#elif defined(_MSC_VER)
-#define RECOMP_FPE_COLD __declspec(noinline)
-#else
-#define RECOMP_FPE_COLD
-#endif
-)RT";
-    for (const bool dbl : {false, true}) {
-        const std::string w = dbl ? "64" : "32";
-        const std::string two = "(GuestContext* c,uint64_t _a,uint64_t _b){uint64_t _v=0;\n";
-        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_add" + w + two + EmitFPAddSubValue(dbl, false, true) +
-             "\nreturn _v;}\n";
-        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_sub" + w + two + EmitFPAddSubValue(dbl, true, true) +
-             "\nreturn _v;}\n";
-        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_div" + w + two + EmitFPDivideValue(dbl, true) +
-             "\nreturn _v;}\n";
-        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_fma" + w +
-             "(GuestContext* c,uint64_t _a,uint64_t _b,uint64_t _z){uint64_t _v=0;\n" +
-             EmitFPMulAddValue(dbl, false, true) + "\nreturn _v;}\n";
-        for (const bool half : {false, true}) {
-            s += "RECOMP_FPE_COLD uint64_t recomp_fpe_" + std::string(half ? "rsqrts" : "recps") + w +
-                 "(GuestContext* c,uint64_t _aa,uint64_t _bb){\n" + EmitFPStepValue(dbl, half, true) +
-                 "\nreturn _v;}\n";
-        }
-        s += "RECOMP_FPE_COLD uint64_t recomp_fpe_sqrt" + w +
-             "(GuestContext* c,uint64_t _a){uint64_t _b=0,_v=0;\n" + EmitFPSqrtAbdHead(dbl, true) +
-             EmitFPSqrtTail(dbl) + "\nreturn _v;}\n";
-    }
-    return s;
-}
-
-// Declarations for the runtime header.
-inline const char* FpxExactH() {
-    return R"RT(/* FPX1: the exact bodies the fast path falls back to, out of line
-   (recomp_runtime.c). Raw operand bits in, result bits out, FPSR in c. */
-uint64_t recomp_fpe_add32(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_sub32(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_div32(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_fma32(GuestContext*,uint64_t,uint64_t,uint64_t);
-uint64_t recomp_fpe_recps32(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_rsqrts32(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_sqrt32(GuestContext*,uint64_t);
-uint64_t recomp_fpe_add64(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_sub64(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_div64(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_fma64(GuestContext*,uint64_t,uint64_t,uint64_t);
-uint64_t recomp_fpe_recps64(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_rsqrts64(GuestContext*,uint64_t,uint64_t);
-uint64_t recomp_fpe_sqrt64(GuestContext*,uint64_t);
-)RT";
-}
-
-// Arm FPMin/FPMax/FPMinNum/FPMaxNum on raw S/D bits `a` and `b`, with bitwise
-// ordering so host NaN, signed-zero and denormal modes cannot intervene.
-// Implements baseline FPCR.DN/FZ and cumulative FPSR.IOC/IDC; `store` consumes
-// the result in _v. The line breaks match what put() emits.
-inline std::string EmitFPMinMax(bool dbl, bool minimum, bool numeric, const std::string& a,
-                                const std::string& b, const std::string& store) {
-    std::string s = "{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
-        (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
-        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
-        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";\n    ";
-    s += "if(c->fpcr & (1ULL<<24)) {"
-        " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
-        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }\n    ";
-    s += "{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
-        " _bn=(_b&_exp)==_exp&&(_b&_frac);"
-        " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-        " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }\n    ";
-    if (numeric) {
-        s += "else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;\n    ";
-    }
-    s += "else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
-        " else if(!((_a|_b)&~_sign)) _v=" +
-        std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
-        " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
-        " ((_a&_sign)?_a>_b:_a<_b); _v=" +
-        std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }\n    ";
-    s += "if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
-        " { _v=_exp|_quiet; } " + store + " } }";
-    return s;
-}
-
-// FCMP-style comparison of S/D registers `a` and `b` (register arrays; an
-// empty `b` compares with +0.0) into NZCV: 0110 equal, 1000 less, 0010
-// greater, 0011 unordered. Integer ordering of the IEEE bits, so host compare
-// semantics and modes cannot intervene. FZ flushes subnormal inputs (IDC); a
-// NaN raises IOC when it is signalling, or for any NaN when `signal` is set.
-inline std::string EmitFPCompareFlags(bool dbl, bool signal, const std::string& a,
-                                      const std::string& b) {
-    const std::string sz = dbl ? "8" : "4";
-    return "{ uint64_t _a=0,_b=0; memcpy(&_a," + a + "," + sz + ");" +
-        (b.empty() ? std::string() : " memcpy(&_b," + b + "," + sz + ");") +
-        " const uint64_t _sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
-        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
-        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
-        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
-        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
-        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-        " if(_an||_bn) { if(" + (signal ? "1" : "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))") +
-        ") c->fpsr|=1; c->n=0; c->z=0; c->c=1; c->v=1; }"
-        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
-        " int _lt=!_eq&&(((_a^_b)&_sign)?!!(_a&_sign):((_a&_sign)?_a>_b:_a<_b));"
-        " c->n=(uint8_t)_lt; c->z=(uint8_t)_eq; c->c=(uint8_t)!_lt; c->v=0; } }";
-}
-
-// FCMEQ/FCMGE/FCMGT (`kind` "eq", "ge", "gt") of raw S/D bits `a` and `b` into
-// an all-ones or zero _v, which `store` consumes. Integer ordering of the IEEE
-// bits; FZ flushes subnormal inputs (IDC). A NaN compares false and raises IOC
-// when it is signalling, or for any NaN in the ordered GE/GT forms.
-inline std::string EmitFPCompareMask(bool dbl, const std::string& kind, const std::string& a,
-                                     const std::string& b, const std::string& store) {
-    const bool eq = kind == "eq";
-    return "{ uint64_t _a=" + a + ",_b=" + b + ",_v=0; const uint64_t _sign=" +
-        (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
-        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
-        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
-        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
-        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
-        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-        " if(_an||_bn) { if(" + std::string(eq ? "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))" : "1") +
-        ") c->fpsr|=1; }"
-        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
-        " int _gt=!_eq&&(((_a^_b)&_sign)?!(_a&_sign):((_a&_sign)?_a<_b:_a>_b)); (void)_gt; (void)_eq;"
-        " if(" + (eq ? "_eq" : kind == "ge" ? "_eq||_gt" : "_gt") + ") _v=~(uint64_t)0; } " + store + " }";
-}
-
-inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
-    if (unhandled) {
-        *unhandled = false;
+// Append C for one instruction. Returns false if the instruction terminates the block. When
+// supplied, known_unhandled distinguishes an explicit runtime fallback from a translated
+// instruction; the return value alone cannot do that because fallbacks deliberately leave the
+// current block open.
+inline bool Translate(u32 i, u64 pc, std::string& out, bool* known_unhandled = nullptr) {
+    if (known_unhandled) {
+        *known_unhandled = false;
     }
     char buf[256];
     // Appends in place. Taking a string_view and appending piecewise (rather
@@ -1039,44 +487,16 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         out.append(s);
         out.push_back('\n');
     };
-    // Every "we cannot translate this" path goes through here. Three sites used
-    // to emit the call by hand and return early, which meant they never set the
-    // coverage flag - the exclusives alone were 5,036 instructions per export
-    // that the static coverage figure silently did not count.
-    auto put_unhandled = [&]() {
-        if (unhandled) {
-            *unhandled = true;
+    const auto put_unhandled = [&]() {
+        if (known_unhandled) {
+            *known_unhandled = true;
         }
-        char b[128];
-        snprintf(b, sizeof b,
+        char fallback[128];
+        snprintf(fallback, sizeof fallback,
                  "recomp_unhandled(c,0x%08xU,g_module_base+0x%llxULL); if(c->halted) return;", i,
                  (unsigned long long)pc);
-        put(b);
+        put(fallback);
     };
-    // S/D FRECPE and FRSQRTE share one lane core; U selects reciprocal sqrt.
-    // Decode before the legacy conversion class, whose opcode is shared here.
-    const bool estimate_scalar = (i & 0xDFBFFC00u) == 0x5EA1D800u;
-    const bool estimate_vector = (i & 0x9FBFFC00u) == 0x0EA1D800u;
-    if (estimate_scalar || estimate_vector) {
-        const bool dbl = (i & (1u << 22)) != 0;
-        const bool q = (i & (1u << 30)) != 0;
-        if (estimate_vector && dbl && !q) { put_unhandled(); return true; }
-        const unsigned rn = (i >> 5) & 31, rd = i & 31;
-        const unsigned width = dbl ? 64 : 32;
-        const unsigned bytes = estimate_scalar ? width / 8 : q ? 16 : 8;
-        const unsigned lanes = bytes / (width / 8);
-        const std::string ty = dbl ? "uint64_t" : "uint32_t";
-        std::string s = "{ " + ty + " _a[" + std::to_string(lanes) + "],_r[" +
-                        std::to_string(lanes) + "]; memcpy(_a,c->vreg[" +
-                        std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-        s += "for(unsigned _i=0;_i<" + std::to_string(lanes) + ";++_i) _r[_i]=(" + ty +
-             ")recomp_fp_estimate(c,_a[_i]," + std::to_string(width) + "," +
-             std::to_string((i >> 29) & 1) + "); ";
-        s += "memset(c->vreg[" + std::to_string(rd) + "],0,16); memcpy(c->vreg[" +
-             std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-        put(s);
-        return true;
-    }
     const u64 next = pc + 4;
 
     if ((i & 0xFFFFF01F) == 0xD503201F) { put("/* nop/hint */"); return true; }
@@ -1215,10 +635,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         u32 sf = i >> 31, op = (i >> 30) & 1, S = (i >> 29) & 1, shift = (i >> 22) & 3, rm = (i >> 16) & 31, imm6 = (i >> 10) & 0x3F, rn = (i >> 5) & 31, rd = i & 31;
         // ROR is reserved for ADD/SUB shifted register - decoding it as a shift
         // would silently invent an instruction the CPU does not have.
-        // Same width rule as the logical form: the 32-bit encoding is only
-        // allocated for imm6 < 32, and shifting a uint32_t by 32..63 is
-        // undefined behaviour rather than a translation.
-        if (shift == 3 || (!sf && imm6 >= 32)) {
+        if (shift == 3) {
             put_unhandled();
             return true;
         }
@@ -1317,8 +734,11 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             if (rt != 31) {
                 snprintf(buf, sizeof buf, "c->x[%u]=recomp_load%s(c,%s);", rt, ty, addr.c_str());
                 put(buf);
+            } else {
+                snprintf(buf, sizeof buf, "(void)recomp_load%s(c,%s);", ty, addr.c_str());
+                put(buf);
             }
-        } else if (size < 3) {
+        } else if (size < 2 || (size == 2 && opc == 2)) {
             // Signed load: sign-extend from the accessed width.
             const char* st = size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
             if (rt != 31) {
@@ -1327,9 +747,12 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 if (opc == 3) s += "_r &= 0xFFFFFFFFULL; ";   // 32-bit destination
                 s += "c->x[" + std::to_string(rt) + "] = _r; }";
                 put(s);
+            } else {
+                put("(void)recomp_load" + std::string(ty) + "(c," + addr + ");");
             }
         } else {
-            // size==3 with opc>=2 is not a defined load/store here.
+            // size==2/opc==3 and the size==3/opc>=2 combinations are not
+            // defined scalar loads/stores in this addressing class.
             put_unhandled();
             return true;
         }
@@ -1407,14 +830,21 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             s += "int64_t _o=" + std::to_string((long long)off) + "; ";
             const std::string w = std::to_string(sz * 8);
             if (is_load) {
-                // Both words come back through temporaries. Rt/Rt2 == 31 is XZR
-                // here, so that half is simply not written back - writing it
-                // would land on c->x[31], which is where SP lives. The load
-                // itself still happens, which is what the architecture does.
-                s += "{ uint64_t _p0,_p1; recomp_ldp" + w + "(c," + addr + ",&_p0,&_p1); ";
-                if (rt != 31)  s += "c->x[" + std::to_string(rt) + "]=_p0; ";
-                if (rt2 != 31) s += "c->x[" + std::to_string(rt2) + "]=_p1; ";
-                s += "} ";
+                // Rt/Rt2 == 31 is XZR here, so the loaded value is discarded -
+                // writing it would land on c->x[31], which is where SP lives.
+                if (rt != 31) {
+                    s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(sz * 8) +
+                         "(c," + addr + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(sz * 8) + "(c," + addr + "); ";
+                }
+                if (rt2 != 31) {
+                    s += "c->x[" + std::to_string(rt2) + "]=recomp_load" + std::to_string(sz * 8) +
+                         "(c," + addr + "+" + std::to_string(sz) + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(sz * 8) + "(c," + addr + "+" +
+                         std::to_string(sz) + "); ";
+                }
             } else {
                 s += "recomp_stp" + w + "(c," + addr + "," +
                      (rt == 31 ? std::string("(uint64_t)0") : ("c->x[" + std::to_string(rt) + "]")) +
@@ -1587,7 +1017,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         s32 imm9 = (s32)((i >> 12) & 0x1FF);
         if (imm9 & 0x100) imm9 |= ~0x1FF;
         // mode 0 = LDUR/STUR, 1 = post-index, 3 = pre-index
-        if ((mode == 0 || mode == 1 || mode == 3) && size <= 3) {
+        // PRFUM is only the size=11/opc=10 unscaled form. The writeback forms
+        // and opc=11 are unallocated and must reach the fallback engine.
+        if (size == 3 && opc == 2 && mode == 0) {
+            put("/* prfum */");
+            return true;
+        }
+        if ((mode == 0 || mode == 1 || mode == 3) && size <= 3 &&
+            !(size == 2 && opc == 3) && !(size == 3 && opc >= 2)) {
             const u32 bits = 8u << size;
             std::string s = "{ uint64_t _b=c->x[" + std::to_string(rn) + "]; int64_t _o=" +
                             std::to_string((long long)imm9) + "; ";
@@ -1608,17 +1045,19 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 if (rt != 31) {
                     s += "c->x[" + std::to_string(rt) + "]=recomp_load" + std::to_string(bits) +
                          "(c," + addr + "); ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
                 }
-            } else if (size == 3) {
-                // opc>=2 with size==3 is PRFUM, a prefetch hint. It has no
-                // architectural effect, so emitting nothing is exact - what it
-                // must never do is store.
-            } else if (rt != 31) {
-                s += "c->x[" + std::to_string(rt) + "]=(uint64_t)(int64_t)" + signed_cast +
-                     "recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
-                // opc==3 sign-extends into a 32-bit destination, so the result
-                // is truncated back to W width after the extension.
-                if (opc == 3) s += "c->x[" + std::to_string(rt) + "]&=0xFFFFFFFFULL; ";
+            } else {
+                if (rt != 31) {
+                    s += "c->x[" + std::to_string(rt) + "]=(uint64_t)(int64_t)" + signed_cast +
+                         "recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
+                    // opc==3 sign-extends into a 32-bit destination, so the result
+                    // is truncated back to W width after the extension.
+                    if (opc == 3) s += "c->x[" + std::to_string(rt) + "]&=0xFFFFFFFFULL; ";
+                } else {
+                    s += "(void)recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
+                }
             }
             if (mode == 1 || mode == 3) s += "c->x[" + std::to_string(rn) + "]=_b+_o; ";
             s += "}";
@@ -1627,117 +1066,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // Load/store exclusive and acquire/release.
-    //
-    // The non-exclusive acquire/release forms (LDAR/STLR, o2 set) are ordinary
-    // loads and stores as far as this backend is concerned - suyu's memory
-    // accessors are already atomic at these widths, and there is no weaker
-    // ordering here to fence against - so they are translated directly.
-    //
-    // The genuinely exclusive forms (LDXR/LDAXR/STXR/STLXR, o2 clear) are not.
-    // They used to become a plain load/store with STXR unconditionally
-    // reporting success, which is exact only when nothing else can touch the
-    // address. Under this backend real guest threads run concurrently, so an
-    // always-succeeds STXR makes every compare-and-swap non-atomic: two
-    // threads both "win" the same lock, the data it protects is then updated
-    // from both, and the next thread to wait on it spins forever. Hand these
-    // to the fallback engine, which owns the kernel's real exclusive monitor.
+    // Load/store exclusive, acquire/release, and atomic instructions. The C
+    // runtime memory helpers are plain accesses: wrapping them in fences would
+    // not make the accesses atomic and would still leave a C++ data race. Hand
+    // this complete encoding group to the fallback engine, which owns the
+    // kernel's exclusive monitor and implements the required memory ordering.
     if ((i & 0x3F000000) == 0x08000000) {
-        const u32 size = i >> 30, o2 = (i >> 23) & 1, L = (i >> 22) & 1, o1 = (i >> 21) & 1;
-        const u32 rt2 = (i >> 10) & 31, rn = (i >> 5) & 31, rt = i & 31;
-        // Pair forms: LDXP/LDAXP/STXP/STLXP. size 00/01 is unallocated here,
-        // so only the 32- and 64-bit register widths exist.
-        //
-        // These carry the lock traffic. A threaded engine implements its mutex
-        // as a 128-bit compare-and-swap over {owner, count} or {ptr, tag}, and
-        // on a second title the pair forms alone were 73.5% of every
-        // transition to the fallback engine once cntpct_el0 was implemented.
-        if (o1 && !o2 && (size == 2 || size == 3)) {
-            const u32 rbytes = (size == 3) ? 8u : 4u;
-            const std::string addr = "c->x[" + std::to_string(rn) + "]";
-            const std::string sz = std::to_string(rbytes);
-            if (L) {
-                // LDXP/LDAXP. Rt takes the low half, Rt2 the high half - the
-                // same order DynarmicExclusiveMonitor::ExclusiveRead128 fills,
-                // and for the 32-bit form the low and high words of the
-                // doubleword at the address.
-                std::string s2 = "{ uint64_t _lo,_hi; recomp_ldxp(c," + addr + "," + sz +
-                                 ",&_lo,&_hi); ";
-                // A W-register destination is written zero-extended.
-                const char* cast = (rbytes == 4) ? "(uint32_t)" : "";
-                if (rt != 31) {
-                    s2 += "c->x[" + std::to_string(rt) + "] = " + cast + "_lo; ";
-                }
-                if (rt2 != 31) {
-                    s2 += "c->x[" + std::to_string(rt2) + "] = " + cast + "_hi; ";
-                }
-                s2 += "}";
-                put(s2);
-            } else {
-                // STXP/STLXP. Rs (bits 20:16) receives the status, 0 on success.
-                const u32 rs = (i >> 16) & 31;
-                const std::string lo =
-                    (rbytes == 4) ? ("(uint64_t)(uint32_t)" + Xz(rt)) : Xz(rt);
-                const std::string hi =
-                    (rbytes == 4) ? ("(uint64_t)(uint32_t)" + Xz(rt2)) : Xz(rt2);
-                std::string s2 = "{ uint32_t _st = recomp_stxp(c," + addr + "," + sz + "," +
-                                 lo + "," + hi + "); ";
-                if (rs != 31) {
-                    s2 += "c->x[" + std::to_string(rs) + "] = _st; ";
-                }
-                s2 += "}";
-                put(s2);
-            }
-            return true;
-        }
-        if (!o1 && rt2 == 31) {
-            const u32 bits = 8u << size;
-            if (!o2) {
-                // LDXR/LDAXR and STXR/STLXR. Both route through the emulator's
-                // own exclusive monitor, so an exclusive taken here is visible
-                // to a thread running on the fallback JIT.
-                //
-                // Acquire/release ordering (the LDAXR/STLXR spelling, o0 set)
-                // is not modelled separately: suyu's memory accessors are
-                // already atomic at these widths and the host is x86-64, whose
-                // ordering is strong enough that the fence these imply is a
-                // no-op in practice. Noted rather than silently assumed.
-                const std::string addr = "c->x[" + std::to_string(rn) + "]";
-                if (L) {
-                    // LDXR/LDAXR: mark and load.
-                    if (rt != 31) {
-                        put("c->x[" + std::to_string(rt) + "] = recomp_ldxr(c," + addr + "," +
-                            std::to_string(bits / 8) + ");");
-                    } else {
-                        put("(void)recomp_ldxr(c," + addr + "," + std::to_string(bits / 8) + ");");
-                    }
-                } else {
-                    // STXR/STLXR: Rs receives the status, 0 on success. Rs is
-                    // held in the Rt2 field's neighbour (bits 20:16).
-                    const u32 rs = (i >> 16) & 31;
-                    std::string s2 = "{ uint32_t _st = recomp_stxr(c," + addr + "," +
-                                     std::to_string(bits / 8) + "," + Xz(rt) + "); ";
-                    if (rs != 31) {
-                        s2 += "c->x[" + std::to_string(rs) + "] = _st; ";
-                    }
-                    s2 += "}";
-                    put(s2);
-                }
-                return true;
-            }
-            const std::string addr = "c->x[" + std::to_string(rn) + "]";
-            if (L) {
-                // LDAR
-                if (rt != 31) {
-                    put("c->x[" + std::to_string(rt) + "] = recomp_load" +
-                        std::to_string(bits) + "(c," + addr + ");");
-                }
-            } else {
-                // STLR - no status register.
-                put("recomp_store" + std::to_string(bits) + "(c," + addr + "," + Xz(rt) + ");");
-            }
-            return true;
-        }
+        put_unhandled();
+        return true;
     }
 
     // Data-processing 3-source: MADD/MSUB and the widening multiplies.
@@ -1824,7 +1160,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         // indexed read of an int32 array compiles to LDRSW with a register
         // offset - so leaving them out put thousands of real loads on the
         // fallback.
-        if (size <= 3 && !(opc >= 2 && size == 3)) {
+        if (size <= 3 && !(opc >= 2 && size == 3) && !(size == 2 && opc == 3)) {
             const u32 bits = 8u << size;
             std::string idx;
             switch (option) {
@@ -1843,14 +1179,22 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                     if (rt != 31) {
                         put("c->x[" + std::to_string(rt) + "] = recomp_load" +
                             std::to_string(bits) + "(c," + addr + ");");
+                    } else {
+                        put("(void)recomp_load" + std::to_string(bits) + "(c," + addr + ");");
                     }
-                } else if (rt != 31) {
-                    const char* st = size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
-                    std::string s = "{ uint64_t _r = (uint64_t)(int64_t)(" + std::string(st) +
-                                    ")recomp_load" + std::to_string(bits) + "(c," + addr + "); ";
-                    if (opc == 3) s += "_r &= 0xFFFFFFFFULL; ";   // 32-bit destination
-                    s += "c->x[" + std::to_string(rt) + "] = _r; }";
-                    put(s);
+                } else {
+                    if (rt != 31) {
+                        const char* st =
+                            size == 0 ? "int8_t" : size == 1 ? "int16_t" : "int32_t";
+                        std::string s = "{ uint64_t _r = (uint64_t)(int64_t)(" +
+                                        std::string(st) + ")recomp_load" +
+                                        std::to_string(bits) + "(c," + addr + "); ";
+                        if (opc == 3) s += "_r &= 0xFFFFFFFFULL; "; // 32-bit destination
+                        s += "c->x[" + std::to_string(rt) + "] = _r; }";
+                        put(s);
+                    } else {
+                        put("(void)recomp_load" + std::to_string(bits) + "(c," + addr + ");");
+                    }
                 }
                 return true;
             }
@@ -5036,165 +4380,141 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     // hand-off to the fallback engine correct: the remaining instructions in
     // this block must not run twice, since the fallback resumes at this same
     // PC and will execute them itself.
-    // ---- EXTR (and therefore ROR immediate) ----------------------------
-    //
-    // ROR Rd, Rn, #imm is EXTR with Rn == Rm, and between the two widths it was
-    // 13.1% of every unhandled instruction in a second title - the single
-    // largest gap after EXT, and pure integer work. Compilers emit it for
-    // rotates in hashing and bit-twiddling code.
-    //
-    // sf 0 0 100111 N 0 Rm imms Rn Rd. N must track sf: N==sf is the only
-    // allocated combination, and imms must be < 32 in the 32-bit form.
-    if ((i & 0x7FA00000) == 0x13800000) {
-        const u32 sf = i >> 31, N = (i >> 22) & 1;
-        const u32 rm = (i >> 16) & 31, imms = (i >> 10) & 63;
-        const u32 rn = (i >> 5) & 31, rd = i & 31;
-        const u32 width = sf ? 64u : 32u;
-        if (N == sf && imms < width) {
-            if (rd != 31) {
-                std::string s2 = "{ uint64_t _hi=" + (sf ? Xz(rn) : ("(uint64_t)" + Wz(rn))) +
-                                 ", _lo=" + (sf ? Xz(rm) : ("(uint64_t)" + Wz(rm))) + ", _r; ";
-                if (imms == 0) {
-                    // Shifting by the full width is undefined in C, and lsb==0
-                    // is the common case (a plain MOV-through-EXTR).
-                    s2 += "_r = _lo; ";
-                } else {
-                    s2 += "_r = (_lo >> " + std::to_string(imms) + ") | (_hi << " +
-                          std::to_string(width - imms) + "); ";
-                }
-                if (!sf) s2 += "_r &= 0xFFFFFFFFULL; ";
-                s2 += "c->x[" + std::to_string(rd) + "] = _r; }";
-                put(s2);
-            } else {
-                put("/* extr -> xzr */");
-            }
-            return true;
-        }
-    }
-
-    // ---- ADC / ADCS / SBC / SBCS ---------------------------------------
-    //
-    // sf op S 11010000 Rm 000000 Rn Rd. op: 0 = ADC, 1 = SBC. Small but real -
-    // 1.4% of the gap - and it appears in multi-word arithmetic where getting
-    // the carry wrong is silent.
-    if ((i & 0x1FE0FC00) == 0x1A000000) {
-        const u32 sf = i >> 31, op = (i >> 30) & 1, S = (i >> 29) & 1;
-        const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
-        const char* sign = sf ? "0x8000000000000000ULL" : "0x80000000ULL";
-        std::string s2 = "{ uint64_t _a=" + (sf ? Xz(rn) : ("(uint64_t)" + Wz(rn))) +
-                         ", _b=" + (sf ? Xz(rm) : ("(uint64_t)" + Wz(rm))) +
-                         ", _ci=(uint64_t)c->c, _r; ";
-        // SBC is ADC against the inverted operand, which is also what makes the
-        // borrow come out right: carry-clear means borrow.
-        if (op) s2 += sf ? "_b = ~_b; " : "_b = (~_b) & 0xFFFFFFFFULL; ";
-        s2 += "_r = _a + _b + _ci; ";
-        if (!sf) s2 += "_r &= 0xFFFFFFFFULL; ";
-        if (S) {
-            s2 += std::string("c->z = (_r == 0); c->n = (_r & ") + sign + ") ? 1 : 0; ";
-            if (sf) {
-                // Unsigned overflow with a carry-in: the sum wraps either when
-                // it lands below _a, or when it lands exactly on _a with the
-                // carry set (_b == ~0 and _ci == 1).
-                s2 += "c->c = (_r < _a) || (_ci && _r == _a); ";
-            } else {
-                s2 += "c->c = ((_a + _b + _ci) > 0xFFFFFFFFULL); ";
-            }
-            s2 += std::string("c->v = ((~(_a ^ _b) & (_a ^ _r)) & ") + sign + ") ? 1 : 0; ";
-        }
-        if (rd != 31) {
-            s2 += "c->x[" + std::to_string(rd) + "] = _r; ";
-        }
-        s2 += "}";
-        put(s2);
-        return true;
-    }
-
-    // ---- LDPSW ----------------------------------------------------------
-    //
-    // Load pair of 32-bit words, each sign-extended to 64. opc=01 V=0 L=1, so
-    // it sits outside the LDP/STP handler above, which only covers opc 00/10.
-    // 3.1% of the gap, and it turns up wherever a pair of ints is read into
-    // 64-bit registers at once.
-    //
-    // 0110100xx1 ... : signed offset 0x69400000, post-index 0x68C00000,
-    // pre-index 0x69C00000. imm7 is scaled by 4.
-    if ((i & 0xFFC00000) == 0x69400000 || (i & 0xFFC00000) == 0x68C00000 ||
-        (i & 0xFFC00000) == 0x69C00000) {
-        const u32 rt = i & 31, rn = (i >> 5) & 31, rt2 = (i >> 10) & 31;
-        const s32 imm7 = ((s32)(((i >> 15) & 0x7F) << 25) >> 25) * 4;
-        const bool post = (i & 0xFFC00000) == 0x68C00000;
-        const bool pre = (i & 0xFFC00000) == 0x69C00000;
-
-        std::string s2 = "{ uint64_t _base=" + Xsp(rn) + "; uint64_t _addr = _base";
-        if (!post) s2 += " + (int64_t)" + std::to_string(imm7);
-        s2 += "; ";
-        // Both words are read before either register is written: Rn may be Rt
-        // or Rt2, and writing early would corrupt the address for the second
-        // load.
-        s2 += "uint64_t _v1 = (uint64_t)(int64_t)(int32_t)(uint32_t)recomp_load32(c,_addr); ";
-        s2 += "uint64_t _v2 = (uint64_t)(int64_t)(int32_t)(uint32_t)recomp_load32(c,_addr+4); ";
-        if (rt != 31) s2 += "c->x[" + std::to_string(rt) + "] = _v1; ";
-        if (rt2 != 31) s2 += "c->x[" + std::to_string(rt2) + "] = _v2; ";
-        if (post || pre) {
-            s2 += "c->x[" + std::to_string(rn) + "] = _base + (int64_t)" +
-                  std::to_string(imm7) + "; ";
-        }
-        s2 += "}";
-        put(s2);
-        return true;
-    }
-
     put_unhandled();
     return true;
 }
 
 
+// Encode arbitrary UTF-8 bytes as one C string literal. Octal escapes are used for bytes outside
+// printable ASCII because, unlike \x escapes, exactly three octal digits cannot consume a
+// following hexadecimal character. This keeps ROM titles containing quotes, newlines, or
+// non-ASCII characters from producing invalid generated source.
+inline std::string EscapeCString(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    char octal[5];
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        case '?':
+            // Generated projects target C11, where ??/ is a trigraph for a backslash and can
+            // turn the following byte into an escape sequence before the compiler sees it.
+            escaped += "\\077";
+            break;
+        default:
+            if (ch >= 0x20 && ch <= 0x7E) {
+                escaped += static_cast<char>(ch);
+            } else {
+                snprintf(octal, sizeof octal, "\\%03o", static_cast<unsigned>(ch));
+                escaped += octal;
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+inline bool IsModuleIdentifier(std::string_view value) {
+    if (value.empty() || value.size() > 32) {
+        return false;
+    }
+    for (const unsigned char ch : value) {
+        if ((ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') &&
+            (ch < '0' || ch > '9') && ch != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char* RuntimeH();
 const char* RuntimeC();
 
-/// One bucket of the unhandled-instruction histogram.
 struct UnhandledSite {
-    size_t count = 0;
-    u32 example_insn = 0;   ///< a representative full encoding, for hand-decoding
-    u64 example_pc = 0;     ///< where that example lives, for disassembling in context
+    size_t count{};
+    u32 example_instruction{};
+    u64 example_pc{};
 };
 
-/// AArch64 top-level encoding group, from bits 28:25 of the instruction.
-/// Table C4-1 in the ARM ARM. Coarse, but enough to say "the gap is SIMD"
-/// versus "the gap is loads and stores" at a glance.
-inline const char* EncodingGroupName(u32 op0) {
-    switch (op0 & 0xF) {
-    case 0x0: return "reserved/sme";
-    case 0x1: case 0x3: return "unallocated";
-    case 0x2: return "sve";
-    case 0x8: case 0x9: return "dp-immediate";
-    case 0xA: case 0xB: return "branch/exception/system";
-    case 0x4: case 0x6: case 0xC: case 0xE: return "load/store";
-    case 0x5: case 0xD: return "dp-register";
-    case 0x7: case 0xF: return "dp-simd/fp";
-    default: return "unknown";
+// Top-level AArch64 encoding group selected by instruction bits 28:25.
+inline const char* EncodingGroupName(u32 group) {
+    switch (group & 0xF) {
+    case 0x0:
+        return "reserved/sme";
+    case 0x1:
+    case 0x3:
+        return "unallocated";
+    case 0x2:
+        return "sve";
+    case 0x8:
+    case 0x9:
+        return "dp-immediate";
+    case 0xA:
+    case 0xB:
+        return "branch/exception/system";
+    case 0x4:
+    case 0x6:
+    case 0xC:
+    case 0xE:
+        return "load/store";
+    case 0x5:
+    case 0xD:
+        return "dp-register";
+    case 0x7:
+    case 0xF:
+        return "dp-simd/fp";
+    default:
+        return "unknown";
     }
 }
 
 // Stats returned to the caller for manifest/reporting.
 struct RecompileStats {
-    size_t blocks = 0;
-    size_t instructions = 0;          ///< n_bytes/4: every word in .text, padding included
-    size_t translated_terminators = 0;
-    size_t emitted = 0;               ///< instructions actually walked inside discovered blocks
-    size_t unhandled = 0;             ///< of those, how many fell through to recomp_unhandled
+    size_t blocks{};
+    size_t instructions{}; ///< All four-byte words in the input text segment.
+    size_t translated_terminators{};
+    size_t visited_instructions{};       ///< Instructions walked while emitting discovered blocks.
+    size_t known_unhandled_instructions{}; ///< Instructions explicitly sent to runtime fallback.
+    std::map<u32, size_t> known_unhandled_by_op0;
+    std::map<u32, UnhandledSite> known_unhandled_by_signature;
 
-    /// Unhandled counts keyed by encoding group (bits 28:25).
-    std::map<u32, size_t> unhandled_by_group;
-    /// Unhandled counts keyed by the top 10 bits, which usually identifies the
-    /// opcode family while dropping register operands. This is the list that
-    /// says which instruction to implement next.
-    std::map<u32, UnhandledSite> unhandled_by_signature;
-
-    /// Fraction of walked instructions the decoder could not translate.
-    double UnhandledFraction() const {
-        return emitted ? double(unhandled) / double(emitted) : 0.0;
+    [[nodiscard]] size_t KnownTranslatedInstructions() const {
+        return visited_instructions - known_unhandled_instructions;
     }
+
+    [[nodiscard]] double KnownUnhandledFraction() const {
+        return visited_instructions
+                   ? static_cast<double>(known_unhandled_instructions) /
+                         static_cast<double>(visited_instructions)
+                   : 0.0;
+    }
+
+    [[nodiscard]] double KnownTranslatedFraction() const {
+        return visited_instructions ? 1.0 - KnownUnhandledFraction() : 0.0;
+    }
+};
+
+// Module-relative virtual addresses needed by the generated standalone loader. Hosted suyu uses
+// its own already-mapped process memory, but a portable emitted executable must reproduce the NSO
+// segment layout exactly instead of placing every bundled file at the start of its flat buffer.
+struct RecompileImageLayout {
+    u64 rodata_vaddr{};
+    u64 data_vaddr{};
+    u64 bss_size{};
 };
 
 // Emit a buildable C project that statically recompiles `text` (raw AArch64 .text at `base`).
@@ -5222,8 +4542,121 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                                   // block discovery seeds a root at each even when nothing in
                                   // this module's own .text branches there directly.
                                   const std::vector<u64>* extra_roots = nullptr,
-                                  // Internal fixture control; production exports use 32 MiB.
-                                  size_t unit_source_limit = 32u << 20) {
+                                  RecompileImageLayout image_layout = {},
+                                  // Exact NSO build ID used to bind the generated image back to
+                                  // the module it came from at runtime. Raw inputs have no NSO
+                                  // identity and therefore leave this null, which emits 32 zeros.
+                                  const std::array<u8, 0x20>* build_id = nullptr,
+                                  // SHA-256 and byte size of the page-aligned mapped text image.
+                                  // Both are absent for raw inputs, which emit a zero hash/size.
+                                  const std::array<u8, 0x20>* text_sha256 = nullptr,
+                                  u64 mapped_text_size = 0) {
+    (void)source_only; // Kept in the public API for compatibility; this function only emits files.
+    if (!IsModuleIdentifier(mod)) {
+        throw std::invalid_argument(
+            "module must contain 1-32 ASCII letters, digits, or underscores");
+    }
+    if (!text || n_bytes == 0 || (n_bytes & 3) != 0) {
+        throw std::invalid_argument("text must be non-empty and a multiple of four bytes");
+    }
+    if (n_bytes / 4 > std::numeric_limits<u32>::max() ||
+        n_bytes > std::numeric_limits<u64>::max() - base) {
+        throw std::invalid_argument("text address range is too large");
+    }
+    if (out_dir.empty()) {
+        throw std::invalid_argument("output directory must not be empty");
+    }
+    const auto max_stream_size = static_cast<size_t>(std::numeric_limits<std::streamsize>::max());
+    if (n_bytes > max_stream_size || rodata_size > max_stream_size || data_size > max_stream_size) {
+        throw std::invalid_argument("a segment is too large to emit on this host");
+    }
+    if ((!rodata && rodata_size != 0) || (!data_seg && data_size != 0)) {
+        throw std::invalid_argument("a segment size was provided without segment data");
+    }
+    if ((text_sha256 == nullptr) != (mapped_text_size == 0)) {
+        throw std::invalid_argument("mapped text SHA-256 and size must be provided together");
+    }
+    if (text_sha256) {
+        constexpr u64 TextPageSize = 0x1000;
+        if (n_bytes > std::numeric_limits<u64>::max() - (TextPageSize - 1)) {
+            throw std::invalid_argument("mapped text size overflows 64 bits");
+        }
+        const u64 expected_mapped_text_size =
+            (static_cast<u64>(n_bytes) + TextPageSize - 1) & ~(TextPageSize - 1);
+        if (mapped_text_size != expected_mapped_text_size) {
+            throw std::invalid_argument(
+                "mapped text size must equal the decoded text rounded up to 0x1000 bytes");
+        }
+    }
+    const u64 text_end = base + static_cast<u64>(n_bytes);
+    const auto checked_end = [](u64 address, u64 size, const char* name) {
+        if (size > std::numeric_limits<u64>::max() - address) {
+            throw std::invalid_argument(std::string{name} + " address range overflows 64 bits");
+        }
+        return address + size;
+    };
+    const auto ranges_overlap = [](u64 first, u64 first_end, u64 second, u64 second_end) {
+        return first < second_end && second < first_end;
+    };
+    u64 image_end = text_end;
+    u64 rodata_end = image_layout.rodata_vaddr;
+    if (rodata_size != 0) {
+        if (image_layout.rodata_vaddr < base) {
+            throw std::invalid_argument("rodata must lie inside the standalone memory window");
+        }
+        rodata_end = checked_end(image_layout.rodata_vaddr, static_cast<u64>(rodata_size),
+                                 "rodata");
+        if (ranges_overlap(base, text_end, image_layout.rodata_vaddr, rodata_end)) {
+            throw std::invalid_argument("text and rodata ranges overlap");
+        }
+        image_end = std::max(image_end, rodata_end);
+    }
+    u64 data_end = image_layout.data_vaddr;
+    u64 data_and_bss_end = image_layout.data_vaddr;
+    if (data_size != 0 || image_layout.bss_size != 0) {
+        if (image_layout.data_vaddr < base) {
+            throw std::invalid_argument("data/BSS must lie inside the standalone memory window");
+        }
+        data_end = checked_end(image_layout.data_vaddr, static_cast<u64>(data_size), "data");
+        data_and_bss_end = checked_end(data_end, image_layout.bss_size, "BSS");
+        if (ranges_overlap(base, text_end, image_layout.data_vaddr, data_and_bss_end)) {
+            throw std::invalid_argument("text and data/BSS ranges overlap");
+        }
+        if (rodata_size != 0 &&
+            ranges_overlap(image_layout.rodata_vaddr, rodata_end, image_layout.data_vaddr,
+                           data_and_bss_end)) {
+            throw std::invalid_argument("rodata and data/BSS ranges overlap");
+        }
+        image_end = std::max(image_end, data_and_bss_end);
+    }
+    constexpr u64 MinimumGuestMemorySize = 256ULL * 1024 * 1024;
+    constexpr u64 RuntimeTailSize = 128ULL * 1024 * 1024;
+    constexpr u64 StackReserveSize = 1ULL * 1024 * 1024;
+    u64 aligned_image_size = image_end - base;
+    if (aligned_image_size > std::numeric_limits<u64>::max() - 0xFFF) {
+        throw std::invalid_argument("standalone memory window is too large");
+    }
+    aligned_image_size = (aligned_image_size + 0xFFF) & ~0xFFFULL;
+    if (aligned_image_size > std::numeric_limits<u64>::max() - RuntimeTailSize) {
+        throw std::invalid_argument("standalone image leaves no room for runtime memory");
+    }
+    const u64 guest_memory_size =
+        std::max(MinimumGuestMemorySize, aligned_image_size + RuntimeTailSize);
+    if (guest_memory_size > std::numeric_limits<u64>::max() - base) {
+        throw std::invalid_argument("standalone memory window overflows 64 bits");
+    }
+    const u64 heap_base = base + std::max(guest_memory_size / 2, aligned_image_size);
+    const u64 heap_end = base + guest_memory_size - StackReserveSize;
+    if (entry_pc != 0 && ((entry_pc & 3) != 0 || entry_pc < base || entry_pc >= text_end)) {
+        throw std::invalid_argument("entry PC must be aligned and inside text");
+    }
+    if (extra_roots) {
+        for (const u64 root : *extra_roots) {
+            if ((root & 3) != 0 || root < base || root >= text_end) {
+                throw std::invalid_argument("every extra root must be aligned and inside text");
+            }
+        }
+    }
     RecompileStats stats;
     auto blocks = DiscoverBlocks(text, n_bytes, base, entry_pc, extra_roots);
     const u32* p = reinterpret_cast<const u32*>(text);
@@ -5241,21 +4674,55 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     const auto make_dir = [](const std::string& dir) {
         std::error_code ec;
         std::filesystem::create_directories(Utf8Path(dir), ec);
+        if (ec) {
+            throw std::runtime_error("could not create output directory '" + dir + "': " +
+                                     ec.message());
+        }
     };
     make_dir(out_dir);
     // Every generated translation unit lands here, keeping the module root down
     // to the few files a human reads.
     const std::string src_dir = out_dir + "/src";
     make_dir(src_dir);
-    // Render one complete block before deciding which unit owns it. Block counts
-    // alone do not bound source size: exact vector FP bodies can expand one
-    // guest instruction into kilobytes of C. Retain every block, but isolate a
-    // single block exceeding the budget rather than silently dropping code.
-    std::string unit_body;
-    size_t unit_first = 0;
-    size_t unit_blocks = 0;
+    std::vector<std::ofstream> units;
+    units.reserve(unit_count);
+    for (size_t u = 0; u < unit_count; ++u) {
+        units.emplace_back(Utf8Path(src_dir + "/recompiled_" + mod + "_" + std::to_string(u) + ".c"),
+                           std::ios::binary);
+        if (!units.back()) {
+            throw std::runtime_error("could not open generated translation unit for writing");
+        }
+        units.back() << "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
+                        "#include \"recomp_runtime.h\"\n"
+                        "#include <stdint.h>\n"
+                        "#include <string.h>\n"   // memcpy, used by the scalar FP paths
+                        "#include <math.h>\n"
+                        "struct _recomp_ent{uint64_t va; BlockFn fn;};\n\n";
+        if (!units.back()) {
+            throw std::runtime_error("could not write generated translation unit header");
+        }
+    }
+
+    // Each unit accumulates into a string and is written out in large blocks.
+    // Streaming every fragment through operator<< meant a sentry construction
+    // and a virtual xsputn per token (several per instruction) straight into a
+    // default 4 KiB filebuf; batching turns the whole emit into a handful of
+    // multi-megabyte writes per unit at no cost in output bytes.
+    // Blocks are visited in unit order, so a single buffer serves every unit -
+    // one buffer per unit would cost hundreds of megabytes of slack on a title
+    // that emits hundreds of units.
+    constexpr size_t kUnitFlushBytes = 8u << 20;
     std::string rcu;
-    rcu.reserve(4096);
+    rcu.reserve(kUnitFlushBytes + (1u << 20));
+    const auto flush_unit = [&](size_t u, bool force) {
+        if (rcu.size() >= kUnitFlushBytes || (force && !rcu.empty())) {
+            units[u].write(rcu.data(), (std::streamsize)rcu.size());
+            if (!units[u]) {
+                throw std::runtime_error("could not write generated translation unit");
+            }
+            rcu.clear();
+        }
+    };
 
     // Hoisted out of the per-instruction loop: a fresh std::string per guest
     // instruction is one allocation per instruction across the whole title.
@@ -5339,7 +4806,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     for (const auto& b : blocks) {
         rcu.clear();
         FuncNameTo(namebuf, mod.c_str(), b.vaddr);
-        rcu += "void ";
+        rcu += "static void ";
         rcu += namebuf;
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
@@ -5404,23 +4871,27 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                 rcu += label;
             }
             body.clear();
-            const u32 insn = p[first + k];
-            const u64 insn_pc = b.vaddr + (u64)k * 4;
-            bool unhandled = false;
-            open = Translate(insn, insn_pc, body, &unhandled);
+            const u32 instruction = p[first + k];
+            const u64 instruction_pc = b.vaddr + static_cast<u64>(k) * 4;
+            bool known_unhandled = false;
+            open = Translate(instruction, instruction_pc, body, &known_unhandled);
             rcu += body;
-            ++stats.emitted;
-            if (unhandled) {
-                ++stats.unhandled;
-                ++stats.unhandled_by_group[(insn >> 25) & 0xF];
-                auto& site = stats.unhandled_by_signature[insn & 0xFFC00000u];
+            ++stats.visited_instructions;
+            if (known_unhandled) {
+                ++stats.known_unhandled_instructions;
+                ++stats.known_unhandled_by_op0[(instruction >> 25) & 0xF];
+                auto& site =
+                    stats.known_unhandled_by_signature[instruction & 0xFFC00000U];
                 if (site.count == 0) {
-                    site.example_insn = insn;
-                    site.example_pc = insn_pc;
+                    site.example_instruction = instruction;
+                    site.example_pc = instruction_pc;
                 }
                 ++site.count;
             }
-            if (!open) ++stats.translated_terminators;
+            if (!open) {
+                ++stats.translated_terminators;
+                break;
+            }
         }
         // A block that ends by running off its own end still has to hand the
         // dispatcher an absolute guest address, exactly as every branch
@@ -5563,11 +5034,12 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "  }\n"
           "  }\n}\n";
 
-    const std::string title_str = display_title.empty() ? mod : display_title;
+    const std::string title_str = EscapeCString(display_title.empty() ? mod : display_title);
     std::ostringstream mc;
     mc << "#include \"recomp_runtime.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n";
     mc << "#ifdef HAVE_SDL2\n#include <SDL2/SDL.h>\n#endif\n\n";
-    mc << "#define GUEST_MEM_SIZE (256ULL * 1024 * 1024) /* 256 MB */\n\n";
+    mc << "#define GUEST_MEM_SIZE (0x" << std::hex << guest_memory_size << std::dec
+       << "ULL) /* includes the complete module image */\n\n";
     mc << "static const char* kGameTitle = \"" << title_str << "\";\n\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "static SDL_Window*   g_sdl_window   = NULL;\n";
@@ -5595,6 +5067,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "    if(e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_ESCAPE) return 0;\n";
     mc << "  }\n  return 1;\n}\n#endif /* HAVE_SDL2 */\n\n";
     mc << "int main(int argc, char** argv){\n";
+    mc << "  int use_save=1;\n";
+    mc << "  for(int i=1;i<argc;++i) if(strcmp(argv[i],\"--no-save\")==0) use_save=0;\n";
     mc << "  printf(\"=== %s ===\\n\", kGameTitle);\n\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "  if(SDL_Init(SDL_INIT_VIDEO) == 0) {\n";
@@ -5605,26 +5079,29 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "  } else {\n";
     mc << "    fprintf(stderr, \"[recomp] SDL2 init failed: %s (running headless)\\n\", SDL_GetError());\n";
     mc << "  }\n#endif\n\n";
+    mc << "  if(GUEST_MEM_SIZE > (uint64_t)(size_t)-1){\n";
+    mc << "    fprintf(stderr,\"Guest memory is too large for this host\\n\"); return 1;\n";
+    mc << "  }\n";
     mc << "  uint8_t* mem = (uint8_t*)calloc(1, (size_t)GUEST_MEM_SIZE);\n";
     mc << "  if(!mem){ fprintf(stderr,\"Failed to allocate guest memory\\n\"); return 1; }\n";
     mc << "  GuestContext c; memset(&c,0,sizeof c);\n";
     mc << "  c.mem=mem; c.mem_size=GUEST_MEM_SIZE;\n";
     mc << "  c.mem_base_vaddr=0x" << std::hex << base << std::dec << "ULL;\n";
-    mc << "  c.heap_base=c.mem_base_vaddr+GUEST_MEM_SIZE/2;\n";
-    mc << "  c.heap_cur=c.heap_base; c.heap_end=c.mem_base_vaddr+GUEST_MEM_SIZE;\n";
+    mc << "  c.heap_base=0x" << std::hex << heap_base << "ULL;\n";
+    mc << "  c.heap_cur=c.heap_base; c.heap_end=0x" << heap_end << std::dec << "ULL;\n";
     mc << "  c.x[31]=c.mem_base_vaddr + GUEST_MEM_SIZE - 16; /* SP */\n";
     mc << "  c.pc=0x" << std::hex << (entry_pc ? entry_pc : base) << std::dec << "ULL;\n\n";
-    mc << "  recomp_save_init(&c, argv[0]);\n\n";
+    mc << "  if(use_save) recomp_save_init(&c, argv[0]);\n\n";
     mc << "  { char data_dir[512];\n";
     mc << "    snprintf(data_dir,sizeof data_dir,\"%s\",argv[0]);\n";
     mc << "    char* sl=strrchr(data_dir,'\\\\'); if(!sl) sl=strrchr(data_dir,'/'); if(sl) *(sl+1)=0; else data_dir[0]=0;\n";
     mc << "    strncat(data_dir,\"data\",sizeof(data_dir)-strlen(data_dir)-1);\n";
-    mc << "    recomp_load_segments(&c,data_dir);\n  }\n\n";
-    mc << "  { uint64_t sz=0;\n";
-    mc << "    if(recomp_save_exists(&c,\"autosave.bin\")){\n";
-    mc << "      recomp_save_read(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE,&sz);\n";
-    mc << "      printf(\"[recomp] Restored autosave (%llu bytes)\\n\",(unsigned long long)sz);\n";
-    mc << "    }\n  }\n\n";
+    mc << "    if(!recomp_load_segments(&c,data_dir,"
+       << "0x" << std::hex << base << "ULL,0x" << n_bytes << "ULL,"
+       << "0x" << image_layout.rodata_vaddr << "ULL,0x" << rodata_size << "ULL,"
+       << "0x" << image_layout.data_vaddr << "ULL,0x" << data_size << "ULL,"
+       << "0x" << image_layout.bss_size << "ULL)) { free(mem); return 1; }\n"
+       << std::dec << "  }\n\n";
     mc << "  printf(\"[recomp] Starting at pc=0x%llx\\n\",(unsigned long long)c.pc);\n";
     mc << "  /* Main loop: pump SDL events while the guest runs */\n";
     mc << "#ifdef HAVE_SDL2\n";
@@ -5635,7 +5112,6 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     mc << "#else\n";
     mc << "  recomp_run(&c);\n";
     mc << "#endif\n\n";
-    mc << "  recomp_save_write(&c,\"autosave.bin\",c.mem,(uint64_t)GUEST_MEM_SIZE);\n";
     mc << "  printf(\"[recomp] halted at pc=0x%llx\\n\",(unsigned long long)c.pc);\n";
     mc << "#ifdef HAVE_SDL2\n";
     mc << "  if(g_sdl_texture)  SDL_DestroyTexture(g_sdl_texture);\n";
@@ -5657,8 +5133,14 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "else()\n"
        << "  enable_language(C)\n"
        << "endif()\n"
+       << "if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)\n"
+       << "  message(FATAL_ERROR \"Generated recompiled projects require a 64-bit host\")\n"
+       << "endif()\n"
        << "set(CMAKE_C_STANDARD 11)\n"
        << "include_directories(${CMAKE_CURRENT_SOURCE_DIR})\n"
+       << "if(NOT WIN32)\n"
+       << "  set(RECOMP_PLATFORM_LIBS m)\n"
+       << "endif()\n"
        << "# A host project (suyu) may apply C++ flags to every language; this\n"
        << "# directory is plain C, and MSVC rejects /std:c11 together with\n"
        << "# /std:c++20 outright.\n"
@@ -5768,17 +5250,19 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "endif()\n\n"
        << (g_emit_standalone_runner ? "if(NOT RECOMP_STATIC_ONLY)\n" : "if(FALSE)\n")
        << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
-       << "if(RECOMP_JOB_POOL)\n"
-       << "  set_target_properties(recompiled PROPERTIES JOB_POOL_COMPILE ${RECOMP_JOB_POOL})\n"
-       << "endif()\n"
-       << "if(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/data\")\n"
-       << "  add_custom_command(TARGET recompiled POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory"
-          " \"${CMAKE_CURRENT_SOURCE_DIR}/data\" \"$<TARGET_FILE_DIR:recompiled>/data\")\n"
-       << "endif()\n"
+       << "target_link_libraries(recompiled PRIVATE ${RECOMP_PLATFORM_LIBS})\n"
+       << "add_custom_command(TARGET recompiled POST_BUILD\n"
+       << "  COMMAND ${CMAKE_COMMAND} -E remove -f\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data/rodata.bin\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data/data.bin\n"
+       << "  COMMAND ${CMAKE_COMMAND} -E copy_directory\n"
+       << "          ${CMAKE_CURRENT_SOURCE_DIR}/data\n"
+       << "          $<TARGET_FILE_DIR:recompiled>/data\n"
+       << "  VERBATIM)\n"
        << "if(SDL2_FOUND)\n"
        << "  target_compile_definitions(recompiled PRIVATE HAVE_SDL2)\n"
        << "  target_include_directories(recompiled PRIVATE ${SDL2_INCLUDE_DIRS})\n"
-       << "  target_link_libraries(recompiled ${SDL2_LIBRARIES})\n"
+       << "  target_link_libraries(recompiled PRIVATE ${SDL2_LIBRARIES})\n"
        << "  message(STATUS \"SDL2 found — recompiled will open a game window\")\n"
        << "else()\n"
        << "  message(STATUS \"SDL2 not found — running headless (no window)\")\n"
@@ -5800,6 +5284,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     cm << "if(NOT RECOMP_STATIC_ONLY)\n"
        << "add_library(" << dll_target << " SHARED recomp_export.c recomp_runtime.c "
           "${RECOMP_SOURCES})\n"
+       << "target_link_libraries(" << dll_target << " PRIVATE ${RECOMP_PLATFORM_LIBS})\n"
        << "set_target_properties(" << dll_target << " PROPERTIES C_VISIBILITY_PRESET hidden "
           "OUTPUT_NAME \"" << dll_target << "\")\n"
        << "if(RECOMP_JOB_POOL)\n"
@@ -5836,7 +5321,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "endif()\n"
        << "target_include_directories(" << static_target
        << " PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})\n"
-       << "target_link_libraries(" << static_target << " PUBLIC recomp_runtime_shared)\n"
+       << "target_link_libraries(" << static_target
+       << " PUBLIC recomp_runtime_shared ${RECOMP_PLATFORM_LIBS})\n"
        << "target_compile_definitions(" << static_target
        << " PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_MODULE=1"
        << " g_module_base=g_module_base_" << mod
@@ -5846,15 +5332,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << " recomp_image_lookup=recomp_image_lookup_" << mod
     << " recomp_image_index=recomp_image_index_" << mod
        << " recomp_image_set_base=recomp_image_set_base_" << mod
-       << " recomp_image_entry=recomp_image_entry_" << mod << ")\n"
-       << "endif()\n";
+       << " recomp_image_entry=recomp_image_entry_" << mod
+       << " recomp_image_build_id=recomp_image_build_id_" << mod
+       << " recomp_image_text_sha256=recomp_image_text_sha256_" << mod
+       << " recomp_image_text_size=recomp_image_text_size_" << mod << ")\n";
 
     std::ostringstream ex;
     ex << "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
           "#include \"recomp_runtime.h\"\n\n"
-          "/* The one symbol suyu resolves out of a recompiled image. Named\n"
-          "   distinctly from the internal recomp_lookup so the export is\n"
-          "   unambiguous, and so the internal one can stay hidden. */\n"
+          "/* Host-facing symbols are named distinctly from internal runtime\n"
+          "   symbols so each export is unambiguous and internals stay hidden. */\n"
           "#ifdef RECOMP_STATIC_MODULE\n"
           "/* Linked straight into the host executable: static-library symbols are\n"
           "   visible to the linker on their own, and the names are already made\n"
@@ -5868,103 +5355,46 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#else\n"
           "#define RECOMP_API __attribute__((visibility(\"default\")))\n"
           "#endif\n\n"
-          "/* Version of the generated-image contract used by automatic bundle\n"
-          "   selection. ABI 4 adds bounded, nonrecursive module-local slices to\n"
-          "   guarded instruction side entries. ABI 5 restores per-entry checks\n"
-          "   and exact guest floating-point status. */\n"
-          "RECOMP_API unsigned recomp_image_abi(void){ return RECOMP_IMAGE_ABI; }\n"
-          "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
-          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n";
-    if (EmitGuardGen()) {
-        u64 code_lo = 0, code_end = 0;
-        if (!blocks.empty()) {
-            code_lo = blocks.front().vaddr;
-            for (const auto& b : blocks) {
-                code_end = std::max<u64>(code_end, b.vaddr + (u64)b.count * 4);
+          "RECOMP_API const uint8_t* recomp_image_build_id(void);\n"
+          "RECOMP_API const uint8_t* recomp_image_text_sha256(void);\n"
+          "RECOMP_API uint64_t recomp_image_text_size(void);\n"
+          "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc);\n"
+          "RECOMP_API void recomp_image_set_base(uint64_t base);\n"
+          "RECOMP_API uint64_t recomp_image_entry(void);\n\n";
+
+    const std::array<u8, 0x20> empty_build_id{};
+    const auto& emitted_build_id = build_id ? *build_id : empty_build_id;
+    const std::array<u8, 0x20> empty_text_sha256{};
+    const auto& emitted_text_sha256 = text_sha256 ? *text_sha256 : empty_text_sha256;
+    static constexpr char HexDigits[] = "0123456789abcdef";
+    const auto emit_digest = [&](const char* name, const std::array<u8, 0x20>& digest) {
+        ex << "static const uint8_t " << name << "[32] = {\n";
+        for (size_t i = 0; i < digest.size(); ++i) {
+            if ((i & 7) == 0) {
+                ex << "    ";
+            }
+            const u8 byte = digest[i];
+            ex << "0x" << HexDigits[byte >> 4] << HexDigits[byte & 0xF];
+            if (i + 1 == digest.size()) {
+                ex << '\n';
+            } else if ((i & 7) == 7) {
+                ex << ",\n";
+            } else {
+                ex << ", ";
             }
         }
-        char span[160];
-        snprintf(span, sizeof span,
-                 "  *code_lo=0x%llxULL; *code_end=0x%llxULL; *base=&g_module_base;\n",
-                 (unsigned long long)code_lo, (unsigned long long)code_end);
-        ex << "/* ABI 6 feature GG1. The generation word starts at VERIFY_ALWAYS, so\n"
-              "   until a host that knows GG1 takes it over every block verifies on\n"
-              "   every entry. The host passes its GG1 version and learns the word,\n"
-              "   the module-relative span the blocks cover, and where the load base\n"
-              "   lives. The FM1 handshake below refuses to complete before this one,\n"
-              "   so a host that knows FM1 but not GG1 refuses the whole bundle. */\n"
-              "uint32_t g_recomp_gg_word = RECOMP_GG_VERIFY_ALWAYS;\n"
-              "static int g_recomp_gg_host = 0;\n"
-              "RECOMP_API uint32_t* recomp_image_guard_gen_v1(uint32_t host_version, uint64_t* code_lo,\n"
-              "                                               uint64_t* code_end, const uint64_t** base){\n"
-              "  if(host_version!=2u) return 0;\n"
-              "  RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,RECOMP_GG_VERIFY_ALWAYS);\n"
-           << span
-           << "  g_recomp_gg_host=1;\n"
-              "  return &g_recomp_gg_word;\n"
-              "}\n";
-    }
-    if (g_emit_fastmem) {
-        ex << "/* ABI 6 feature handshake. The host passes its own view of the page\n"
-              "   table layout and of the context offsets; 1 means this image was\n"
-              "   compiled against exactly those, so the host may enable fm_limit. */\n"
-              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FASTMEM_PT1"
-           << (EmitGuardGen() ? " | RECOMP_FEATURE_GUARD_GEN1" : "")
-           << (g_emit_fpx ? " | RECOMP_FEATURE_FPX1" : "") << "; }\n"
-              "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
-              "                                            uint64_t ptr_mask, uint32_t off_table,\n"
-              "                                            uint32_t off_limit){\n"
-           << (EmitGuardGen() ? "  if(!g_recomp_gg_host) return 0;\n" : "")
-           << "  return page_bits==RECOMP_FM_PAGE_BITS && stride_log2==RECOMP_FM_STRIDE_LOG2 &&\n"
-              "         ptr_mask==(uint64_t)RECOMP_FM_PTR_MASK &&\n"
-              "         off_table==offsetof(GuestContext,fm_table) &&\n"
-              "         off_limit==offsetof(GuestContext,fm_limit);\n"
-              "}\n";
-    } else if (g_emit_fpx) {
-        ex << "/* ABI 6 feature report. */\n"
-              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FPX1; }\n";
-    }
-    if (g_emit_fpx) {
-        ex << "/* FPX1 handshake. The host passes its own view of the FP control and\n"
-              "   status fields and of its kill-switch bit; nonzero means this image was\n"
-              "   compiled against exactly those. The low byte is RECOMP_FPX_HOST, the\n"
-              "   fast path this image was compiled to (0: compiled out). */\n"
-              "RECOMP_API unsigned recomp_image_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
-              "                                        uint64_t inhibit_bit){\n"
-              "  if(off_fpcr!=offsetof(GuestContext,fpcr) || off_fpsr!=offsetof(GuestContext,fpsr) ||\n"
-              "     inhibit_bit!=RECOMP_FPX_INHIBIT) return 0;\n"
-              "  return 0x100u | (unsigned)RECOMP_FPX_HOST"
-           << (g_emit_fpx_shadow ? " | 0x200u; /* the shadow instrumentation build */\n" : ";\n")
-           << "}\n";
-    }
-    ex << "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
-          "/* Run a bounded sequence while control flow stays inside this module.\n"
-          "   Compact conditional branches return to this C loop instead of the\n"
-          "   cross-library host dispatcher. Every additional block consumes the\n"
-          "   same execution budget, bounding the interval between interrupt checks\n"
-          "   and the host's executed-block accounting. */\n"
-          "RECOMP_API void recomp_image_run_slice(GuestContext* c){\n"
-          "  int first=1;\n"
-          "  while(!c->halted && c->pending_svc==~UINT64_C(0) && c->chain_budget>0){\n"
-          "    BlockFn f=recomp_lookup(c->pc-g_module_base);\n"
-          "    if(!f)return;\n"
-          "    if(!first && --c->chain_budget<=0)return;\n"
-          "    first=0; f(c);\n"
-          "  }\n"
-          "}\n\n"
-          /* Hands the block index out so a host dispatcher can do the lookup
-             itself. Going through recomp_image_lookup costs three nested calls
-             across the shared-object boundary on every block edge; with this it
-             is a bounds check and one load. Addresses are absolute so the caller
-             needs to know nothing about the module base. Only valid once
-             recomp_image_set_base has run, which is when the index is built. */
-          "extern int _recomp_index_view(uint64_t*, uint64_t*, BlockFn**);\n"
-          "RECOMP_API int recomp_image_index(uint64_t* lo, uint64_t* hi, BlockFn** idx){\n"
-          "  if(!_recomp_index_view(lo, hi, idx)) return 0;\n"
-          "  *lo += g_module_base; *hi += g_module_base;\n"
-          "  return 1;\n"
-          "}\n"
-          "\n"
+        ex << "};\n\n";
+    };
+    emit_digest("g_recomp_image_build_id", emitted_build_id);
+    emit_digest("g_recomp_image_text_sha256", emitted_text_sha256);
+    ex << "/* Immutable identity of the NSO used to generate this image. */\n"
+          "RECOMP_API const uint8_t* recomp_image_build_id(void){ return g_recomp_image_build_id; }\n\n"
+          "/* Identity of the complete loader-visible text mapping. */\n"
+          "RECOMP_API const uint8_t* recomp_image_text_sha256(void){ return g_recomp_image_text_sha256; }\n\n"
+          "RECOMP_API uint64_t recomp_image_text_size(void){ return 0x"
+       << std::hex << mapped_text_size << std::dec
+       << "ULL; }\n\n"
+          "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           "/* Tells this image where its module actually got loaded, so the\n"
           "   addresses it computes are real rather than module-relative. */\n"
           "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n"
@@ -5977,17 +5407,36 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << std::hex << (entry_pc ? entry_pc : base) << std::dec << "ULL; }\n";
 
     auto write = [&](const std::string& name, const std::string& data) {
-        std::ofstream o(Utf8Path(out_dir + "/" + name), std::ios::binary);
+        const std::string path = out_dir + "/" + name;
+        std::ofstream o(Utf8Path(path), std::ios::binary);
+        if (!o) {
+            throw std::runtime_error("could not open generated file '" + path + "'");
+        }
         o.write(data.data(), (std::streamsize)data.size());
+        if (!o) {
+            throw std::runtime_error("could not write generated file '" + path + "'");
+        }
+        o.close();
+        if (!o) {
+            throw std::runtime_error("could not close generated file '" + path + "'");
+        }
     };
     write("recomp_runtime.h", RuntimeH());
     write("recomp_runtime.c", RuntimeC());
     // The dispatch table is generated code like the block bodies, so it belongs
     // with them rather than at the top level.
     write("src/recompiled_" + mod + ".c", rc);
-    // finish_unit closed each block translation unit before reaching here.
-    if (g_emit_standalone_runner) {
-        write("main.c", mc.str());
+    // The unit files were streamed out as blocks were translated; just make
+    // sure everything has reached disk.
+    for (auto& u : units) {
+        u.flush();
+        if (!u) {
+            throw std::runtime_error("could not flush generated translation unit");
+        }
+        u.close();
+        if (!u) {
+            throw std::runtime_error("could not close generated translation unit");
+        }
     }
     std::string export_text = ex.str();
     if (EmitGuardGen()) {
@@ -6004,12 +5453,84 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     write("recomp_export.c", export_text);
     write("CMakeLists.txt", cm.str());
 
-    // Coverage report. Without this the exporter cannot describe its own output:
-    // block and instruction counts say how much code was walked, not how much of
-    // it was actually translated, and an export made entirely of fallbacks looks
-    // identical to a complete one. The signature histogram is the actionable
-    // part - it ranks which opcode family to implement next by how often it is
-    // actually hit, rather than by which gaps look important.
+    // This is static translation coverage, not runtime execution coverage. It reports explicit
+    // fallback sites honestly as "known unhandled" because a decoder bug can still translate an
+    // instruction incorrectly without appearing here.
+    {
+        std::ostringstream coverage;
+        coverage.imbue(std::locale::classic());
+        coverage << "{\n"
+                 << "  \"schema_version\": 1,\n"
+                 << "  \"module\": \"" << mod << "\",\n"
+                 << "  \"coverage_scope\": \"emitted text words, including unreachable words and padding\",\n"
+                 << "  \"text_base\": \"0x" << std::hex << base << std::dec << "\",\n"
+                 << "  \"text_size_bytes\": " << n_bytes << ",\n"
+                 << "  \"text_words\": " << stats.instructions << ",\n"
+                 << "  \"instructions_visited\": " << stats.visited_instructions << ",\n"
+                 << "  \"known_translated_instructions\": "
+                 << stats.KnownTranslatedInstructions() << ",\n"
+                 << "  \"known_unhandled_instructions\": "
+                 << stats.known_unhandled_instructions << ",\n";
+        if (stats.visited_instructions != 0) {
+            coverage << std::fixed << std::setprecision(6)
+                     << "  \"known_translated_percent\": "
+                     << stats.KnownTranslatedFraction() * 100.0 << ",\n"
+                     << "  \"known_unhandled_percent\": "
+                     << stats.KnownUnhandledFraction() * 100.0 << ",\n";
+        } else {
+            coverage << "  \"known_translated_percent\": null,\n"
+                     << "  \"known_unhandled_percent\": null,\n";
+        }
+
+        coverage << "  \"known_unhandled_by_op0\": [";
+        bool first_group = true;
+        for (const auto& [group, count] : stats.known_unhandled_by_op0) {
+            coverage << (first_group ? "\n" : ",\n")
+                     << "    { \"op0\": " << group << ", \"name\": \""
+                     << EncodingGroupName(group) << "\", \"count\": " << count << " }";
+            first_group = false;
+        }
+        coverage << (first_group ? "]" : "\n  ]") << ",\n";
+
+        std::vector<std::pair<u32, UnhandledSite>> ranked{
+            stats.known_unhandled_by_signature.begin(),
+            stats.known_unhandled_by_signature.end()};
+        std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+            if (left.second.count != right.second.count) {
+                return left.second.count > right.second.count;
+            }
+            return left.first < right.first;
+        });
+        coverage << "  \"known_unhandled_by_signature\": [";
+        bool first_signature = true;
+        size_t shown = 0;
+        for (const auto& [signature, site] : ranked) {
+            if (shown++ == 64) {
+                break;
+            }
+            char signature_hex[11];
+            char instruction_hex[11];
+            char pc_hex[19];
+            snprintf(signature_hex, sizeof signature_hex, "0x%08X", signature);
+            snprintf(instruction_hex, sizeof instruction_hex, "0x%08X",
+                     site.example_instruction);
+            snprintf(pc_hex, sizeof pc_hex, "0x%llX",
+                     static_cast<unsigned long long>(site.example_pc));
+            coverage << (first_signature ? "\n" : ",\n")
+                     << "    { \"signature\": \"" << signature_hex << "\", \"count\": "
+                     << site.count << ", \"example_instruction\": \"" << instruction_hex
+                     << "\", \"example_pc\": \"" << pc_hex << "\", \"group\": \""
+                     << EncodingGroupName((site.example_instruction >> 25) & 0xF) << "\" }";
+            first_signature = false;
+        }
+        coverage << (first_signature ? "]" : "\n  ]") << ",\n"
+                 << "  \"distinct_unhandled_signatures\": "
+                 << stats.known_unhandled_by_signature.size() << "\n"
+                 << "}\n";
+        write("recomp_static_coverage.json", coverage.str());
+    }
+
+    // Bundle text/rodata/data as binary blobs so the exe can load them at startup
     {
         std::ostringstream cov;
         cov << "{\n";
@@ -6069,16 +5590,63 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         make_dir(data_subdir);
         // Always write text.bin
         {
-            std::ofstream o(Utf8Path(data_subdir + "/text.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/text.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(text), (std::streamsize)n_bytes);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
         }
         if (rodata && rodata_size > 0) {
-            std::ofstream o(Utf8Path(data_subdir + "/rodata.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/rodata.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(rodata), (std::streamsize)rodata_size);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(Utf8Path(data_subdir + "/rodata.bin"), ec);
+            if (ec) {
+                throw std::runtime_error("could not remove stale generated rodata segment: " +
+                                         ec.message());
+            }
         }
         if (data_seg && data_size > 0) {
-            std::ofstream o(Utf8Path(data_subdir + "/data.bin"), std::ios::binary);
+            const std::string path = data_subdir + "/data.bin";
+            std::ofstream o(Utf8Path(path), std::ios::binary);
+            if (!o) {
+                throw std::runtime_error("could not open generated file '" + path + "'");
+            }
             o.write(reinterpret_cast<const char*>(data_seg), (std::streamsize)data_size);
+            if (!o) {
+                throw std::runtime_error("could not write generated file '" + path + "'");
+            }
+            o.close();
+            if (!o) {
+                throw std::runtime_error("could not close generated file '" + path + "'");
+            }
+        } else {
+            std::error_code ec;
+            std::filesystem::remove(Utf8Path(data_subdir + "/data.bin"), ec);
+            if (ec) {
+                throw std::runtime_error("could not remove stale generated data segment: " +
+                                         ec.message());
+            }
         }
     }
 
@@ -7085,8 +6653,11 @@ int  recomp_save_write(GuestContext* c, const char* name, const void* data, uint
 int  recomp_save_read(GuestContext* c, const char* name, void* buf, uint64_t buf_size, uint64_t* out_size);
 int  recomp_save_delete(GuestContext* c, const char* name);
 int  recomp_save_exists(GuestContext* c, const char* name);
-/* Load bundled data segments into guest memory */
-int  recomp_load_segments(GuestContext* c, const char* data_dir);
+/* Load bundled segments at their exact module-relative guest addresses and zero BSS. */
+int  recomp_load_segments(GuestContext* c, const char* data_dir,
+                          uint64_t text_vaddr, uint64_t text_size,
+                          uint64_t rodata_vaddr, uint64_t rodata_size,
+                          uint64_t data_vaddr, uint64_t data_size, uint64_t bss_size);
 #endif
 )RT";
     if (fastmem || fpx) {
@@ -7434,8 +7005,10 @@ const uint8_t* recomp_aes_sbox(int inverse){
   return inverse ? inv : fwd;
 }
 static uint8_t* memptr(GuestContext* c, uint64_t va, uint64_t sz){
-  uint64_t off=va-c->mem_base_vaddr;
-  if(off+sz>c->mem_size) return 0;
+  uint64_t off;
+  if(va<c->mem_base_vaddr || sz>c->mem_size) return 0;
+  off=va-c->mem_base_vaddr;
+  if(off>c->mem_size-sz) return 0;
   return c->mem+off;
 }
 
@@ -7761,8 +7334,9 @@ int recomp_cond(GuestContext* c,unsigned cond){
 /* ── Save-data filesystem ── */
 
 static void mkpath(const char* path) {
-  char tmp[512]; size_t len;
-  snprintf(tmp,sizeof tmp,"%s",path); len=strlen(tmp);
+  char tmp[1024]; size_t len=strlen(path);
+  if(len>=sizeof tmp) return;
+  memcpy(tmp,path,len+1);
   for(size_t i=1;i<len;i++){
     if(tmp[i]==PATH_SEP||tmp[i]=='/'){tmp[i]=0; MKDIR(tmp); tmp[i]=PATH_SEP;}
   }
@@ -7838,11 +7412,14 @@ int recomp_save_read(GuestContext* c, const char* name, void* buf, uint64_t buf_
   snprintf(path,sizeof path,"%s%c%s",c->save_dir,PATH_SEP,name);
   FILE* f=fopen(path,"rb");
   if(!f){if(out_size)*out_size=0; return 0;}
-  fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+  if(fseek(f,0,SEEK_END)!=0){fclose(f); if(out_size)*out_size=0; return 0;}
+  long sz=ftell(f);
+  if(sz<0||fseek(f,0,SEEK_SET)!=0){fclose(f); if(out_size)*out_size=0; return 0;}
   uint64_t to_read=(uint64_t)sz<buf_size?(uint64_t)sz:buf_size;
-  fread(buf,1,(size_t)to_read,f); fclose(f);
-  if(out_size)*out_size=to_read;
-  printf("[recomp] Loaded %llu bytes <- %s\n",(unsigned long long)to_read,path);
+  size_t got=fread(buf,1,(size_t)to_read,f); int failed=ferror(f); fclose(f);
+  if(out_size)*out_size=(uint64_t)got;
+  if(failed||got!=(size_t)to_read) return 0;
+  printf("[recomp] Loaded %llu bytes <- %s\n",(unsigned long long)got,path);
   return 1;
 }
 
@@ -7859,25 +7436,62 @@ int recomp_save_exists(GuestContext* c, const char* name) {
   if(f){fclose(f); return 1;} return 0;
 }
 
-/* ── Segment loader: loads rodata.bin + data.bin from the data dir into guest memory ── */
+/* ── Checked segment loader ── */
 
-int recomp_load_segments(GuestContext* c, const char* data_dir) {
-  const char* names[]={"rodata.bin","data.bin","text.bin"};
-  /* Corresponding offsets from segment info embedded in manifest — for now, load
-     sequentially after .text in memory. The real offsets come from the blockmap. */
-  for(int i=0;i<3;i++){
-    char path[1024];
-    snprintf(path,sizeof path,"%s%c%s",data_dir,PATH_SEP,names[i]);
-    FILE* f=fopen(path,"rb");
-    if(!f) continue;
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    if((uint64_t)sz<=c->mem_size){
-      /* Load at the appropriate offset — text at base, others after */
-      fread(c->mem,1,(size_t)sz,f);
-    }
-    fclose(f);
-    printf("[recomp] Loaded segment %s (%ld bytes)\n",names[i],sz);
+static int load_segment(GuestContext* c,const char* data_dir,const char* name,
+                        uint64_t vaddr,uint64_t expected_size){
+  char path[1024]; FILE* f; long measured; uint8_t* destination; size_t read_size;
+  int path_size,close_result;
+  if(expected_size==0) return 1;
+  if(expected_size>(uint64_t)(size_t)-1){
+    fprintf(stderr,"[recomp] Segment is too large for this host: %s\n",name); return 0;
   }
+  path_size=snprintf(path,sizeof path,"%s%c%s",data_dir,PATH_SEP,name);
+  if(path_size<0 || (size_t)path_size>=sizeof path){
+    fprintf(stderr,"[recomp] Segment path is too long: %s\n",name); return 0;
+  }
+  f=fopen(path,"rb");
+  if(!f){ fprintf(stderr,"[recomp] Missing segment %s\n",path); return 0; }
+  if(fseek(f,0,SEEK_END)!=0 || (measured=ftell(f))<0 || fseek(f,0,SEEK_SET)!=0){
+    fprintf(stderr,"[recomp] Could not measure segment %s\n",path); fclose(f); return 0;
+  }
+  if((uint64_t)measured!=expected_size){
+    fprintf(stderr,"[recomp] Segment %s has %ld bytes; expected %llu\n",name,measured,
+            (unsigned long long)expected_size); fclose(f); return 0;
+  }
+  destination=memptr(c,vaddr,expected_size);
+  if(!destination){
+    fprintf(stderr,"[recomp] Segment %s lies outside guest memory\n",name); fclose(f); return 0;
+  }
+  read_size=fread(destination,1,(size_t)expected_size,f);
+  close_result=fclose(f);
+  if(read_size!=(size_t)expected_size || close_result!=0){
+    fprintf(stderr,"[recomp] Could not read complete segment %s\n",path); return 0;
+  }
+  printf("[recomp] Loaded segment %s (%llu bytes) at 0x%llx\n",name,
+         (unsigned long long)expected_size,(unsigned long long)vaddr);
+  return 1;
+}
+
+int recomp_load_segments(GuestContext* c,const char* data_dir,
+                         uint64_t text_vaddr,uint64_t text_size,
+                         uint64_t rodata_vaddr,uint64_t rodata_size,
+                         uint64_t data_vaddr,uint64_t data_size,uint64_t bss_size){
+  uint8_t* bss;
+  if(!load_segment(c,data_dir,"text.bin",text_vaddr,text_size) ||
+     !load_segment(c,data_dir,"rodata.bin",rodata_vaddr,rodata_size) ||
+     !load_segment(c,data_dir,"data.bin",data_vaddr,data_size)) return 0;
+  if(data_size>~(uint64_t)0-data_vaddr){
+    fprintf(stderr,"[recomp] Data/BSS address overflow\n"); return 0;
+  }
+  if(bss_size>(uint64_t)(size_t)-1){
+    fprintf(stderr,"[recomp] BSS is too large for this host\n"); return 0;
+  }
+  bss=memptr(c,data_vaddr+data_size,bss_size);
+  if(bss_size!=0 && !bss){
+    fprintf(stderr,"[recomp] BSS lies outside guest memory\n"); return 0;
+  }
+  if(bss_size!=0) memset(bss,0,(size_t)bss_size);
   return 1;
 }
 
@@ -7981,8 +7595,9 @@ void recomp_svc(GuestContext* c,unsigned imm){
     }
     break;
   default:
-    printf("[recomp] Unhandled SVC #0x%x x0=0x%llx x1=0x%llx\n",imm,
-      (unsigned long long)c->x[0],(unsigned long long)c->x[1]);
+    printf("[recomp] Unhandled SVC #0x%x x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",imm,
+      (unsigned long long)c->x[0],(unsigned long long)c->x[1],
+      (unsigned long long)c->x[2],(unsigned long long)c->x[3]);
     c->x[0]=0;
     break;
   }
@@ -8043,9 +7658,9 @@ void recomp_run(GuestContext* c){
   uint64_t g=0;
   while(!c->halted){
     BlockFn f=recomp_lookup(c->pc);
-    if(!f){ fprintf(stderr,"[recomp] no block at 0x%llx\n",(unsigned long long)c->pc); break;}
+    if(!f){ fprintf(stderr,"[recomp] no block at 0x%llx\n",(unsigned long long)c->pc); c->halted=1; break;}
     f(c);
-    if(++g>100000000ULL){ fprintf(stderr,"[recomp] watchdog (100M iterations)\n"); break; }
+    if(++g>100000000ULL){ fprintf(stderr,"[recomp] watchdog (100M iterations)\n"); c->halted=1; break; }
     /* Yield every 4096 blocks to prevent 100% CPU spin on tight loops */
     if((g & 0xFFF)==0){
 #ifdef _WIN32

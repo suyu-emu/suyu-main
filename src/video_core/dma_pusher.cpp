@@ -57,7 +57,8 @@ bool DmaPusher::Step() {
     }
 
     if (prefetch_size > 0) {
-        ProcessCommands(command_list.prefetch_command_list);
+        ProcessCommands(std::span<const CommandHeader>{command_list.prefetch_command_list.data(),
+                                                        prefetch_size});
         dma_pushbuffer.pop();
         return true;
     }

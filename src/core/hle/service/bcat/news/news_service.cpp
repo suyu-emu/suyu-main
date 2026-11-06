@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "core/hle/service/bcat/news/newly_arrived_event_holder.h"
+#include "core/hle/service/bcat/news/news_data_service.h"
+#include "core/hle/service/bcat/news/news_database_service.h"
 #include "core/hle/service/bcat/news/news_service.h"
 #include "core/hle/service/bcat/news/news_storage.h"
 #include "core/hle/service/cmif_serialization.h"
@@ -26,9 +29,9 @@ INewsService::INewsService(Core::System& system_) : ServiceFramework{system_, "I
         {30300, nullptr, "RequestImmediateReception"},
         {30400, nullptr, "DecodeArchiveFile"}, //3.0.0-18.1.0 (stub)
         {30500, nullptr, "Unknown30500"}, //8.0.0+ (stub)
-        {30900, nullptr, "Unknown30900"}, //1.0.0 (stub)
-        {30901, nullptr, "Unknown30901"}, //1.0.0 (stub)
-        {30902, nullptr, "Unknown30902"}, //1.0.0 (stub)
+        {30900, D<&INewsService::CreateNewlyArrivedEventHolderOld>, "CreateNewlyArrivedEventHolderOld"}, //1.0.0
+        {30901, D<&INewsService::CreateNewsDataServiceOld>, "CreateNewsDataServiceOld"}, //1.0.0
+        {30902, D<&INewsService::CreateNewsDatabaseServiceOld>, "CreateNewsDatabaseServiceOld"}, //1.0.0
         {40100, nullptr, "SetSubscriptionStatus"},
         {40101, D<&INewsService::RequestAutoSubscription>, "RequestAutoSubscription"}, //3.0.0+
         {40200, D<&INewsService::ClearStorage>, "ClearStorage"},
@@ -57,6 +60,26 @@ Result INewsService::GetSubscriptionStatus(Out<u32> out_status,
 Result INewsService::IsSystemUpdateRequired(Out<bool> out_is_system_update_required) {
     LOG_WARNING(Service_BCAT, "(STUBBED) called");
     *out_is_system_update_required = false;
+    R_SUCCEED();
+}
+
+Result INewsService::CreateNewlyArrivedEventHolderOld(
+    OutInterface<INewlyArrivedEventHolder> out_interface) {
+    LOG_INFO(Service_BCAT, "called");
+    *out_interface = std::make_shared<INewlyArrivedEventHolder>(system);
+    R_SUCCEED();
+}
+
+Result INewsService::CreateNewsDataServiceOld(OutInterface<INewsDataService> out_interface) {
+    LOG_INFO(Service_BCAT, "called");
+    *out_interface = std::make_shared<INewsDataService>(system);
+    R_SUCCEED();
+}
+
+Result INewsService::CreateNewsDatabaseServiceOld(
+    OutInterface<INewsDatabaseService> out_interface) {
+    LOG_INFO(Service_BCAT, "called");
+    *out_interface = std::make_shared<INewsDatabaseService>(system);
     R_SUCCEED();
 }
 

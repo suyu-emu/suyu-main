@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <array>
 #include <cstring>
 #include <openssl/err.h>
@@ -96,20 +95,16 @@ Crypto::AESCipher<Key>::AESCipher(Key key, Mode mode) : ctx(std::make_unique<Cip
 
     ASSERT(ctx->encryption_context && ctx->decryption_context && ctx->cipher && "OpenSSL cipher context failed init!");
     // now init ciphers
-    // An all-zero key means the user has not installed the key this cipher needs.
-    // XTS rejects such a key outright, because its two halves must differ, so the
-    // cipher is left unkeyed; callers check for the key and report it missing, and
-    // an unkeyed cipher refuses to transcode rather than crash.
-    const bool key_present =
-        std::any_of(key.begin(), key.end(), [](u8 b) { return b != 0; });
-    if (!key_present) {
-        LOG_DEBUG(Crypto, "No key available for this cipher; leaving it uninitialized");
-        return;
+    // Zero is a valid AES key for CTR and ECB, and those ciphers are exercised
+    // during key derivation even when a key file is absent. Initialize every
+    // mode normally instead of leaving a callable half-initialized object.
+    const bool encryption_initialized =
+        EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL) == 1;
+    const bool decryption_initialized =
+        EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL) == 1;
+    if (!encryption_initialized || !decryption_initialized) {
+        UNREACHABLE_MSG("Failed to initialize OpenSSL {} cipher", GetCipherName(mode, sizeof(Key)));
     }
-    ctx->keyed = true;
-    ASSERT(EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL));
-    ASSERT(EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL));
-    ctx->initialized = true;
 
     EVP_CIPHER_CTX_set_padding(ctx->encryption_context, 0);
     EVP_CIPHER_CTX_set_padding(ctx->decryption_context, 0);

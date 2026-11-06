@@ -16,6 +16,7 @@ namespace Service::AM {
 struct Applet;
 class WindowSystem;
 class IStorage;
+class ILockAccessor;
 
 class IHomeMenuFunctions final : public ServiceFramework<IHomeMenuFunctions> {
 public:
@@ -29,6 +30,8 @@ private:
     Result UnlockForeground();
     Result PopFromGeneralChannel(Out<SharedPointer<IStorage>> out_storage);
     Result GetPopFromGeneralChannelEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+    Result GetHomeButtonWriterLockAccessor(
+        Out<SharedPointer<ILockAccessor>> out_lock_accessor);
     Result IsSleepEnabled(Out<bool> out_is_sleep_enbaled);
     Result IsRebootEnabled(Out<bool> out_is_reboot_enbaled);
     Result IsForceTerminateApplicationDisabledForDebug(

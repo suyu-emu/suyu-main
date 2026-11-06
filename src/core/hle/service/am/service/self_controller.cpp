@@ -54,7 +54,7 @@ ISelfController::ISelfController(Core::System& system_, std::shared_ptr<Applet> 
         {61, D<&ISelfController::SetMediaPlaybackState>, "SetMediaPlaybackState"},
         {62, D<&ISelfController::SetIdleTimeDetectionExtension>, "SetIdleTimeDetectionExtension"},
         {63, D<&ISelfController::GetIdleTimeDetectionExtension>, "GetIdleTimeDetectionExtension"},
-        {64, nullptr, "SetInputDetectionSourceSet"},
+        {64, D<&ISelfController::SetInputDetectionSourceSet>, "SetInputDetectionSourceSet"},
         {65, D<&ISelfController::ReportUserIsActive>, "ReportUserIsActive"},
         {66, nullptr, "GetCurrentIlluminance"},
         {67, nullptr, "IsIlluminanceAvailable"},
@@ -311,6 +311,12 @@ Result ISelfController::GetIdleTimeDetectionExtension(
     std::scoped_lock lk{m_applet->lock};
     *out_idle_time_detection_extension = m_applet->idle_time_detection_extension;
 
+    R_SUCCEED();
+}
+
+Result ISelfController::SetInputDetectionSourceSet(u32 input_detection_source_set) {
+    LOG_WARNING(Service_AM, "(STUBBED) called, input_detection_source_set=0x{:08X}",
+                input_detection_source_set);
     R_SUCCEED();
 }
 

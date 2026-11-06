@@ -17,9 +17,10 @@
 namespace Service::VI {
 
 IApplicationDisplayService::IApplicationDisplayService(Core::System& system_,
-                                                       std::shared_ptr<Container> container)
-    : ServiceFramework{system_, "IApplicationDisplayService"},
-      m_container{std::move(container)}, m_context{system, "IApplicationDisplayService"} {
+                                                       std::shared_ptr<Container> container,
+                                                       Policy policy)
+    : ServiceFramework{system_, "IApplicationDisplayService"}, m_container{std::move(container)},
+      m_policy{policy}, m_context{system, "IApplicationDisplayService"} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {100, C<&IApplicationDisplayService::GetRelayService>, "GetRelayService"},
@@ -161,11 +162,37 @@ Result IApplicationDisplayService::ListDisplays(
     Out<u64> out_count, OutArray<DisplayInfo, BufferAttr_HipcMapAlias> out_displays) {
     LOG_WARNING(Service_VI, "(STUBBED) called");
 
-    if (out_displays.size() > 0) {
-        out_displays[0] = DisplayInfo{};
-        *out_count = 1;
+    static const std::array<DisplayInfo, 1> user_displays{};
+    static const std::array compositor_displays = [] {
+        std::array<DisplayInfo, 5> displays{};
+        displays[0].max_layers = 2;
+        displays[1].display_name = DisplayName{"External"};
+        displays[1].max_layers = 0;
+        displays[2].display_name = DisplayName{"Edid"};
+        displays[2].max_layers = 0;
+        displays[2].width = 0;
+        displays[2].height = 0;
+        displays[3].display_name = DisplayName{"Internal"};
+        displays[3].max_layers = 0;
+        displays[4].display_name = DisplayName{"Null"};
+        displays[4].max_layers = 0;
+        displays[4].width = 0;
+        displays[4].height = 0;
+        return displays;
+    }();
+
+    const auto copy_displays = [&](const auto& displays) {
+        const auto count = (std::min)(out_displays.size(), displays.size());
+        for (std::size_t index = 0; index < count; ++index) {
+            out_displays[index] = displays[index];
+        }
+        *out_count = count;
+    };
+
+    if (m_policy == Policy::Compositor) {
+        copy_displays(compositor_displays);
     } else {
-        *out_count = 0;
+        copy_displays(user_displays);
     }
 
     R_SUCCEED();

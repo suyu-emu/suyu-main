@@ -33,30 +33,17 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     // generic "suyu ..." title that would otherwise flash for a moment
     // before the game's own title gets set later in the boot sequence.
     const std::string window_title = [] {
-        std::filesystem::path exe;
-#if defined(_WIN32)
+#ifdef _WIN32
         wchar_t exe_w[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe_w, MAX_PATH);
-        exe = exe_w;
-#elif defined(__APPLE__)
-        // Ask for the length first; the answer can exceed PATH_MAX once
-        // symlinks and bundle nesting are in play.
-        std::uint32_t size = 0;
-        _NSGetExecutablePath(nullptr, &size);
-        std::string buffer;
-        buffer.resize(size);
-        if (size != 0 && _NSGetExecutablePath(buffer.data(), &size) == 0) {
-            exe = buffer.c_str();
-        }
-#else
+        return std::filesystem::path(exe_w).stem().string();
+#elif defined(__linux__)
         std::error_code ec;
-        exe = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (ec) {
-            exe.clear();
-        }
+        const auto executable_path = std::filesystem::canonical("/proc/self/exe", ec);
+        return ec ? std::string{"suyu-recompiled"} : executable_path.stem().string();
+#else
+        return std::string{"suyu-recompiled"};
 #endif
-        // A generic name beats an empty title bar when the lookup fails.
-        return exe.empty() ? std::string{"suyu"} : exe.stem().string();
     }();
 #else
     const std::string window_title = fmt::format("suyu {} | {}-{} (Vulkan)", Common::g_build_name,

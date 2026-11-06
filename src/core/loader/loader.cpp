@@ -322,24 +322,26 @@ std::unique_ptr<AppLoader> GetLoader(Core::System& system, FileSys::VirtualFile 
         return nullptr;
     }
 
-    FileType type = IdentifyFile(file);
     const FileType filename_type = GuessFromFilename(file->GetName());
+    FileType type{};
 
-    // Special case: an exefs "main" is itself a valid NSO0, so IdentifyFile
-    // (which tries AppLoader_NSO before AppLoader_DeconstructedRomDirectory)
-    // reports NSO for it. AppLoader_NSO::Load only maps that single module and
-    // never initializes the process - it has no NPDM, so it cannot set up the
-    // page table - and the very first KProcess::LoadModule() then writes
-    // through a null Memory::Impl::current_page_table. GuessFromFilename only
-    // ever returns DeconstructedRomDirectory for a file literally named
-    // "main" (see above), which is exactly this situation, so that alone is
-    // enough - originally this also required FileSys::IsDirectoryExeFS(
-    // file->GetContainingDirectory()) to see "main.npdm" beside it, but for
-    // some VirtualFile implementations GetContainingDirectory() doesn't
-    // return a populated listing, silently defeating the check and leaving
-    // the null-page-table crash in place.
-    if (type == FileType::NSO && filename_type == FileType::DeconstructedRomDirectory) {
-        type = FileType::DeconstructedRomDirectory;
+    // A literal ExeFS "main" can be recognized from its four-byte NSO magic
+    // without probing encrypted container formats first. Apart from avoiding
+    // needless work, this is required for decrypted standalone inputs that do
+    // not have NCA header keys. Treating it as a bare NSO would also skip its
+    // neighboring NPDM and leave the process page table uninitialized. The
+    // literal filename is therefore part of the ExeFS contract: if main.npdm
+    // is absent, the deconstructed loader reports it as missing instead of
+    // attempting to run the file as a standalone NSO.
+    if (filename_type == FileType::DeconstructedRomDirectory) {
+        const auto nso_type = IdentifyFileLoader<AppLoader_NSO>(file);
+        if (nso_type && *nso_type == FileType::NSO) {
+            type = FileType::DeconstructedRomDirectory;
+        } else {
+            type = IdentifyFile(file);
+        }
+    } else {
+        type = IdentifyFile(file);
     }
 
     // Special case: 00 is either a NCA or NAX.

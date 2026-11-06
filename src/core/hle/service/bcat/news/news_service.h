@@ -15,6 +15,10 @@ class System;
 
 namespace Service::News {
 
+class INewlyArrivedEventHolder;
+class INewsDataService;
+class INewsDatabaseService;
+
 class INewsService final : public ServiceFramework<INewsService> {
 public:
     explicit INewsService(Core::System& system_);
@@ -30,6 +34,12 @@ private:
     Result GetTopicList(Out<s32> out_count, OutBuffer<BufferAttr_HipcMapAlias> out_topics, s32 filter);
 
     Result IsSystemUpdateRequired(Out<bool> out_is_system_update_required);
+
+    Result CreateNewlyArrivedEventHolderOld(OutInterface<INewlyArrivedEventHolder> out_interface);
+
+    Result CreateNewsDataServiceOld(OutInterface<INewsDataService> out_interface);
+
+    Result CreateNewsDatabaseServiceOld(OutInterface<INewsDatabaseService> out_interface);
 
     Result RequestAutoSubscription(u64 value);
 

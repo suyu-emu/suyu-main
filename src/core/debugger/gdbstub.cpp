@@ -419,9 +419,9 @@ void GDBStub::HandleQuery(std::string_view sv) {
         std::string buffer;
         buffer += R"(<?xml version="1.0"?>)";
         buffer += "<library-list>";
-        for (const auto& [base, name] : modules) {
+        for (const auto& [base, module] : modules) {
             buffer += fmt::format(R"(<library name="{}"><segment address="{:#x}"/></library>)",
-                                  EscapeXML(name), base);
+                                  EscapeXML(module.name), base);
         }
         buffer += "</library-list>";
 
@@ -694,8 +694,9 @@ void GDBStub::HandleRcmd(const std::vector<u8>& command) {
             GetInteger(page_table.GetStackRegionStart()),
             GetInteger(page_table.GetStackRegionStart()) + page_table.GetStackRegionSize() - 1);
 
-        for (const auto& [vaddr, name] : modules)
-            reply += fmt::format("  {:#012x} - {:#012x} {}\n", vaddr, GetInteger(Core::GetModuleEnd(debug_process, vaddr)), name);
+        for (const auto& [vaddr, module] : modules)
+            reply += fmt::format("  {:#012x} - {:#012x} {}\n", vaddr,
+                                 GetInteger(Core::GetModuleEnd(debug_process, vaddr)), module.name);
     } else if (command_str == "mappings" || command_str == "get mappings") {
         reply = "Mappings:\n";
         VAddr cur_addr = 0;

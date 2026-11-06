@@ -1,0 +1,121 @@
+name: Static recompiler CI
+
+on:
+  push:
+    branches:
+      - static-recompiler
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recompiler-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone:
+    name: Standalone (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2022
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize required dependency
+        shell: bash
+        run: git submodule update --init --depth=1 externals/mbedtls
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: >-
+          cmake -S tools/static_recompiler -B build/recompiler
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build/recompiler --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build/recompiler --output-on-failure
+
+  hosted-runtime:
+    name: Hosted runtime (Ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize submodules
+        run: >-
+          git
+          -c submodule."externals/nxdumptool".update=none
+          -c submodule."externals/nxapi".update=none
+          -c submodule."externals/nx-optimizer".update=none
+          submodule update --init --recursive --depth=1
+
+      - name: Repair legacy Dynarmic forwarding header
+        shell: bash
+        run: |
+          header="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$header" ] && grep -q 'C:/Users' "$header"; then
+            printf '%s\n' \
+              '// Forwarding header' \
+              '#include <boost/variant/variant.hpp>' \
+              '#include <boost/variant/recursive_variant.hpp>' \
+              '#include <boost/variant/recursive_wrapper.hpp>' \
+              '#include <boost/variant/get.hpp>' \
+              '#include <boost/variant/apply_visitor.hpp>' \
+              '#include <boost/variant/static_visitor.hpp>' \
+              '#include <boost/variant/visitor_ptr.hpp>' > "$header"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools \
+            libssl-dev libusb-1.0-0-dev libpulse-dev \
+            libvulkan-dev gamemode-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxkbcommon-dev libxtst-dev \
+            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
+            libegl-dev libdrm-dev libgbm-dev \
+            libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev \
+            libboost-all-dev
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build/runtime
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_QT=OFF
+          -DBUILD_TESTING=ON
+          -DYUZU_TESTS=ON
+          -DOPENSSL_ROOT_DIR=/usr
+
+      - name: Build runtime and tests
+        run: >-
+          cmake --build build/runtime
+          --target suyu-cmd tests suyu_recomp arm64_to_c_tests
+          --parallel 4
+
+      - name: Test hosted integration
+        run: |
+          ./build/runtime/bin/tests '[main-integration]'
+          ctest --test-dir build/runtime --output-on-failure \
+            -R '^static_recompiler_(arm64_to_c|smoke)$'

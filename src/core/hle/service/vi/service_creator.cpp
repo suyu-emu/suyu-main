@@ -31,7 +31,7 @@ Result GetApplicationDisplayService(
     }
 
     *out_application_display_service =
-        std::make_shared<IApplicationDisplayService>(system, std::move(container));
+        std::make_shared<IApplicationDisplayService>(system, std::move(container), policy);
     R_SUCCEED();
 }
 

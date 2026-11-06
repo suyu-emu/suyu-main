@@ -7,7 +7,7 @@
     },
     "boost": {
         "artifact": "%VERSION%-cmake.tar.xz",
-        "find_args": "CONFIG OPTIONAL_COMPONENTS headers context system fiber filesystem",
+        "find_args": "CONFIG COMPONENTS regex OPTIONAL_COMPONENTS headers context system fiber filesystem",
         "hash": "6ae6e94664fe7f2fb01976b59b276ac5df8085c7503fa829d810fbfe495960cfec44fa2c36e2cb23480bc19c956ed199d4952b02639a00a6c07625d4e7130c2d",
         "min_version": "1.57",
         "package": "Boost",

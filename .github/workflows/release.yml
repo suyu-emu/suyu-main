@@ -72,27 +72,9 @@ jobs:
           fetch-depth: 0
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          # X11/Wayland headers are not optional: SDL3 aborts configure without
-          # one of them. glslang-tools supplies glslangValidator, which the host
-          # shader step requires by name.
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ninja-build nasm autoconf \
-            qt6-base-dev qt6-base-private-dev libqt6svg6-dev libqt6charts6-dev \
-            qt6-multimedia-dev libqt6opengl6-dev glslang-tools \
-            libboost-dev libboost-filesystem-dev libboost-context-dev \
-            libusb-1.0-0-dev libssl-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-            libswscale-dev libswresample-dev \
-            libzstd-dev liblz4-dev libgl1-mesa-dev \
-            libasound2-dev libpulse-dev \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxkbcommon-dev libxss-dev libxtst-dev \
-            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
-            libegl-dev libdrm-dev libgbm-dev libvulkan-dev \
-            squashfs-tools patchelf desktop-file-utils
-      - name: Enable corresponding-source repositories
-        if: matrix.appimage
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        shell: bash
         run: |
           sudo tee /etc/apt/sources.list.d/suyu-appimage-sources.sources > /dev/null <<'EOF'
           Types: deb-src
@@ -259,28 +241,22 @@ jobs:
           MSYS_NO_PATHCONV: '1'
         run: |
           cmake --version
-          cmake -B build -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
-            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
-            -DSUYU_NO_JIT=${{ matrix.no_jit }} \
-            -DSUYU_EXPORT_BUILD_KIT=ON \
-            '-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.linker_flags }}'
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja 2>&1 | tee cmake_configure.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-windows
+          path: cmake_configure.log
       - name: Build
-        shell: bash
-        run: cmake --build build --target suyu suyu-cmd export-build-kit
-      - name: Verify production export build kit
+        run: cmake --build build --target suyu suyu-cmd tests suyu_recomp arm64_to_c_tests -j4
+      - name: Test integrated regressions
         shell: pwsh
         run: |
-          python tests/export_build_kit/test_release_kit.py --kit build/bin/export-build-kit --output build-release-kit-check
-          if ($LASTEXITCODE -ne 0) { throw 'Production build kit link check failed' }
-      - name: Test graphics settings GUI and INI persistence
-        shell: pwsh
-        run: |
-          python tests/graphics_settings/run_fixture.py --build build
-          if ($LASTEXITCODE -ne 0) { throw 'Graphics settings GUI/INI tests failed' }
-          python tests/graphics_settings/run_gpu_ticks.py --build build
-          if ($LASTEXITCODE -ne 0) { throw 'Fast GPU Time off-switch test failed' }
+          & build/bin/tests.exe '[main-integration]'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build --output-on-failure -R '^static_recompiler_(arm64_to_c|smoke)$'
       - name: Package
         shell: pwsh
         run: |
@@ -312,7 +288,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
       - name: Fix submodule headers
         run: |
           f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
@@ -338,12 +314,7 @@ jobs:
         run: |
           cmake --version
           set -o pipefail
-          # Build FFmpeg statically from source (-DYUZU_USE_EXTERNAL_FFMPEG=ON) instead of
-          # linking Ubuntu's system FFmpeg, and link Boost statically too
-          # (-DBoost_USE_STATIC_LIBS=ON): a binary dynamically linked against Ubuntu's
-          # libavcodec/libavutil/libboost_*/etc. sonames won't run on other distros (e.g.
-          # Fedora) that ship different versions of these libraries with incompatible sonames.
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DYUZU_USE_EXTERNAL_FFMPEG=ON -DBoost_USE_STATIC_LIBS=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
       - name: Upload cmake log
         if: failure()
         uses: actions/upload-artifact@v4
@@ -351,7 +322,11 @@ jobs:
           name: cmake-log-linux
           path: cmake_configure.log
       - name: Build
-        run: cmake --build build --target suyu suyu-cmd -j4
+        run: cmake --build build --target suyu suyu-cmd tests suyu_recomp arm64_to_c_tests -j4
+      - name: Test integrated regressions
+        run: |
+          ./build/bin/tests '[main-integration]'
+          ctest --test-dir build --output-on-failure -R '^static_recompiler_(arm64_to_c|smoke)$'
       - name: Package
         run: |
           # Flat AppDir layout (binary/desktop-file/icon all next to each other) rather than
@@ -422,12 +397,15 @@ jobs:
           fetch-depth: 0
       - name: Install dependencies
         run: |
-          brew update
-          brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm qt
-      - name: Test static recompiler
-        run: python3 tests/recompiler_smoke/run.py
-      - name: Test bounded source partitioning
-        run: python3 tests/recompiler_partition/run.py --build build-partition-test
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - name: Install deps
+        run: brew install ninja qt@6 openssl ffmpeg glslang molten-vk boost
       - name: Configure
         run: |
           cmake --version
@@ -498,7 +476,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
@@ -527,7 +505,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
       - name: Fix submodule headers
         run: |
           f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
@@ -711,7 +689,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Init submodules
         run: |
-          git -c submodule."externals/ownfoil".update=none -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
       - name: Fix submodule headers
         run: |
           f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
@@ -750,8 +728,56 @@ jobs:
           tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
       - uses: actions/upload-artifact@v4
         with:
-          name: libretro-android
-          path: suyu-libretro-core-android-arm64.tar.gz
+          name: libretro
+          path: suyu-libretro-core-linux-x64.tar.gz
+
+  build-libretro-windows:
+    name: Libretro Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        shell: bash
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y --no-progress
+          $sdkDir = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          echo "VULKAN_SDK=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+          echo "$($sdkDir.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-libretro-windows
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu_libretro -j4
+      - name: Package
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force _pkg -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory _pkg | Out-Null
+          Get-ChildItem build -Recurse -Filter suyu_libretro.dll | ForEach-Object { Copy-Item $_.FullName _pkg/ }
+          Compress-Archive -Path _pkg/* -DestinationPath suyu-libretro-core-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libretro-windows
+          path: suyu-libretro-core-windows-x64.zip
 
   release:
     name: Publish Release

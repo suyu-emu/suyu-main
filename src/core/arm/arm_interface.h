@@ -31,6 +31,7 @@ using WatchpointArray = std::array<Kernel::DebugWatchpoint, Core::Hardware::NUM_
 // NOTE: these values match the HaltReason enum in Dynarmic
 enum class HaltReason : u64 {
     StepThread = 0x00000001,
+    CacheInvalidation = 0x00000002,
     DataAbort = 0x00000004,
     BreakLoop = 0x02000000,
     SupervisorCall = 0x04000000,

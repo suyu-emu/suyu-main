@@ -12,6 +12,7 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
@@ -30,6 +31,47 @@ class Patcher {};
 #endif
 
 namespace Loader {
+
+FileSys::VirtualFile ResolveDeconstructedRomFS(const FileSys::VirtualDir& exefs_dir) {
+    if (exefs_dir == nullptr) {
+        return nullptr;
+    }
+
+    FileSys::VirtualFile romfs = exefs_dir->GetFile("romfs.bin");
+    if (romfs == nullptr) {
+        romfs = exefs_dir->GetFile("romfs");
+    }
+
+    // Restrict the parent lookup to a directory actually named "exefs" so
+    // loading an unrelated loose `main` cannot silently capture neighboring
+    // content from its parent directory.
+    FileSys::VirtualDir layout_root;
+    if (exefs_dir->GetName() == "exefs") {
+        layout_root = exefs_dir->GetParentDirectory();
+    }
+
+    if (romfs == nullptr && layout_root != nullptr) {
+        romfs = layout_root->GetFile("romfs.bin");
+        if (romfs == nullptr) {
+            romfs = layout_root->GetFile("romfs");
+        }
+    }
+    if (romfs != nullptr) {
+        return romfs;
+    }
+
+    FileSys::VirtualDir extracted_romfs = exefs_dir->GetSubdirectory("romfs");
+    if (extracted_romfs == nullptr && layout_root != nullptr) {
+        extracted_romfs = layout_root->GetSubdirectory("romfs");
+    }
+    if (extracted_romfs == nullptr) {
+        return nullptr;
+    }
+
+    LOG_INFO(Loader, "Building RomFS view from extracted directory {}",
+             extracted_romfs->GetFullPath());
+    return FileSys::CreateRomFS(std::move(extracted_romfs));
+}
 
 struct PatchCollection {
     explicit PatchCollection(bool is_application_) : is_application{is_application_} {
@@ -151,7 +193,15 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         }
 
         dir = file->GetContainingDirectory();
+        if (dir == nullptr) {
+            return {ResultStatus::ErrorNullFile, {}};
+        }
     }
+
+    // Keep the original host directory around. PatchExeFS may replace `dir`
+    // with a layered VFS directory that no longer has the host-side parent,
+    // which is where standard extracted layouts keep their sibling RomFS.
+    const FileSys::VirtualDir source_dir = dir;
 
     // Read meta to determine title ID
     FileSys::VirtualFile npdm = dir->GetFile("main.npdm");
@@ -180,6 +230,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     if (result2 != ResultStatus::Success) {
         return {result2, {}};
     }
+    title_id = metadata.GetTitleID();
     metadata.Print();
 
     // Enable NCE only for applications with 39-bit address space.
@@ -262,10 +313,41 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         }
 
         next_load_addr = *tentative_next_load_addr;
-        modules.insert_or_assign(load_addr, module);
+        modules.insert_or_assign(
+            load_addr,
+            AppLoader::NsoModuleInfo{module, system.GetApplicationProcessBuildID()});
         LOG_DEBUG(Loader, "loaded module {} @ {:#X}", module, load_addr);
     }
 
+    // LoadModule records each NSO's build ID while loading it. Preserve the
+    // application's main identity in the legacy system-wide slot instead of
+    // leaving it set to whichever library happened to load last.
+    for (const auto& entry : modules) {
+        const auto& module = entry.second;
+        if (module.name == "main") {
+            system.SetApplicationProcessBuildID(module.build_id);
+            break;
+        }
+    }
+
+    // AppLoader_NCA/NSP/NRO all register a RomFSFactory for their process here;
+    // this loader never did, so FileSystemController::OpenProcess() found no
+    // registration for a deconstructed-rom-directory process (every native
+    // static-recomp export, plus any real homebrew shipped this way) and left
+    // its output romfs_controller untouched - a null shared_ptr the FSP_SRV
+    // caller then called through unconditionally, segfaulting the instant a
+    // title's very first OpenDataStorageByCurrentProcess request came in.
+    // Registering unconditionally (matching NRO) fixes that regardless of
+    // whether romfs.bin is actually present: ReadRomFS below already returns
+    // ErrorNoRomFS cleanly when `romfs` is still null, so a title with no
+    // bundled RomFS gets a real (if empty) answer instead of a crash.
+    romfs = ResolveDeconstructedRomFS(source_dir);
+    LOG_DEBUG(Loader, "registering romfs factory for pid={} title={:016X} romfs_present={}",
+              process.GetProcessId(), metadata.GetTitleID(), romfs != nullptr);
+    system.GetFileSystemController().RegisterProcess(
+        process.GetProcessId(), metadata.GetTitleID(),
+        std::make_unique<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
+                                                system.GetFileSystemController()));
 
     is_loaded = true;
     return {ResultStatus::Success,

@@ -164,6 +164,7 @@ void DevOpen(const std::filesystem::path& p) {
 struct DevPanelState {
     Core::System* system{};
     InputCommon::InputSubsystem* input{};
+    std::function<void()> save_config;
     HWND status{};
     HWND mods{};
     HWND devices{};
@@ -174,88 +175,10 @@ struct DevPanelState {
     std::vector<Common::ParamPackage> device_list;
 };
 
-// Shows the current value; see DevApplyResScale for the write side.
-void DevRefreshResScale(DevPanelState& st) {
-    const auto current = Settings::values.resolution_setup.GetValue();
-    int index = 0;
-    for (std::size_t i = 0; i < kResScaleEntries.size(); ++i) {
-        if (kResScaleEntries[i].first == current) {
-            index = static_cast<int>(i);
-            break;
-        }
+void DevSaveConfig(const DevPanelState& st) {
+    if (st.save_config) {
+        st.save_config();
     }
-    SendMessageW(st.res_scale, CB_SETCURSEL, index, 0);
-}
-
-// Same effect as the Qt frontend's OnResolutionScaleSelected while a game is running: the
-// setting is changed and saved right away. Existing render targets already on the GPU keep
-// their current size (see GMainWindow::RestartForResolutionScale in src/suyu/main.cpp for
-// why - rescaled images refuse in-place reallocation and the pipeline cache does not key on
-// resolution), so - exactly like Qt - the new scale takes full effect the next time this
-// package is started, not on the frame after picking it.
-void DevApplyResScale(DevPanelState& st) {
-    const int index = static_cast<int>(SendMessageW(st.res_scale, CB_GETCURSEL, 0, 0));
-    if (index < 0 || static_cast<std::size_t>(index) >= kResScaleEntries.size()) {
-        return;
-    }
-    const auto setup = kResScaleEntries[index].first;
-    if (Settings::values.resolution_setup.GetValue() == setup) {
-        return;
-    }
-    Settings::values.resolution_setup.SetValue(setup);
-    Settings::UpdateRescalingInfo();
-    if (st.system != nullptr) {
-        st.system->ApplySettings();
-    }
-    SaveNativeControls();
-}
-
-// Combine shows while a pair's halves are on two players, Split while a pair is on one.
-void DevRefreshJoyconButtons(DevPanelState& st) {
-    if (st.input == nullptr) {
-        return;
-    }
-    const auto pads = ControllerPads(st.input->GetInputDevices());
-    auto& players = Settings::values.players.GetValue();
-    ShowWindow(st.combine,
-               SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
-                                                                                    : SW_HIDE);
-    ShowWindow(st.split,
-               SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, {}) ? SW_SHOW
-                                                                                  : SW_HIDE);
-}
-
-void DevJoyconAction(DevPanelState& st, bool combine) {
-    if (st.input == nullptr) {
-        return;
-    }
-    const auto pads = ControllerPads(st.input->GetInputDevices());
-    auto& players = Settings::values.players.GetValue();
-    const auto map_pad = [&st](const Common::ParamPackage& pad, Settings::PlayerInput& player) {
-        MapDefault(*st.input, pad, player);
-    };
-    const auto slot =
-        combine ? SuyuCmd::CombineJoycons(players, pads, SdlConfig::default_buttons, map_pad)
-                : SuyuCmd::SplitJoycons(players, pads, SdlConfig::default_buttons, map_pad);
-    if (!slot) {
-        MessageBoxW(nullptr, L"No Joy-Cons to change right now.", L"Controls",
-                    MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-    // The player's own choice from here on: auto-assign leaves the controls alone.
-    if (g_export_package) {
-        SdlConfig::auto_assign_controllers = false;
-    }
-    if (st.system != nullptr) {
-        st.system->HIDCore().ReloadInputDevices();
-    }
-    SaveNativeControls();
-    const std::wstring text =
-        combine ? L"Joy-Cons combined into Player " + std::to_wstring(*slot + 1) + L"."
-                : L"Joy-Cons split: the left one is Player " + std::to_wstring(*slot + 1) +
-                      L", the right one the next player.";
-    MessageBoxW(nullptr, text.c_str(), L"Controls", MB_OK | MB_ICONINFORMATION);
-    DevRefreshJoyconButtons(st);
 }
 
 // Per-button remapping. Auto-map covers the common case; this covers the rest -
@@ -303,6 +226,10 @@ void DevBindSelected(DevPanelState& st, bool clear) {
         } else {
             player.buttons[sel].clear();
         }
+        if (st.system != nullptr) {
+            st.system->HIDCore().ReloadInputDevices();
+        }
+        DevSaveConfig(st);
         DevRefreshBinds(st);
         // A choice made here is the player's own; auto-assign leaves it alone.
         if (g_export_package) {
@@ -350,10 +277,7 @@ void DevBindSelected(DevPanelState& st, bool clear) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
-    if (g_export_package) {
-        SdlConfig::auto_assign_controllers = false;
-    }
-    SaveNativeControls();
+    DevSaveConfig(st);
     DevRefreshBinds(st);
 }
 
@@ -373,8 +297,8 @@ void DevRefreshDevices(DevPanelState& st) {
         return;
     }
     for (const auto& device : st.input->GetInputDevices()) {
-        const std::string engine = device.Get("engine", "");
-        if (engine != "sdl" && engine != "joycon" && engine != "gcpad") {
+        const std::string name = device.Get("display", device.Get("class", "Unknown"));
+        if (name == "Any" || name == "Keyboard/Mouse" || name == "Keyboard Only") {
             continue;
         }
         const std::string name = device.Get("display", device.Get("class", "Unknown"));
@@ -447,10 +371,7 @@ void DevApplyPadMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
-    if (g_export_package) {
-        SdlConfig::auto_assign_controllers = false;
-    }
-    SaveNativeControls();
+    DevSaveConfig(st);
     MessageBoxW(nullptr, L"Controller mapped to Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -481,10 +402,7 @@ void DevApplyKeyboardMapping(DevPanelState& st) {
     if (st.system != nullptr) {
         st.system->HIDCore().ReloadInputDevices();
     }
-    if (g_export_package) {
-        SdlConfig::auto_assign_controllers = false;
-    }
-    SaveNativeControls();
+    DevSaveConfig(st);
     MessageBoxW(nullptr, L"Keyboard controls restored for Player 1.", L"Controls",
                 MB_OK | MB_ICONINFORMATION);
 }
@@ -666,8 +584,8 @@ LRESULT CALLBACK DevPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
-    const auto previous_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input,
+                 const std::function<void()>& save_config) {
     static bool registered = false;
     static const wchar_t* kClass = L"SuyuGameDebugPanel";
     if (!registered) {
@@ -708,6 +626,7 @@ void ShowDevMenu(Core::System& system, InputCommon::InputSubsystem* input) {
     DevPanelState state{};
     state.system = &system;
     state.input = input;
+    state.save_config = save_config;
     state.status = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY |
                                        ES_AUTOVSCROLL | WS_VSCROLL,
@@ -821,6 +740,10 @@ EmuWindow_SDL2::~EmuWindow_SDL2() {
     SDL_Quit();
 }
 
+void EmuWindow_SDL2::SetConfigSaveCallback(std::function<void()> callback) {
+    config_save_callback = std::move(callback);
+}
+
 InputCommon::MouseButton EmuWindow_SDL2::SDLButtonToMouseButton(u32 button) const {
     switch (button) {
     case SDL_BUTTON_LEFT:
@@ -881,7 +804,7 @@ void EmuWindow_SDL2::OnFingerUp() {
 void EmuWindow_SDL2::OnKeyEvent(int key, u8 state) {
 #ifdef _WIN32
     if (state == SDL_PRESSED && key == SDL_SCANCODE_F12) {
-        ShowDevMenu(system, input_subsystem);
+        ShowDevMenu(system, input_subsystem, config_save_callback);
         return;
     }
 #endif

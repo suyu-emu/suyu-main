@@ -459,9 +459,10 @@ private slots:
                                  u64 expected_title_id = 0);
     void UnloadRecompiledImages();
     bool RecompiledImagesLoaded() const;
-    /// Finds the built recompiled images that belong to a game file, if the
-    /// game sits inside an export package. Empty when there are none.
-    static QString FindRecompiledImageDirFor(const QString& game_path, u64 title_id = 0);
+    /// Finds built recompiled images for a game beside the source/package or
+    /// in a remembered export root. Empty when there are none.
+    static QString FindRecompiledImageDirFor(const QString& game_path,
+                                             const QString& game_name);
     /// Strips the library UI down to the one game this build launches.
     void EnterSingleGameMode();
     void OnLaunchRecompiledBuild(const QString& game_name, const std::string& game_path);
@@ -629,6 +630,9 @@ private:
     /// This build exists to run one baked-in game: no library, and closing the
     /// game closes the application.
     bool single_game_mode_ = false;
+    /// A manual image selection is consumed by the next boot. Automatic boots
+    /// replace stale images with the cache belonging to the selected title.
+    bool preserve_recompiled_images_for_next_boot_ = false;
 
     bool auto_paused = false;
     bool auto_muted = false;

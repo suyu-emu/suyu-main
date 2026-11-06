@@ -7,6 +7,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 
 #include "core/arm/arm_interface.h"
 #include "core/file_sys/program_metadata.h"
@@ -21,6 +22,10 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_thread_local_page.h"
 #include "core/memory.h"
+
+namespace Core {
+class ArmRecompProcessState;
+}
 
 namespace Kernel {
 
@@ -70,6 +75,7 @@ private:
     using TLPIterator = TLPTree::iterator;
 
 private:
+    std::shared_ptr<Core::ArmRecompProcessState> m_arm_recomp_state;
     std::array<std::unique_ptr<Core::ArmInterface>, Core::Hardware::NUM_CPU_CORES> m_arm_interfaces{};
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> m_running_threads{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> m_running_thread_idle_counts{};

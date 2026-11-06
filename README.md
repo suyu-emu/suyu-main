@@ -20,15 +20,10 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit —
 
 ---
 
-> **This is the final public release of suyu — v0.04. This repository is a public archive.**
->
-> No further development or downloads are planned. The codebase is preserved here under GPL-3.0 for historical reference and community use.
->
-> **Note:** a small number of fixes were later pulled in from a community
-> continuation of this codebase, after users reported that installed
-> updates/DLC, service handler registration, and RomFS registration were all
-> broken in the archived build. Those fixes are folded in here as bug fixes to
-> suyu itself; this remains the same final v0.04 release, not new development.
+> **This fork is under active development.** Its default branch is focused on a
+> title-specialized, static-first runtime with a correctness-preserving Dynarmic
+> fallback. See the [static recompiler roadmap](docs/StaticRecompiler.md) for
+> what works today and what still needs to be proven.
 
 ## About
 
@@ -41,7 +36,8 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 
 ## Status
 
-Final version: **v0.04**. Automated builds are published to the [releases page](../../releases) by GitHub Actions (Windows, Linux, Android).
+The current base is **v0.04**, with continued development on top. Release builds are published to
+the [releases page](../../releases) by GitHub Actions when maintainers cut one.
 
 Platforms: Windows, Linux, Android. macOS/iOS not included in this release.
 
@@ -95,9 +91,11 @@ Nothing here fetches a game, keys or firmware. Those are yours to supply.
 
 Start with the maintained repository:
 
-```sh
-git clone --recursive --branch mk8-recomp https://github.com/suyu-emu/suyu-main.git suyu
-cd suyu
+### Windows
+
+```bat
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+cmake --build build --target suyu suyu-cmd suyu_recomp
 ```
 
 Use `--branch v14.1.0` instead to build the released source. The default branch
@@ -110,45 +108,9 @@ rather than from the package manager.
 ### Linux
 
 ```sh
-sudo apt-get install -y \
-  build-essential git curl ca-certificates pkg-config ninja-build nasm autoconf \
-  qt6-base-dev qt6-base-private-dev libqt6svg6-dev libqt6charts6-dev \
-  qt6-multimedia-dev libqt6opengl6-dev glslang-tools \
-  libboost-dev libboost-filesystem-dev libboost-context-dev \
-  libusb-1.0-0-dev libssl-dev \
-  libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-  libswscale-dev libswresample-dev \
-  libzstd-dev liblz4-dev libgl1-mesa-dev libasound2-dev libpulse-dev \
-  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
-  libxkbcommon-dev libxss-dev libxtst-dev \
-  libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
-  libegl-dev libdrm-dev libgbm-dev libvulkan-dev
-```
-
-Three of those are easy to miss and each stops the build outright:
-`glslang-tools` provides `glslangValidator`, which the host shader step looks up
-by name; the X11 and Wayland headers are what SDL3 refuses to configure without;
-and `libavfilter-dev` is required by `FindFFmpeg` even though the emulator only
-decodes.
-
-If the distribution's CMake is older than 3.31:
-
-```sh
-V=3.31.6
-curl -fsSL -o /tmp/cmake.tar.gz "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-x86_64.tar.gz"
-sudo mkdir -p /opt/cmake && sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
-export PATH=/opt/cmake/bin:$PATH
-```
-
-Then:
-
-```sh
-cmake -B build -GNinja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
-  -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
-  -Dfmt_FORCE_BUNDLED=ON
-cmake --build build --target suyu suyu-cmd
+sudo apt-get install ninja-build qt6-base-dev libqt6svg6-dev libusb-1.0-0-dev libssl-dev
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+cmake --build build --target suyu suyu-cmd suyu_recomp
 ```
 
 The package metadata requires fmt 10 or newer because `logging.h` uses

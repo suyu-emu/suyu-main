@@ -106,6 +106,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QSplashScreen>
 #include <QShortcut>
@@ -741,23 +742,6 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
     if (!has_gamepath && is_qlaunch) {
         OnHomeMenu();
     }
-    // The CPU backend is chosen when the process starts, so the recompiled
-    // images have to be in place *before* BootGame - loading them afterwards
-    // (as the deferred SUYU_RECOMP_DIR hook below did for a command-line game)
-    // silently boots the game on the JIT instead. SUYU_RECOMP_DIR is the
-    // explicit debugging override. Automatic package and cache selection
-    // happens in BootGame after the loader reports the title ID.
-    if (!game_path.isEmpty()) {
-        const QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
-        if (!recomp_dir.isEmpty()) {
-            const int loaded = LoadRecompiledImagesFrom(recomp_dir);
-            if (loaded == 0) {
-                LOG_WARNING(Frontend, "No recompiled images under {}, booting on the JIT",
-                            recomp_dir.toStdString());
-            }
-        }
-    }
-
     if (single_game_mode_) {
         EnterSingleGameMode();
     }
@@ -2382,6 +2366,49 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
     const auto v_file = Core::GetGameFileFromPath(vfs, filename.toUtf8().constData());
     const auto loader = Loader::GetLoader(*system, v_file, params.program_id, params.program_index);
 
+    // The CPU backend is selected while LoadROM creates the application
+    // process, so choose the title's verified AOT image before that call. This
+    // lives in the common boot path rather than the constructor so launches
+    // from the library, recent-files menu, drag-and-drop, and the command line
+    // all follow the same static-first policy.
+    const bool keep_manual_selection =
+        std::exchange(preserve_recompiled_images_for_next_boot_, false) &&
+        RecompiledImagesLoaded();
+    if (!keep_manual_selection) {
+        QString game_name;
+        if (loader != nullptr) {
+            std::string loader_title;
+            if (loader->ReadTitle(loader_title) == Loader::ResultStatus::Success) {
+                game_name = QString::fromStdString(loader_title).trimmed();
+            }
+        }
+
+        QString recomp_dir = QString::fromLocal8Bit(qgetenv("SUYU_RECOMP_DIR"));
+        if (recomp_dir.isEmpty()) {
+            recomp_dir = FindRecompiledImageDirFor(filename, game_name);
+        }
+
+        // Images are process-specific. Leaving the previous game's dispatcher
+        // installed would make the next title enter ArmRecomp only to fail its
+        // identity check and spend the whole run behind an unnecessary wrapper.
+        if (RecompiledImagesLoaded()) {
+            UnloadRecompiledImages();
+        }
+        if (!recomp_dir.isEmpty()) {
+            const int loaded = LoadRecompiledImagesFrom(recomp_dir);
+            if (loaded == 0) {
+                LOG_WARNING(Frontend, "No compatible recompiled images under {}; booting on JIT",
+                            recomp_dir.toStdString());
+            } else {
+                LOG_INFO(Frontend, "Static-first launch selected {} AOT image(s) for '{}'", loaded,
+                         filename.toStdString());
+            }
+        }
+    } else {
+        LOG_INFO(Frontend, "Using manually selected recompiled images for '{}'",
+                 filename.toStdString());
+    }
+
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
         // Update NSPs report the update content ID (application ID + 0x800).
@@ -3988,13 +4015,23 @@ void GMainWindow::OnExportRecompiledSource(const QString& output_dir, bool sourc
     auto* future_watcher = new QFutureWatcher<suyu::recomp::RecompileStats>(this);
     connect(future_watcher, &QFutureWatcher<suyu::recomp::RecompileStats>::finished, this,
             [this, future_watcher, output_dir]() {
-                const auto stats = future_watcher->result();
-                QMessageBox::information(
-                    this, tr("Recompile Export"),
-                    tr("Exported %1 blocks (%2 instructions) to:\n%3")
-                        .arg(static_cast<int>(stats.blocks))
-                        .arg(static_cast<int>(stats.instructions))
-                        .arg(output_dir));
+                try {
+                    const auto stats = future_watcher->result();
+                    QMessageBox::information(
+                        this, tr("Recompile Export"),
+                        tr("Exported %1 blocks (%2 instructions) to:\n%3")
+                            .arg(static_cast<int>(stats.blocks))
+                            .arg(static_cast<int>(stats.instructions))
+                            .arg(output_dir));
+                } catch (const std::exception& error) {
+                    QMessageBox::critical(
+                        this, tr("Recompile Export Failed"),
+                        tr("The recompiler could not write the export:\n%1")
+                            .arg(QString::fromUtf8(error.what())));
+                } catch (...) {
+                    QMessageBox::critical(this, tr("Recompile Export Failed"),
+                                          tr("The recompiler could not write the export."));
+                }
                 future_watcher->deleteLater();
             });
 
@@ -7076,121 +7113,97 @@ namespace {
         std::string name;
         Core::RecompLookupFn lookup;
         void (*set_base)(u64);
-        Core::RecompBlockFn run_slice;
-        // Hands out the image's block index so the dispatcher can do the lookup
-        // itself instead of calling across the shared-object boundary for it.
-        int (*get_index)(u64*, u64*, Core::RecompBlockFn**);
+        Core::RecompBuildIdFn build_id;
+        Core::RecompTextHashFn text_sha256;
+        Core::RecompTextSizeFn text_size;
         u64 base = 0;
         unsigned (*guard_v2)(unsigned) = nullptr;
         unsigned image_abi = 0;
     };
+struct PendingRecompImageBinding {
+    RecompImage* image{};
+    u64 base{};
+    std::size_t index{};
+    std::string module_name;
+};
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
-constexpr unsigned CurrentRecompImageAbi = 5;
-// ABI 6 is ABI 5 plus the FM1 page-table fast path; exports produce it unless
-// SUYU_AOT_FASTMEM=0. A bundle is one ABI or the other, never mixed.
-constexpr unsigned FastmemRecompImageAbi = 6;
-
-// Off unless asked for: this sits on the dispatch path, which runs tens of
-// millions of times a second.
-std::string miss_record_dir;
-std::mutex miss_mutex;
-std::map<std::string, std::set<u64>> recorded_misses;
-
-void RecordMiss(const std::string& module, u64 offset) {
-    std::scoped_lock lock{miss_mutex};
-    auto& set = recorded_misses[module];
-    if (set.size() >= 65536 || !set.insert(offset).second) {
-        return;
-    }
-    // Written out as each new address first appears rather than at exit: the
-    // process is stopped with a signal at the end of a benchmark, and an atexit
-    // handler is not guaranteed to see that.
-    QDir().mkpath(QString::fromStdString(miss_record_dir));
-    for (const auto& [name, offsets] : recorded_misses) {
-        std::ofstream out(miss_record_dir + "/" + name + ".roots");
-        for (u64 value : offsets) {
-            out << std::hex << value << "\n";
-        }
-    }
-    LOG_INFO(Frontend, "uncovered entry point {}+{:#x}", module, offset);
-}
-
-// A compact, sorted view of the records above. The dispatcher runs tens of
-// millions of times a second, and a RecompImage is ~56 bytes with a std::string
-// at the front, so walking the records themselves touches a cache line per
-// image. These entries are 24 bytes and contiguous.
-struct OwnerEntry {
-    u64 base;
-    Core::RecompLookupFn lookup;
-    Core::RecompBlockFn run_slice;
-    // A direct view of the image's block index. Hitting it is a bounds check and
-    // one load; missing it falls back to `lookup`, which also covers addresses
-    // outside the indexed range.
-    u64 idx_lo;
-    u64 idx_hi;
-    Core::RecompBlockFn* idx;
-    int record;
-};
-std::array<OwnerEntry, 16> owner_entries{};
-int owner_count = 0;
-
-void RebuildOwnerTable() {
-    int n = 0;
-    for (size_t k = 0; k < loaded_records.size() && n < static_cast<int>(owner_entries.size());
-         ++k) {
-        const auto& r = loaded_records[k];
-        if (r.base == 0 || !r.lookup) {
-            continue;
-        }
-        u64 lo = 0, hi = 0;
-        Core::RecompBlockFn* idx = nullptr;
-        if (!r.get_index || !r.get_index(&lo, &hi, &idx)) {
-            lo = 1;   // An empty range no pc can satisfy.
-            hi = 0;
-            idx = nullptr;
-        }
-        owner_entries[n++] =
-            OwnerEntry{r.base, r.lookup, r.run_slice, lo, hi, idx, static_cast<int>(k)};
-    }
-    std::sort(owner_entries.begin(), owner_entries.begin() + n,
-              [](const OwnerEntry& a, const OwnerEntry& b) { return a.base < b.base; });
-    owner_count = n;
-}
+std::vector<PendingRecompImageBinding> pending_image_bindings;
+std::size_t pending_image_binding_count{};
 } // Anonymous namespace
 
 void GMainWindow::UnloadRecompiledImages() {
     Core::SetRecompLookup(nullptr);
-    Core::SetRecompLongSlices(false);
+    Core::SetRecompBinder(nullptr);
     for (auto* lib : loaded_images) {
         lib->unload();
         lib->deleteLater();
     }
     loaded_images.clear();
     loaded_records.clear();
-    owner_count = 0;
-    auto_loaded_recompiled_title_id = 0;
+    pending_image_bindings.clear();
+    pending_image_binding_count = 0;
 }
 
 bool GMainWindow::RecompiledImagesLoaded() const {
     return !loaded_images.empty();
 }
 
-QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path, u64 title_id) {
-    // Every export package layout - Windows package dir, Linux AppDir usr/bin,
-    // macOS Contents/Resources - puts aot_cache beside the bundled ROM, so the
-    // ROM's own directory is the only place worth looking.
-    const QString base = QFileInfo(game_path).absolutePath();
+QString GMainWindow::FindRecompiledImageDirFor(const QString& game_path,
+                                               const QString& game_name) {
     QStringList candidates;
-    if (title_id != 0) {
-        candidates.append(QString::fromStdString(Common::FS::PathToUTF8String(
-            Common::FS::GetSuyuPath(Common::FS::SuyuPath::CacheDir) / "aot" /
-            fmt::format("{:016X}", title_id))));
+    const auto add_cache_layouts = [&candidates](const QString& cache_root) {
+        if (cache_root.isEmpty()) {
+            return;
+        }
+        // `exefs` is the current exporter layout. `recompiled` is retained for
+        // caches produced before that layout change and for hand-built trees.
+        candidates.append(cache_root + QStringLiteral("/exefs"));
+        candidates.append(cache_root + QStringLiteral("/recompiled"));
+    };
+
+    const QFileInfo game_info(game_path);
+    const QString game_dir = game_info.absolutePath();
+    add_cache_layouts(game_dir + QStringLiteral("/aot_cache"));
+    candidates.append(game_dir + QStringLiteral("/recompiled"));
+
+    // A source-only package boots exefs/main, while its aot_cache is a sibling
+    // of exefs. Account for that package shape as well as a ROM beside a cache.
+    QDir package_dir(game_dir);
+    if (package_dir.dirName().compare(QStringLiteral("exefs"), Qt::CaseInsensitive) == 0 &&
+        package_dir.cdUp()) {
+        add_cache_layouts(package_dir.absoluteFilePath(QStringLiteral("aot_cache")));
     }
-    candidates.append({
-        base + QStringLiteral("/aot_cache/recompiled"),
-        base + QStringLiteral("/recompiled"),
-    });
+
+    QStringList names;
+    const auto add_name = [&names](QString name) {
+        name = name.trimmed();
+        if (name.isEmpty()) {
+            return;
+        }
+        static const QRegularExpression illegal(QStringLiteral("[\\\\/:*?\"<>|]"));
+        name.replace(illegal, QStringLiteral("_"));
+        if (!names.contains(name)) {
+            names.append(name);
+        }
+    };
+    add_name(game_name);
+    add_name(game_info.completeBaseName());
+
+    // Exports can live away from the original ROM. Search only the handful of
+    // roots the exporter remembers, and only the two title-derived directory
+    // names, rather than recursively loading every game's native code.
+    for (const QString& root : GameExportDialog::RecompileOutputRoots()) {
+        for (const QString& name : names) {
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral("/aot_cache"));
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral(".AppDir/usr/bin/aot_cache"));
+            add_cache_layouts(root + QDir::separator() + name +
+                              QStringLiteral(".app/Contents/Resources/aot_cache"));
+        }
+    }
+    candidates.removeDuplicates();
 
 #ifdef _WIN32
     const QStringList patterns{QStringLiteral("recompiled_*.dll")};
@@ -7414,9 +7427,18 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             }
             continue;
         }
-        const auto fn =
+        const auto lookup =
             reinterpret_cast<Core::RecompLookupFn>(lib->resolve("recomp_image_lookup"));
-        if (!fn) {
+        const auto set_base =
+            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
+        const auto build_id =
+            reinterpret_cast<Core::RecompBuildIdFn>(lib->resolve("recomp_image_build_id"));
+        const auto text_sha256 = reinterpret_cast<Core::RecompTextHashFn>(
+            lib->resolve("recomp_image_text_sha256"));
+        const auto text_size =
+            reinterpret_cast<Core::RecompTextSizeFn>(lib->resolve("recomp_image_text_size"));
+        if (!lookup || !set_base || !build_id || !text_sha256 || !text_size) {
+            // Some other library that happens to sit in the tree.
             lib->unload();
             lib->deleteLater();
             if (require_current_abi) {
@@ -7511,114 +7533,125 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                 break;
             }
         }
-        auto* set_base =
-            reinterpret_cast<void (*)(u64)>(lib->resolve("recomp_image_set_base"));
-        auto* run_slice = reinterpret_cast<Core::RecompBlockFn>(
-            lib->resolve("recomp_image_run_slice"));
-        if (abi < 4) {
-            run_slice = nullptr;
-        }
-        auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
-            lib->resolve("recomp_image_index"));
-        if (require_current_abi && (!set_base || !get_index || !run_slice)) {
-            lib->unload();
-            lib->deleteLater();
-            discard_found();
-            return refuse_bundle(QStringLiteral("image lacks current base/index/slice exports: %1")
-                                     .arg(image_path));
-        }
-        records.push_back(
-            RecompImage{owner.dirName().toStdString(), fn, set_base, run_slice, get_index, 0,
-                        guard_v2, abi});
+        records.push_back(RecompImage{owner.dirName().toStdString(), lookup, set_base, build_id,
+                                      text_sha256, text_size, 0});
     }
 
     if (found.empty()) {
         return 0;
     }
 
+    Core::SetRecompLookup(nullptr);
+    Core::SetRecompBinder(nullptr);
     for (auto* lib : loaded_images) {
         lib->unload();
         lib->deleteLater();
     }
     loaded_images = std::move(found);
     loaded_records = std::move(records);
+    pending_image_bindings.clear();
+    pending_image_binding_count = 0;
 
-    // Kernel module names carry an "nn" prefix that the export directories do
-    // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, const char*, u64 base) {
-        // Try the name first - it works for rtld - then fall back to load
-        // order. A game's own modules are not named after the files they were
-        // exported from: main is named after the game ("cross2_Release.nss"),
-        // and the others come through as "nnSdk" and "multimedia". Load order
-        // is identical across titles, so position is the dependable key.
-        // Switch load order is rtld, main, subsdk0..subsdk9, sdk. This table had
-        // only four entries {rtld, main, subsdk0, sdk}, which silently mismaps
-        // any title with more than one subsdk: the module at index 3 is subsdk1,
-        // but a 4-entry table hands it the *sdk* image, and every module from
-        // index 4 on gets no image at all.
-        //
-        // a second title loads nine modules. Four were left uncovered and one
-        // was given the wrong image, so most PCs resolved to a neighbouring
-        // module and missed. sdk is still matched by name first (kernel calls it
-        // "nnSdk"), which is what keeps it correct regardless of module count -
-        // it is the only entry whose position depends on how many subsdks a
-        // title happens to have.
-        static const char* kByLoadOrder[] = {
-            "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
-            "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
-            "sdk",
-        };
-
-        std::string name = module;
-        auto ci_equal = [](const std::string& a, const std::string& b) {
-            return a.size() == b.size() &&
-                   std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
-                       return std::tolower(static_cast<unsigned char>(x)) ==
-                              std::tolower(static_cast<unsigned char>(y));
-                   });
-        };
-        auto match = [&](const std::string& candidate) -> RecompImage* {
+    Core::SetRecompBinder([](size_t index, size_t count, const char* module, u64 base,
+                             const u8* build_id, size_t build_id_size,
+                             const u8* text_sha256, size_t text_sha256_size,
+                             u64 text_size) -> bool {
+        const char* module_name = module != nullptr ? module : "?";
+        if (index == 0) {
+            pending_image_bindings.clear();
+            pending_image_binding_count = 0;
             for (auto& record : loaded_records) {
-                // Kernel module names ("nnSdk") and export directory names
-                // ("sdk") differ in case as well as the "nn" prefix already
-                // stripped above - a case-sensitive compare here silently
-                // fails and falls through to guessing by load order instead
-                // of the name actually matching.
-                if (ci_equal(record.name, candidate)) {
-                    return &record;
-                }
+                record.base = 0;
+                record.set_base(0);
             }
-            return nullptr;
+        }
+        const auto reject_batch = [] {
+            pending_image_bindings.clear();
+            pending_image_binding_count = 0;
+            return false;
         };
-        RecompImage* record = match(name);
-        if (!record && name.rfind("nn", 0) == 0) {
-            record = match(name.substr(2));
+        if (count == 0 || index >= count || index != pending_image_bindings.size() ||
+            (index != 0 && count != pending_image_binding_count) || base == 0) {
+            LOG_ERROR(Frontend,
+                      "Invalid recompiled image batch at index {} (batch {}, available {})",
+                      index, count, loaded_records.size());
+            return reject_batch();
         }
-        if (!record && index < std::size(kByLoadOrder)) {
-            record = match(kByLoadOrder[index]);
+        if (index == 0) {
+            pending_image_binding_count = count;
         }
-        if (record && record->set_base) {
-            // Misses in this module are gaps a re-export can close.
-            Core::RecompGaps::NoteImage(base, record->name);
-            if (record->base == base) {
-                return;
+        if (build_id == nullptr || build_id_size != Core::RecompBuildIdSize ||
+            text_sha256 == nullptr || text_sha256_size != Core::RecompSha256Size) {
+            LOG_ERROR(Frontend, "Invalid identity while binding recompiled module '{}' (#{})",
+                      module_name, index);
+            return reject_batch();
+        }
+
+        RecompImage* matched = nullptr;
+        for (auto& record : loaded_records) {
+            const u8* candidate_build_id = record.build_id();
+            const u8* candidate_text_sha256 = record.text_sha256();
+            if (candidate_build_id == nullptr || candidate_text_sha256 == nullptr ||
+                record.text_size() != text_size ||
+                !std::equal(build_id, build_id + Core::RecompBuildIdSize, candidate_build_id) ||
+                !std::equal(text_sha256, text_sha256 + Core::RecompSha256Size,
+                            candidate_text_sha256)) {
+                continue;
             }
-            record->base = base;
-            record->set_base(base);
-            RebuildOwnerTable();
-            LOG_INFO(Frontend, "Recompiled image for module '{}' (#{}) based at {:#x}", name,
-                     index, base);
-        } else {
-            LOG_WARNING(Frontend, "No recompiled image for module '{}' (#{}, base {:#x})", name,
-                        index, base);
+            if (matched != nullptr) {
+                LOG_ERROR(Frontend,
+                          "Multiple recompiled images match module '{}' (#{}) identity",
+                          module_name, index);
+                return reject_batch();
+            }
+            matched = &record;
         }
+        if (matched == nullptr) {
+            if (count == 1) {
+                LOG_WARNING(
+                    Frontend,
+                    "No recompiled image matches single module '{}' (text {:#x}, base {:#x})",
+                    module_name, text_size, base);
+                return reject_batch();
+            }
+            LOG_WARNING(Frontend,
+                        "No recompiled image matches module '{}' (#{}, text {:#x}, base {:#x}); "
+                        "using JIT fallback for this NSO",
+                        module_name, index, text_size, base);
+        } else if (std::any_of(pending_image_bindings.begin(), pending_image_bindings.end(),
+                               [matched](const PendingRecompImageBinding& pending) {
+                                   return pending.image == matched;
+                               })) {
+            LOG_ERROR(Frontend,
+                      "Recompiled image matched more than one loaded NSO in the same batch");
+            return reject_batch();
+        }
+
+        pending_image_bindings.push_back(
+            PendingRecompImageBinding{matched, base, index, module_name});
+        if (pending_image_bindings.size() != count) {
+            return true;
+        }
+        for (const PendingRecompImageBinding& pending : pending_image_bindings) {
+            if (pending.image == nullptr) {
+                continue;
+            }
+            pending.image->base = pending.base;
+            pending.image->set_base(pending.base);
+            LOG_INFO(Frontend,
+                     "Build-ID matched recompiled image '{}' for module '{}' (#{}) at {:#x}",
+                     pending.image->name, pending.module_name, pending.index, pending.base);
+        }
+        pending_image_bindings.clear();
+        pending_image_binding_count = 0;
+        return true;
     });
 
-    // Every image is keyed by an offset within its own module, so the
-    // dispatcher must first work out which module owns this absolute PC -
-    // the image with the greatest base that does not exceed it - before
-    // reducing to an offset and asking that image alone. Asking every image
-    // in turn (as before) would silently return a different module's block
+    // Every exported image lookup accepts an absolute PC and subtracts the
+    // base supplied through recomp_image_set_base itself. The dispatcher must
+    // still work out which module owns the PC - the image with the greatest
+    // base that does not exceed it - before asking that image alone. Asking
+    // every image in turn would silently return a different module's block
     // whenever two modules both define something at the same offset, which
     // they always do at offset 0 (every module's entry block). A plain
     // function pointer is required here, so the table has to be reached via
@@ -7652,13 +7685,9 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                 return e.run_slice ? e.run_slice : block;
             }
         }
-
-        // Entries are sorted by base, so the owner is the last one at or below
-        // pc and the scan can stop at the first entry above it.
-        int owner_slot = -1;
-        for (int k = 0; k < n; ++k) {
-            if (owner_entries[k].base > pc) {
-                break;
+        if (owner) {
+            if (auto* block = owner->lookup(pc)) {
+                return block;
             }
             owner_slot = k;
         }
@@ -7795,6 +7824,7 @@ void GMainWindow::OnLoadRecompiledImage() {
         }
         return;
     }
+    preserve_recompiled_images_for_next_boot_ = true;
 
     // No modal when the load was driven by the environment variable - that path
     // is meant to run unattended.
