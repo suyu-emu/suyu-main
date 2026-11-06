@@ -21,6 +21,14 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalView
+import androidx.recyclerview.widget.RecyclerView
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.settings.SettingsListScreen
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.findNavController
 import androidx.navigation.fragment.navArgs
@@ -28,7 +36,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.databinding.FragmentSettingsBinding
 import org.yuzu.yuzu_emu.features.input.NativeInput
 import org.yuzu.yuzu_emu.features.settings.model.Settings
 import org.yuzu.yuzu_emu.features.settings.model.view.PathSetting
@@ -43,8 +50,7 @@ class SettingsFragment : Fragment() {
     private lateinit var presenter: SettingsFragmentPresenter
     private var settingsAdapter: SettingsAdapter? = null
 
-    private var _binding: FragmentSettingsBinding? = null
-    private val binding get() = _binding!!
+    private var revision by mutableIntStateOf(0)
 
     private val args by navArgs<SettingsFragmentArgs>()
 
@@ -83,32 +89,44 @@ class SettingsFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        _binding = FragmentSettingsBinding.inflate(layoutInflater)
-        return binding.root
+        val adapter = SettingsAdapter(this, requireContext())
+        settingsAdapter = adapter
+        // The adapter only holds the list and the click handlers now; any change to it redraws.
+        adapter.registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
+            override fun onChanged() { revision++ }
+            override fun onItemRangeChanged(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeChanged(positionStart: Int, itemCount: Int, payload: Any?) { revision++ }
+            override fun onItemRangeInserted(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeRemoved(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeMoved(fromPosition: Int, toPosition: Int, itemCount: Int) { revision++ }
+        })
+
+        val title = resolveToolbarTitle()
+        return suyuComposeView {
+            val anchor = LocalView.current
+            val rows = remember(revision) { SettingsRows.build(adapter, anchor) }
+            SettingsListScreen(
+                title = title,
+                rows = rows,
+                onBack = { settingsViewModel.setShouldNavigateBack(true) },
+                onSearch = if (args.menuTag == Settings.MenuTag.SECTION_ROOT) {
+                    { requireView().findNavController().navigate(R.id.action_settingsFragment_to_settingsSearchFragment) }
+                } else {
+                    null
+                }
+            )
+        }
     }
 
     @SuppressLint("NotifyDataSetChanged")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        settingsAdapter = SettingsAdapter(this, requireContext())
         presenter = SettingsFragmentPresenter(
             settingsViewModel,
             settingsAdapter!!,
             args.menuTag,
             activity
         )
-
-        val toolbarTitle = resolveToolbarTitle()
-        configureToolbar(toolbarTitle)
-
-        binding.listSettings.apply {
-            adapter = settingsAdapter
-            layoutManager = LinearLayoutManager(requireContext())
-        }
-
-        binding.toolbarSettings.setNavigationOnClickListener {
-            settingsViewModel.setShouldNavigateBack(true)
-        }
 
         settingsViewModel.shouldReloadSettingsList.collect(
             viewLifecycleOwner,
@@ -162,23 +180,7 @@ class SettingsFragment : Fragment() {
             }
         }
 
-        if (args.menuTag == Settings.MenuTag.SECTION_ROOT) {
-            binding.toolbarSettings.inflateMenu(R.menu.menu_settings)
-            binding.toolbarSettings.setOnMenuItemClickListener {
-                when (it.itemId) {
-                    R.id.action_search -> {
-                        view.findNavController()
-                            .navigate(R.id.action_settingsFragment_to_settingsSearchFragment)
-                        true
-                    }
-
-                    else -> false
-                }
-            }
-        }
-
         presenter.onViewCreated()
-        setInsets()
     }
 private fun getPlayerIndex(): Int =
         when (args.menuTag) {
@@ -207,28 +209,6 @@ private fun getPlayerIndex(): Int =
             Settings.MenuTag.SECTION_INPUT_PLAYER_SEVEN -> Settings.getPlayerString(7)
             Settings.MenuTag.SECTION_INPUT_PLAYER_EIGHT -> Settings.getPlayerString(8)
             else -> getString(args.menuTag.titleId)
-        }
-    }
-
-    private fun configureToolbar(title: String) {
-        binding.toolbarSettings.title = title
-    }
-
-    private fun setInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.listSettings.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listSettings.updatePadding(bottom = barInsets.bottom)
-
-            binding.appbarSettings.updateMargins(left = leftInsets, right = rightInsets)
-            windowInsets
         }
     }
 

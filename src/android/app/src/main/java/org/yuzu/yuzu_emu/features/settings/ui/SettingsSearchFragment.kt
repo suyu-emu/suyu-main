@@ -1,5 +1,6 @@
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Author: Ghael_V - Lemon Switch Emu - Suyu Team
 
 package org.yuzu.yuzu_emu.features.settings.ui
 
@@ -8,30 +9,29 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.view.inputmethod.InputMethodManager
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
-import androidx.core.widget.doOnTextChanged
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalView
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
-import androidx.recyclerview.widget.LinearLayoutManager
-import com.google.android.material.divider.MaterialDividerItemDecoration
+import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.transition.MaterialSharedAxis
 import info.debatty.java.stringsimilarity.Cosine
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.databinding.FragmentSettingsSearchBinding
 import org.yuzu.yuzu_emu.features.settings.model.view.SettingsItem
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.settings.SettingsSearchScreen
 import org.yuzu.yuzu_emu.utils.NativeConfig
-import org.yuzu.yuzu_emu.utils.ViewUtils.setVisible
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
 import org.yuzu.yuzu_emu.utils.collect
 
 class SettingsSearchFragment : Fragment() {
-    private var _binding: FragmentSettingsSearchBinding? = null
-    private val binding get() = _binding!!
-
     private var settingsAdapter: SettingsAdapter? = null
+    private var revision by mutableIntStateOf(0)
+    private var query by mutableStateOf("")
 
     private val settingsViewModel: SettingsViewModel by activityViewModels()
 
@@ -41,6 +41,7 @@ class SettingsSearchFragment : Fragment() {
         returnTransition = MaterialSharedAxis(MaterialSharedAxis.X, false)
         reenterTransition = MaterialSharedAxis(MaterialSharedAxis.X, false)
         exitTransition = MaterialSharedAxis(MaterialSharedAxis.X, true)
+        query = savedInstanceState?.getString(SEARCH_TEXT).orEmpty()
     }
 
     override fun onCreateView(
@@ -48,61 +49,51 @@ class SettingsSearchFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        _binding = FragmentSettingsSearchBinding.inflate(layoutInflater)
-        return binding.root
+        val adapter = SettingsAdapter(this, requireContext())
+        settingsAdapter = adapter
+        adapter.registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
+            override fun onChanged() { revision++ }
+            override fun onItemRangeChanged(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeChanged(positionStart: Int, itemCount: Int, payload: Any?) { revision++ }
+            override fun onItemRangeInserted(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeRemoved(positionStart: Int, itemCount: Int) { revision++ }
+            override fun onItemRangeMoved(fromPosition: Int, toPosition: Int, itemCount: Int) { revision++ }
+        })
+
+        return suyuComposeView {
+            val anchor = LocalView.current
+            val rows = remember(revision) { SettingsRows.build(adapter, anchor) }
+            SettingsSearchScreen(
+                query = query,
+                onQueryChange = {
+                    query = it
+                    search()
+                },
+                rows = rows,
+                onBack = { settingsViewModel.setShouldNavigateBack(true) }
+            )
+        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-
-        if (savedInstanceState != null) {
-            binding.searchText.setText(savedInstanceState.getString(SEARCH_TEXT))
-        }
-
-        settingsAdapter = SettingsAdapter(this, requireContext())
-
-        val dividerDecoration = MaterialDividerItemDecoration(
-            requireContext(),
-            LinearLayoutManager.VERTICAL
-        )
-        dividerDecoration.isLastItemDecorated = false
-        binding.settingsList.apply {
-            adapter = settingsAdapter
-            layoutManager = LinearLayoutManager(requireContext())
-            addItemDecoration(dividerDecoration)
-        }
-
-        focusSearch()
-
-        binding.backButton.setOnClickListener { settingsViewModel.setShouldNavigateBack(true) }
-        binding.searchBackground.setOnClickListener { focusSearch() }
-        binding.clearButton.setOnClickListener { binding.searchText.setText("") }
-        binding.searchText.doOnTextChanged { _, _, _, _ ->
-            search()
-            binding.settingsList.smoothScrollToPosition(0)
-        }
         settingsViewModel.shouldReloadSettingsList.collect(viewLifecycleOwner) {
             if (it) {
                 settingsViewModel.setShouldReloadSettingsList(false)
                 search()
             }
         }
-
         search()
-
-        setInsets()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(SEARCH_TEXT, binding.searchText.text.toString())
+        outState.putString(SEARCH_TEXT, query)
     }
 
     private fun search() {
-        val searchTerm = binding.searchText.text.toString().lowercase()
-        binding.clearButton.setVisible(visible = searchTerm.isNotEmpty(), gone = false)
+        val searchTerm = query.lowercase()
         if (searchTerm.isEmpty()) {
-            binding.noResultsView.setVisible(visible = false, gone = false)
             settingsAdapter?.submitList(emptyList())
             return
         }
@@ -129,53 +120,7 @@ class SettingsSearchFragment : Fragment() {
             optionalSetting
         }
         settingsAdapter?.submitList(sortedList)
-        binding.noResultsView.setVisible(visible = sortedList.isEmpty(), gone = false)
     }
-
-    private fun focusSearch() {
-        binding.searchText.requestFocus()
-        val imm = requireActivity()
-            .getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager?
-        imm?.showSoftInput(binding.searchText, InputMethodManager.SHOW_IMPLICIT)
-    }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val extraListSpacing = resources.getDimensionPixelSize(R.dimen.spacing_med)
-            val sideMargin = resources.getDimensionPixelSize(R.dimen.spacing_medlarge)
-            val topMargin = resources.getDimensionPixelSize(R.dimen.spacing_chip)
-
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.settingsList.updatePadding(bottom = barInsets.bottom + extraListSpacing)
-            binding.frameSearch.updatePadding(
-                left = leftInsets + sideMargin,
-                top = barInsets.top + topMargin,
-                right = rightInsets + sideMargin
-            )
-            binding.noResultsView.updatePadding(
-                left = leftInsets,
-                right = rightInsets,
-                bottom = barInsets.bottom
-            )
-
-            binding.settingsList.updateMargins(
-                left = leftInsets + sideMargin,
-                right = rightInsets + sideMargin
-            )
-            binding.divider.updateMargins(
-                left = leftInsets + sideMargin,
-                right = rightInsets + sideMargin
-            )
-
-            windowInsets
-        }
 
     companion object {
         const val SEARCH_TEXT = "SearchText"

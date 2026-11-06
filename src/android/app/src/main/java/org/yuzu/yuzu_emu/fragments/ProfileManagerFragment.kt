@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Author: Ghael_V - Lemon Switch Emu - Suyu Team
 
 package org.yuzu.yuzu_emu.fragments
 
@@ -7,30 +8,28 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.fragment.findNavController
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.ProfileAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentProfileManagerBinding
 import org.yuzu.yuzu_emu.model.HomeViewModel
 import org.yuzu.yuzu_emu.model.UserProfile
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.ProfilesScreen
 import org.yuzu.yuzu_emu.utils.NativeConfig
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
 
 class ProfileManagerFragment : Fragment() {
-    private var _binding: FragmentProfileManagerBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
-    private lateinit var profileAdapter: ProfileAdapter
+
+    private var profiles by mutableStateOf<List<UserProfile>>(emptyList())
+    private var currentUuid by mutableStateOf("")
+    private var canCreate by mutableStateOf(true)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,35 +42,23 @@ class ProfileManagerFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentProfileManagerBinding.inflate(layoutInflater)
-        return binding.root
+    ): View = suyuComposeView {
+        ProfilesScreen(
+            profiles = profiles,
+            currentUuid = currentUuid,
+            canCreate = canCreate,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+            onSelect = ::selectProfile,
+            onEdit = ::editProfile,
+            onDelete = ::confirmDeleteProfile,
+            onAdd = ::addProfile
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(visible = false)
-
-        binding.toolbarProfiles.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
-        setupRecyclerView()
         loadProfiles()
-
-        binding.buttonAddUser.setOnClickListener {
-            if (NativeLibrary.canCreateUser()) {
-                findNavController().navigate(R.id.action_profileManagerFragment_to_newUserDialog)
-            } else {
-                MaterialAlertDialogBuilder(requireContext())
-                    .setTitle(R.string.profile_max_users_title)
-                    .setMessage(R.string.profile_max_users_message)
-                    .setPositiveButton(android.R.string.ok, null)
-                    .show()
-            }
-        }
-
-        setInsets()
     }
 
     override fun onResume() {
@@ -79,37 +66,35 @@ class ProfileManagerFragment : Fragment() {
         loadProfiles()
     }
 
-    private fun setupRecyclerView() {
-        profileAdapter = ProfileAdapter(
-            onProfileClick = { profile -> selectProfile(profile) },
-            onEditClick = { profile -> editProfile(profile) },
-            onDeleteClick = { profile -> confirmDeleteProfile(profile) }
-        )
-        binding.listProfiles.apply {
-            layoutManager = LinearLayoutManager(requireContext())
-            adapter = profileAdapter
+    private fun addProfile() {
+        if (NativeLibrary.canCreateUser()) {
+            findNavController().navigate(R.id.action_profileManagerFragment_to_newUserDialog)
+        } else {
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.profile_max_users_title)
+                .setMessage(R.string.profile_max_users_message)
+                .setPositiveButton(android.R.string.ok, null)
+                .show()
         }
     }
 
     private fun loadProfiles() {
-        val profiles = mutableListOf<UserProfile>()
+        val list = mutableListOf<UserProfile>()
         val userUUIDs = NativeLibrary.getAllUsers() ?: emptyArray()
-        val currentUserUUID = NativeLibrary.getCurrentUser()
 
         for (uuid in userUUIDs) {
             if (uuid.isNotEmpty()) {
                 val username = NativeLibrary.getUserUsername(uuid)
                 if (!username.isNullOrEmpty()) {
                     val imagePath = NativeLibrary.getUserImagePath(uuid) ?: ""
-                    profiles.add(UserProfile(uuid, username, imagePath))
+                    list.add(UserProfile(uuid, username, imagePath))
                 }
             }
         }
 
-        profileAdapter.submitList(profiles)
-        profileAdapter.setCurrentUser(currentUserUUID ?: "")
-
-        binding.buttonAddUser.isEnabled = NativeLibrary.canCreateUser()
+        profiles = list
+        currentUuid = NativeLibrary.getCurrentUser() ?: ""
+        canCreate = NativeLibrary.canCreateUser()
     }
 
     private fun selectProfile(profile: UserProfile) {
@@ -117,7 +102,6 @@ class ProfileManagerFragment : Fragment() {
             loadProfiles()
         }
     }
-
 
     private fun editProfile(profile: UserProfile) {
         val bundle = Bundle().apply {
@@ -128,8 +112,7 @@ class ProfileManagerFragment : Fragment() {
     }
 
     private fun confirmDeleteProfile(profile: UserProfile) {
-        val currentUser = NativeLibrary.getCurrentUser()
-        val isCurrentUser = profile.uuid == currentUser
+        val isCurrentUser = profile.uuid == NativeLibrary.getCurrentUser()
 
         MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.profile_delete_confirm_title)
@@ -140,9 +123,7 @@ class ProfileManagerFragment : Fragment() {
                     getString(R.string.profile_delete_confirm_message, profile.username)
                 }
             )
-            .setPositiveButton(R.string.profile_delete) { _, _ ->
-                deleteProfile(profile)
-            }
+            .setPositiveButton(R.string.profile_delete) { _, _ -> deleteProfile(profile) }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
     }
@@ -164,37 +145,8 @@ class ProfileManagerFragment : Fragment() {
         }
     }
 
-    private fun setInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarProfiles.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listProfiles.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listProfiles.updatePadding(
-                bottom = barInsets.bottom +
-                    resources.getDimensionPixelSize(R.dimen.spacing_bottom_list_fab)
-            )
-
-            val fabSpacing = resources.getDimensionPixelSize(R.dimen.spacing_fab)
-            binding.buttonAddUser.updateMargins(
-                left = leftInsets + fabSpacing,
-                right = rightInsets + fabSpacing,
-                bottom = barInsets.bottom + fabSpacing
-            )
-
-            windowInsets
-        }
-    }
-
     override fun onDestroyView() {
         super.onDestroyView()
         NativeConfig.saveGlobalConfig()
-        _binding = null
     }
 }

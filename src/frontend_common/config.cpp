@@ -29,6 +29,10 @@ namespace {
 // Directories inside the executable's folder are stored relative to it, so a portable
 // installation keeps working after being moved or copied instead of pointing at its old place.
 std::string ToStoredPath(const std::string& value) {
+#ifndef _WIN32
+    // GetExeDirectory only exists on Windows (portable installs); Android stores SAF URIs.
+    return value;
+#else
     const std::filesystem::path absolute = std::filesystem::path{FS::ToU8String(value)};
     std::error_code ec;
     const auto relative = std::filesystem::relative(absolute, FS::GetExeDirectory(), ec);
@@ -36,14 +40,19 @@ std::string ToStoredPath(const std::string& value) {
         return value;
     }
     return FS::ToUTF8String(relative.generic_u8string());
+#endif
 }
 
 std::filesystem::path ResolveStoredPath(const std::string& value) {
     const std::filesystem::path stored = std::filesystem::path{FS::ToU8String(value)};
+#ifdef _WIN32
     if (value.empty() || stored.is_absolute()) {
         return stored;
     }
     return FS::GetExeDirectory() / stored;
+#else
+    return stored;
+#endif
 }
 
 } // Anonymous namespace

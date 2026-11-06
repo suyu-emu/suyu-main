@@ -13,6 +13,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
@@ -31,7 +35,6 @@ import org.yuzu.yuzu_emu.HomeNavigationDirections
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.YuzuApplication
-import org.yuzu.yuzu_emu.adapters.GamePropertiesAdapter
 import org.yuzu.yuzu_emu.databinding.FragmentGamePropertiesBinding
 import org.yuzu.yuzu_emu.features.DocumentProvider
 import org.yuzu.yuzu_emu.features.settings.model.Settings
@@ -45,6 +48,8 @@ import org.yuzu.yuzu_emu.model.InstallableProperty
 import org.yuzu.yuzu_emu.model.SubMenuPropertySecondaryAction
 import org.yuzu.yuzu_emu.model.SubmenuProperty
 import org.yuzu.yuzu_emu.model.TaskState
+import org.yuzu.yuzu_emu.ui.compose.games.GameDetailScreen
+import org.yuzu.yuzu_emu.ui.compose.theme.SuyuTheme
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
 import org.yuzu.yuzu_emu.utils.FileUtil
 import org.yuzu.yuzu_emu.utils.GameHelper
@@ -68,6 +73,11 @@ class GamePropertiesFragment : Fragment() {
 
     private val args by navArgs<GamePropertiesFragmentArgs>()
 
+    private var properties by mutableStateOf<List<GameProperty>>(emptyList())
+    private var playTimeSeconds by mutableLongStateOf(0L)
+    private var startEnabled by mutableStateOf(true)
+    private var shortcutEnabled by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enterTransition = MaterialSharedAxis(MaterialSharedAxis.Y, true)
@@ -88,41 +98,31 @@ class GamePropertiesFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(true)
 
-        binding.buttonBack.setOnClickListener {
-            view.findNavController().popBackStack()
-        }
+        getPlayTime()
+        shortcutEnabled = requireActivity().getSystemService(ShortcutManager::class.java)
+            .isRequestPinShortcutSupported
 
-        val shortcutManager = requireActivity().getSystemService(ShortcutManager::class.java)
-        binding.buttonShortcut.isEnabled = shortcutManager.isRequestPinShortcutSupported
-        binding.buttonShortcut.setOnClickListener {
-            viewLifecycleOwner.lifecycleScope.launch {
-                withContext(Dispatchers.IO) {
-                    val shortcut = ShortcutInfo.Builder(requireContext(), args.game.title)
-                        .setShortLabel(args.game.title)
-                        .setIcon(
-                            GameIconUtils.getShortcutIcon(requireActivity(), args.game)
-                                .toIcon(requireContext())
-                        )
-                        .setIntent(args.game.launchIntent)
-                        .build()
-                    shortcutManager.requestPinShortcut(shortcut, null)
-                }
+        binding.composeGameProperties.setContent {
+            SuyuTheme {
+                GameDetailScreen(
+                    game = args.game,
+                    playTimeSeconds = playTimeSeconds,
+                    properties = properties,
+                    startEnabled = startEnabled,
+                    shortcutEnabled = shortcutEnabled,
+                    onBack = { view.findNavController().popBackStack() },
+                    onShortcut = ::requestPinShortcut,
+                    onEditPlayTime = ::showEditPlaytimeDialog,
+                    onStart = {
+                        LaunchGameDialogFragment.newInstance(args.game)
+                            .show(childFragmentManager, LaunchGameDialogFragment.TAG)
+                    }
+                )
             }
         }
 
-        GameIconUtils.loadGameIcon(args.game, binding.imageGameScreen)
-        binding.title.text = args.game.title
-        binding.title.marquee()
-
-        getPlayTime()
-
-        binding.buttonStart.setOnClickListener {
-            LaunchGameDialogFragment.newInstance(args.game)
-                .show(childFragmentManager, LaunchGameDialogFragment.TAG)
-        }
-
         if (GameHelper.cachedGameList.isEmpty()) {
-            binding.buttonStart.isEnabled = false
+            startEnabled = false
             viewLifecycleOwner.lifecycleScope.launch {
                 withContext(Dispatchers.IO) {
                     GameHelper.restoreContentForGame(args.game)
@@ -131,7 +131,7 @@ class GamePropertiesFragment : Fragment() {
                     return@launch
                 }
                 addonViewModel.onAddonsViewStarted(args.game)
-                binding.buttonStart.isEnabled = true
+                startEnabled = true
             }
         }
 
@@ -145,8 +145,6 @@ class GamePropertiesFragment : Fragment() {
             viewLifecycleOwner,
             resetState = { homeViewModel.reloadPropertiesList(false) }
         ) { if (it) reloadList() }
-
-        setInsets()
     }
 
     override fun onDestroy() {
@@ -158,24 +156,23 @@ class GamePropertiesFragment : Fragment() {
     }
 
     private fun getPlayTime() {
-        binding.playtime.text = buildString {
-            val playTimeSeconds = NativeLibrary.playTimeManagerGetPlayTime(args.game.programId)
+        playTimeSeconds = NativeLibrary.playTimeManagerGetPlayTime(args.game.programId).toLong()
+    }
 
-            val hours = playTimeSeconds / 3600
-            val minutes = (playTimeSeconds % 3600) / 60
-            val seconds = playTimeSeconds % 60
-
-            val readablePlayTime = when {
-            hours > 0 -> "$hours${getString(R.string.hours_abbr)} $minutes${getString(R.string.minutes_abbr)} $seconds${getString(R.string.seconds_abbr)}"
-            minutes > 0 -> "$minutes${getString(R.string.minutes_abbr)} $seconds${getString(R.string.seconds_abbr)}"
-            else -> "$seconds${getString(R.string.seconds_abbr)}"
-}
-
-            append(getString(R.string.playtime) + " " + readablePlayTime)
-        }
-
-        binding.playtime.setOnClickListener {
-            showEditPlaytimeDialog()
+    private fun requestPinShortcut() {
+        val shortcutManager = requireActivity().getSystemService(ShortcutManager::class.java)
+        viewLifecycleOwner.lifecycleScope.launch {
+            withContext(Dispatchers.IO) {
+                val shortcut = ShortcutInfo.Builder(requireContext(), args.game.title)
+                    .setShortLabel(args.game.title)
+                    .setIcon(
+                        GameIconUtils.getShortcutIcon(requireActivity(), args.game)
+                            .toIcon(requireContext())
+                    )
+                    .setIntent(args.game.launchIntent)
+                    .build()
+                shortcutManager.requestPinShortcut(shortcut, null)
+            }
         }
     }
 
@@ -504,17 +501,7 @@ class GamePropertiesFragment : Fragment() {
                 }
             }
         }
-        binding.listProperties.apply {
-            val spanCount = resources.getInteger(R.integer.grid_columns)
-            val staggered = StaggeredGridLayoutManager(
-                spanCount,
-                StaggeredGridLayoutManager.VERTICAL
-            ).apply {
-                gapStrategy = StaggeredGridLayoutManager.GAP_HANDLING_MOVE_ITEMS_BETWEEN_SPANS
-            }
-            layoutManager = staggered
-            adapter = GamePropertiesAdapter(viewLifecycleOwner, properties)
-        }
+        this.properties = properties
     }
 
     override fun onResume() {
@@ -523,47 +510,6 @@ class GamePropertiesFragment : Fragment() {
         getPlayTime()
         reloadList()
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            val smallLayout = resources.getBoolean(R.bool.small_layout)
-            if (smallLayout) {
-                binding.listAll.updateMargins(left = leftInsets, right = rightInsets)
-            } else {
-                if (ViewCompat.getLayoutDirection(binding.root) ==
-                    ViewCompat.LAYOUT_DIRECTION_LTR
-                ) {
-                    binding.listAll.updateMargins(right = rightInsets)
-                    binding.iconLayout!!.updateMargins(top = barInsets.top, left = leftInsets)
-                } else {
-                    binding.listAll.updateMargins(left = leftInsets)
-                    binding.iconLayout!!.updateMargins(top = barInsets.top, right = rightInsets)
-                }
-            }
-
-            val fabSpacing = resources.getDimensionPixelSize(R.dimen.spacing_fab)
-            binding.buttonStart.updateMargins(
-                left = leftInsets + fabSpacing,
-                right = rightInsets + fabSpacing,
-                bottom = barInsets.bottom + fabSpacing
-            )
-
-            binding.layoutAll.updatePadding(
-                top = barInsets.top,
-                bottom = barInsets.bottom +
-                    resources.getDimensionPixelSize(R.dimen.spacing_bottom_list_fab)
-            )
-
-            windowInsets
-        }
 
     private val importSaves =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { result ->

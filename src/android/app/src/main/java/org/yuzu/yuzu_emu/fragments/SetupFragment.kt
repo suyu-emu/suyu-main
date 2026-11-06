@@ -16,22 +16,20 @@ import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.isVisible
-import androidx.core.view.updatePadding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.fragment.app.Fragment
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.SetupScreen
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.findNavController
 import androidx.preference.PreferenceManager
-import androidx.viewpager2.widget.ViewPager2.OnPageChangeCallback
 import com.google.android.material.transition.MaterialFadeThrough
 import org.yuzu.yuzu_emu.NativeLibrary
 import java.io.File
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.YuzuApplication
-import org.yuzu.yuzu_emu.adapters.SetupAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentSetupBinding
 import org.yuzu.yuzu_emu.features.settings.model.Settings
 import org.yuzu.yuzu_emu.model.ButtonState
 import org.yuzu.yuzu_emu.model.GamesViewModel
@@ -43,13 +41,17 @@ import org.yuzu.yuzu_emu.model.PageState
 import org.yuzu.yuzu_emu.ui.main.MainActivity
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
 import org.yuzu.yuzu_emu.utils.NativeConfig
-import org.yuzu.yuzu_emu.utils.ViewUtils
-import org.yuzu.yuzu_emu.utils.ViewUtils.setVisible
 import org.yuzu.yuzu_emu.utils.collect
 
 class SetupFragment : Fragment() {
-    private var _binding: FragmentSetupBinding? = null
-    private val binding get() = _binding!!
+    private var page by mutableIntStateOf(0)
+    private var revision by mutableIntStateOf(0)
+
+    private val setupCallback = object : SetupCallback {
+        override fun onStepCompleted(pageButtonId: Int, pageFullyCompleted: Boolean) {
+            revision++
+        }
+    }
 
     private val homeViewModel: HomeViewModel by activityViewModels()
     private val gamesViewModel: GamesViewModel by activityViewModels()
@@ -63,8 +65,7 @@ class SetupFragment : Fragment() {
     private lateinit var pageButtonCallback: SetupCallback
 
     companion object {
-        const val KEY_NEXT_VISIBILITY = "NextButtonVisibility"
-        const val KEY_BACK_VISIBILITY = "BackButtonVisibility"
+        const val KEY_PAGE = "SetupPage"
         const val KEY_HAS_BEEN_WARNED = "HasBeenWarned"
     }
 
@@ -77,9 +78,15 @@ class SetupFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentSetupBinding.inflate(layoutInflater)
-        return binding.root
+    ): View = suyuComposeView {
+        SetupScreen(
+            pages = pages,
+            page = page,
+            revision = revision,
+            onBack = ::pageBackward,
+            onNext = ::onNextClicked,
+            onButton = { it.buttonAction(setupCallback) }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
@@ -89,7 +96,7 @@ class SetupFragment : Fragment() {
             viewLifecycleOwner,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (binding.viewPager2.currentItem > 0) {
+                    if (page > 0) {
                         pageBackward()
                     } else {
                         requireActivity().finish()
@@ -274,105 +281,14 @@ class SetupFragment : Fragment() {
             resetState = { homeViewModel.setGamesDirSelected(false) }
         ) { if (it) checkForButtonState.invoke() }
 
-        binding.viewPager2.apply {
-            adapter = SetupAdapter(requireActivity() as AppCompatActivity, pages)
-            offscreenPageLimit = 2
-            isUserInputEnabled = false
-        }
-
-        binding.viewPager2.registerOnPageChangeCallback(object : OnPageChangeCallback() {
-            var previousPosition: Int = 0
-
-            override fun onPageSelected(position: Int) {
-                super.onPageSelected(position)
-
-                val isFirstPage = position == 0
-                val isLastPage = position == pages.size - 1
-
-                if (isFirstPage) {
-                    ViewUtils.hideView(binding.buttonBack)
-                } else {
-                    ViewUtils.showView(binding.buttonBack)
-                }
-
-                if (isLastPage) {
-                    ViewUtils.hideView(binding.buttonNext)
-                } else {
-                    ViewUtils.showView(binding.buttonNext)
-                }
-
-                previousPosition = position
-            }
-        })
-
-        binding.buttonNext.setOnClickListener {
-            val index = binding.viewPager2.currentItem
-            val currentPage = pages[index]
-
-            val warningMessages =
-                mutableListOf<Triple<Int, Int, Int>>() // title, description, helpLink
-
-            currentPage.pageButtons?.forEach { button ->
-                if (button.hasWarning || button.isUnskippable) {
-                    val buttonState = button.buttonState()
-                    if (buttonState == ButtonState.BUTTON_ACTION_COMPLETE) {
-                        return@forEach
-                    }
-
-                    if (button.isUnskippable) {
-                        MessageDialogFragment.newInstance(
-                            activity = requireActivity(),
-                            titleId = button.warningTitleId,
-                            descriptionId = button.warningDescriptionId,
-                            helpLinkId = button.warningHelpLinkId
-                        ).show(childFragmentManager, MessageDialogFragment.TAG)
-                        return@setOnClickListener
-                    }
-
-                    if (!hasBeenWarned[index]) {
-                        warningMessages.add(
-                            Triple(
-                                button.warningTitleId,
-                                button.warningDescriptionId,
-                                button.warningHelpLinkId
-                            )
-                        )
-                    }
-                }
-            }
-
-            if (warningMessages.isNotEmpty()) {
-                SetupWarningDialogFragment.newInstance(
-                    warningMessages.map { it.first }.toIntArray(),
-                    warningMessages.map { it.second }.toIntArray(),
-                    warningMessages.map { it.third }.toIntArray(),
-                    index
-                ).show(childFragmentManager, SetupWarningDialogFragment.TAG)
-                return@setOnClickListener
-            }
-            pageForward()
-        }
-        binding.buttonBack.setOnClickListener { pageBackward() }
-
 
         if (savedInstanceState != null) {
-            val nextIsVisible = savedInstanceState.getBoolean(KEY_NEXT_VISIBILITY)
-            val backIsVisible = savedInstanceState.getBoolean(KEY_BACK_VISIBILITY)
+            page = savedInstanceState.getInt(KEY_PAGE)
             hasBeenWarned = savedInstanceState.getBooleanArray(KEY_HAS_BEEN_WARNED)!!
-
-            if (nextIsVisible) {
-                binding.buttonNext.visibility = View.VISIBLE
-            }
-            if (backIsVisible) {
-                binding.buttonBack.visibility = View.VISIBLE
-            }
         } else {
             hasBeenWarned = BooleanArray(pages.size)
         }
-
-        setInsets()
     }
-
 
     override fun onStop() {
         super.onStop()
@@ -381,30 +297,59 @@ class SetupFragment : Fragment() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putBoolean(KEY_NEXT_VISIBILITY, binding.buttonNext.isVisible)
-        outState.putBoolean(KEY_BACK_VISIBILITY, binding.buttonBack.isVisible)
+        outState.putInt(KEY_PAGE, page)
         outState.putBooleanArray(KEY_HAS_BEEN_WARNED, hasBeenWarned)
     }
 
-    override fun onDestroyView() {
-        super.onDestroyView()
-        _binding = null
-    }
+    // Re-evaluates every button and page state after a step finished.
+    private val checkForButtonState: () -> Unit = { revision++ }
 
-    private val checkForButtonState: () -> Unit = {
-        val page = pages[binding.viewPager2.currentItem]
-        page.pageButtons?.forEach {
-            if (it.buttonState() == ButtonState.BUTTON_ACTION_COMPLETE) {
-                pageButtonCallback.onStepCompleted(
-                    it.titleId,
-                    pageFullyCompleted = false
-                )
-            }
+    private fun onNextClicked() {
+        val index = page
+        val currentPage = pages[index]
 
-            if (page.pageSteps() == PageState.COMPLETE) {
-                pageButtonCallback.onStepCompleted(0, pageFullyCompleted = true)
+        val warningMessages =
+            mutableListOf<Triple<Int, Int, Int>>() // title, description, helpLink
+
+        currentPage.pageButtons?.forEach { button ->
+            if (button.hasWarning || button.isUnskippable) {
+                val buttonState = button.buttonState()
+                if (buttonState == ButtonState.BUTTON_ACTION_COMPLETE) {
+                    return@forEach
+                }
+
+                if (button.isUnskippable) {
+                    MessageDialogFragment.newInstance(
+                        activity = requireActivity(),
+                        titleId = button.warningTitleId,
+                        descriptionId = button.warningDescriptionId,
+                        helpLinkId = button.warningHelpLinkId
+                    ).show(childFragmentManager, MessageDialogFragment.TAG)
+                    return
+                }
+
+                if (!hasBeenWarned[index]) {
+                    warningMessages.add(
+                        Triple(
+                            button.warningTitleId,
+                            button.warningDescriptionId,
+                            button.warningHelpLinkId
+                        )
+                    )
+                }
             }
         }
+
+        if (warningMessages.isNotEmpty()) {
+            SetupWarningDialogFragment.newInstance(
+                warningMessages.map { it.first }.toIntArray(),
+                warningMessages.map { it.second }.toIntArray(),
+                warningMessages.map { it.third }.toIntArray(),
+                index
+            ).show(childFragmentManager, SetupWarningDialogFragment.TAG)
+            return
+        }
+        pageForward()
     }
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
@@ -461,64 +406,22 @@ class SetupFragment : Fragment() {
 
         gamesViewModel.reloadGames(directoriesChanged = true, firstStartup = false)
 
-        mainActivity.finishSetup(binding.root.findNavController())
+        mainActivity.finishSetup(requireView().findNavController())
     }
 
     fun pageForward() {
-        if (_binding != null) {
-            binding.viewPager2.currentItem += 1
+        if (page < pages.size - 1) {
+            page += 1
         }
     }
 
     fun pageBackward() {
-        if (_binding != null) {
-            binding.viewPager2.currentItem -= 1
+        if (page > 0) {
+            page -= 1
         }
     }
 
     fun setPageWarned(page: Int) {
         hasBeenWarned[page] = true
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets =
-                windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets =
-                windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftPadding = barInsets.left + cutoutInsets.left
-            val topPadding = barInsets.top + cutoutInsets.top
-            val rightPadding = barInsets.right + cutoutInsets.right
-            val bottomPadding = barInsets.bottom + cutoutInsets.bottom
-
-            if (resources.getBoolean(R.bool.small_layout)) {
-                binding.viewPager2
-                    .updatePadding(
-                        left = leftPadding,
-                        top = topPadding,
-                        right = rightPadding
-                    )
-                binding.constraintButtons
-                    .updatePadding(
-                        left = leftPadding,
-                        right = rightPadding,
-                        bottom = bottomPadding
-                    )
-            } else {
-                binding.viewPager2.updatePadding(
-                    top = topPadding,
-                    bottom = bottomPadding
-                )
-                binding.constraintButtons
-                    .updatePadding(
-                        left = leftPadding,
-                        right = rightPadding,
-                        bottom = bottomPadding
-                    )
-            }
-            windowInsets
-        }
 }

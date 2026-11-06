@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Author: Ghael_V - Lemon Switch Emu - Suyu Team
 
 package org.yuzu.yuzu_emu.fragments
 
@@ -7,25 +8,23 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
+import android.widget.Toast
+import androidx.core.os.bundleOf
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
-import androidx.recyclerview.widget.GridLayoutManager
+import androidx.navigation.fragment.findNavController
 import com.google.android.material.transition.MaterialSharedAxis
+import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.AppletAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentAppletLauncherBinding
+import org.yuzu.yuzu_emu.YuzuApplication
 import org.yuzu.yuzu_emu.model.Applet
 import org.yuzu.yuzu_emu.model.AppletInfo
+import org.yuzu.yuzu_emu.model.Game
 import org.yuzu.yuzu_emu.model.HomeViewModel
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.AppletsScreen
 
 class AppletLauncherFragment : Fragment() {
-    private var _binding: FragmentAppletLauncherBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -40,18 +39,6 @@ class AppletLauncherFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        _binding = FragmentAppletLauncherBinding.inflate(inflater)
-        return binding.root
-    }
-
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-        homeViewModel.setStatusBarShadeVisibility(visible = false)
-
-        binding.toolbarApplets.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
         val applets = listOf(
             Applet(
                 R.string.album_applet,
@@ -78,33 +65,43 @@ class AppletLauncherFragment : Fragment() {
                 AppletInfo.QLaunch
             )
         )
-
-        binding.listApplets.apply {
-            layoutManager = GridLayoutManager(
-                requireContext(),
-                resources.getInteger(R.integer.grid_columns)
+        return suyuComposeView {
+            AppletsScreen(
+                applets = applets,
+                onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+                onLaunch = ::launchApplet
             )
-            adapter = AppletAdapter(requireActivity(), applets)
         }
-
-        setInsets()
     }
 
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        homeViewModel.setStatusBarShadeVisibility(visible = false)
+    }
 
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarApplets.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listApplets.updateMargins(left = leftInsets, right = rightInsets)
-
-            binding.listApplets.updatePadding(bottom = barInsets.bottom)
-
-            windowInsets
+    private fun launchApplet(applet: Applet) {
+        val appletPath = NativeLibrary.getAppletLaunchPath(applet.appletInfo.entryId)
+        if (appletPath.isEmpty()) {
+            Toast.makeText(requireContext(), R.string.applets_error_applet, Toast.LENGTH_SHORT).show()
+            return
         }
+
+        if (applet.appletInfo == AppletInfo.Cabinet) {
+            findNavController().navigate(R.id.action_appletLauncherFragment_to_cabinetLauncherDialogFragment)
+            return
+        }
+
+        NativeLibrary.setCurrentAppletId(applet.appletInfo.appletId)
+        val appletGame = Game(
+            title = YuzuApplication.appContext.getString(applet.titleId),
+            path = appletPath
+        )
+        findNavController().navigate(
+            R.id.action_global_emulationActivity,
+            bundleOf(
+                "game" to appletGame,
+                "custom" to false
+            )
+        )
+    }
 }

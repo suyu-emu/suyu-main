@@ -1174,4 +1174,36 @@
     <string name="add_folders">Añadir carpeta</string>
     <string name="percent">%1$d%%</string>
 
+
+    <!-- Biblioteca Compose -->
+    <string name="nav_library">Biblioteca</string>
+    <string name="nav_drivers">Controladores</string>
+    <string name="filter_all">Todos</string>
+    <string name="filter_favorites">Favoritos</string>
+    <string name="recently_played_hero">Jugado recientemente</string>
+    <string name="games_count">%1$d títulos</string>
+    <string name="toggle_favorite">Alternar favorito</string>
+    <string name="compat_perfect">Perfecto</string>
+    <string name="compat_great">Muy bien</string>
+    <string name="compat_playable">Jugable</string>
+    <string name="clear_search">Borrar búsqueda</string>
+    <string name="add_games_folder">Añadir carpeta de juegos</string>
+
+    <string name="settings_group_general">General</string>
+    <string name="settings_group_graphics">Gráficos</string>
+    <string name="settings_group_online">En línea y herramientas</string>
+    <string name="settings_group_data">Datos</string>
+    <string name="settings_group_support">Soporte</string>
+    <string name="settings_ready">Listo para jugar</string>
+    <string name="settings_ready_detail">Firmware %1$s · Claves verificadas</string>
+    <string name="settings_no_firmware">Sin firmware instalado</string>
+    <string name="firmware_description_short">Algunos juegos necesitan firmware para funcionar</string>
+
+    <string name="detail_properties">Propiedades</string>
+    <string name="detail_stat_fps">FPS medios</string>
+    <string name="detail_stat_played">Jugado</string>
+    <string name="detail_stat_size">Tamaño</string>
+    <string name="detail_stat_shaders">Shaders</string>
+    <string name="detail_action_import">Importar</string>
+    <string name="detail_action_export">Exportar</string>
 </resources>
