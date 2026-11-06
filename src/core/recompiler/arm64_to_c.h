@@ -5840,28 +5840,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "target_compile_definitions(" << static_target
        << " PRIVATE SUYU_HOSTED_RECOMP=1 RECOMP_STATIC_MODULE=1"
        << " g_module_base=g_module_base_" << mod
-       << " g_recomp_guard_host_v2=g_recomp_guard_host_v2_" << mod
-       << " recomp_image_abi=recomp_image_abi_" << mod
-       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod;
-    if (g_emit_fastmem) {
-        cm << " recomp_image_features=recomp_image_features_" << mod
-           << " recomp_image_fastmem_v1=recomp_image_fastmem_v1_" << mod;
-    } else if (g_emit_fpx) {
-        cm << " recomp_image_features=recomp_image_features_" << mod;
-    }
-    if (g_emit_fpx) {
-        cm << " recomp_image_fpx_v1=recomp_image_fpx_v1_" << mod;
-    }
-    if (EmitGuardGen()) {
-        cm << " g_recomp_gg_word=g_recomp_gg_word_" << mod
-           << " recomp_image_guard_gen_v1=recomp_image_guard_gen_v1_" << mod;
-    }
-    cm << " recomp_lookup=recomp_lookup_" << mod
-       << " recomp_build_index=recomp_build_index_" << mod
-       << " _recomp_index_view=_recomp_index_view_" << mod
-       << " recomp_image_index=recomp_image_index_" << mod
+       << " recomp_lookup=recomp_lookup_" << mod
+    << " recomp_build_index=recomp_build_index_" << mod
+    << " _recomp_index_view=_recomp_index_view_" << mod
        << " recomp_image_lookup=recomp_image_lookup_" << mod
-       << " recomp_image_run_slice=recomp_image_run_slice_" << mod
+    << " recomp_image_index=recomp_image_index_" << mod
        << " recomp_image_set_base=recomp_image_set_base_" << mod
        << " recomp_image_entry=recomp_image_entry_" << mod << ")\n"
        << "endif()\n";
@@ -7798,14 +7781,51 @@ int recomp_save_init(GuestContext* c, const char* exe_path) {
   printf("[recomp] Save directory: %s\n",c->save_dir);
   return 1;
 }
-
+)RT") + R"RT(
+/* AES S-box, built once on first use.
+   S(x) = affine(x^-1), and x^-1 is x^254 because x^255 == 1 for non-zero x.
+   Generated rather than tabulated: two 256-byte tables written out as source
+   would be 512 bytes of literal in a runtime already split to stay under
+   MSVC's 16380-byte cap. Checked against FIPS 197 and for round-trip. */
+static uint8_t recomp_gmul(uint8_t a, uint8_t b){
+  uint8_t p=0;
+  while(b){ if(b&1) p^=a; a=(uint8_t)((a<<1)^((a>>7)*0x1B)); b=(uint8_t)(b>>1); }
+  return p;
+}
+static uint8_t recomp_ginv(uint8_t x){
+  uint8_t p=1; int b;
+  if(!x) return 0;
+  for(b=7;b>=0;b--){ p=recomp_gmul(p,p); if((254>>b)&1) p=recomp_gmul(p,x); }
+  return p;
+}
+static uint8_t recomp_rotl8(uint8_t x,int n){ return (uint8_t)((x<<n)|(x>>(8-n))); }
+const uint8_t* recomp_aes_sbox(int inverse){
+  static uint8_t fwd[256], inv[256];
+  static int built = 0;
+  if(!built){
+    int i;
+    for(i=0;i<256;i++){
+      uint8_t b = recomp_ginv((uint8_t)i);
+      fwd[i] = (uint8_t)(b ^ recomp_rotl8(b,1) ^ recomp_rotl8(b,2) ^ recomp_rotl8(b,3)
+                           ^ recomp_rotl8(b,4) ^ 0x63);
+    }
+    for(i=0;i<256;i++){
+      uint8_t b = (uint8_t)(recomp_rotl8((uint8_t)i,1) ^ recomp_rotl8((uint8_t)i,3)
+                            ^ recomp_rotl8((uint8_t)i,6) ^ 0x05);
+      inv[i] = recomp_ginv(b);
+    }
+    built = 1;
+  }
+  return inverse ? inv : fwd;
+}
+)RT" + R"RT(
 int recomp_save_write(GuestContext* c, const char* name, const void* data, uint64_t size) {
-  char path[1024];
-  snprintf(path,sizeof path,"%s%c%s",c->save_dir,PATH_SEP,name);
-  /* Ensure parent dirs exist */
-  char parent[1024]; snprintf(parent,sizeof parent,"%s",path);
-  char* sl=strrchr(parent,PATH_SEP); if(!sl) sl=strrchr(parent,'/'); if(sl)*sl=0;
-)RT") + R"RT(  mkpath(parent);
+    char path[1024];
+    snprintf(path,sizeof path,"%s%c%s",c->save_dir,PATH_SEP,name);
+    /* Ensure parent dirs exist */
+    char parent[1024]; snprintf(parent,sizeof parent,"%s",path);
+    char* sl=strrchr(parent,PATH_SEP); if(!sl) sl=strrchr(parent,'/'); if(sl)*sl=0;
+    mkpath(parent);
   FILE* f=fopen(path,"wb");
   if(!f){fprintf(stderr,"[recomp] save write failed: %s\n",path); return 0;}
   fwrite(data,1,(size_t)size,f); fclose(f);

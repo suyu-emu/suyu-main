@@ -3894,6 +3894,18 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
                         .arg(module_results.size()));
         lifted_code_bytes += mod.text_bytes.size();
         const QString mod_dir = recomp_root + QDir::separator() + mod.name;
+        // A failed export can leave the raw NSO at exefs/<module>. Move it
+        // aside before creating the generated module directory, otherwise
+        // CMake reports that the source path is a file.
+        if (QFileInfo(mod_dir).isFile()) {
+            const QString raw_path = nso_raw_dir + QDir::separator() + mod.name;
+            QFile::remove(raw_path);
+            if (!QFile::rename(mod_dir, raw_path)) {
+                LOG_ERROR(Frontend, "Could not move raw NSO out of module path {}",
+                          mod_dir.toStdString());
+                return {};
+            }
+        }
         QDir().mkpath(mod_dir);
         if (fallback_enabled && RequestedJitModules().contains(mod.name)) {
             QFile stub(mod_dir + QDir::separator() + QStringLiteral("CMakeLists.txt"));
