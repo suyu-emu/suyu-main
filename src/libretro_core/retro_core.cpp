@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <charconv>
 #include <chrono>
+#include <stop_token>
 #include <cmath>
 #include <fstream>
 #include <memory>
@@ -76,6 +77,7 @@
 #include "libretro_core/retro_emu_window.h"
 #include "suyu_cmd/explicit_update.h"
 #include "video_core/gpu.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_external.h"
@@ -1479,6 +1481,13 @@ bool StartLoadedGame() {
     }
     auto& gpu = g_system->GPU();
     gpu.ObtainContext();
+    // Builds the pipelines earlier sessions saved before the game runs, and saves the ones
+    // this session builds, so a shader is only compiled during play the first time
+    if (Settings::values.use_disk_shader_cache.GetValue()) {
+        g_system->Renderer().ReadRasterizer()->LoadDiskResources(
+            g_system->GetApplicationProcessProgramID(), std::stop_token{},
+            [](VideoCore::LoadCallbackStage, std::size_t, std::size_t) {});
+    }
     gpu.ReleaseContext();
     gpu.Start();
     g_system->GetCpuManager().OnGpuReady();
