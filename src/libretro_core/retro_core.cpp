@@ -1097,7 +1097,8 @@ RETRO_API void retro_run() {
     if (g_video_cb && g_system && g_game_loaded) {
         auto& renderer = g_system->Renderer();
         if (renderer.IsHeadless()) {
-            // Read before the upload: a frame composited during it is shown next call.
+            // A frame read back while this is held waits, and is shown on the next call
+            const auto frame_lock = renderer.LockLastRenderedFrame();
             const u64 displayed = g_emu_window ? g_emu_window->FramesDisplayed() : 0;
             ++g_perf_frontend_frames;
             if (g_can_dupe && g_have_presented && displayed == g_presented_frame) {

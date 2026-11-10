@@ -18,6 +18,7 @@
 #include <ranges>
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
@@ -181,6 +182,10 @@ try
     , rasterizer(render_window, gpu, device_memory, device, memory_allocator, state_tracker, scheduler) {
 
     is_headless = (render_window.GetWindowInfo().type == Core::Frontend::WindowSystemType::Headless);
+    if (is_headless && !External::IsActive()) {
+        headless_readback_thread = std::jthread(
+            [this](std::stop_token stop_token) { HeadlessReadbackLoop(stop_token); });
+    }
 
     if (External::IsActive()) {
         auto& external = External::GetContext();
@@ -206,43 +211,17 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (is_headless) {
+        RenderAppletCaptureLayer(framebuffers);
+        CompositeHeadless(framebuffers);
+        return;
+    }
+
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
 
     RenderAppletCaptureLayer(framebuffers);
-
-    if (is_headless) {
-        static unsigned headless_composite_count = 0;
-        ++headless_composite_count;
-        if (headless_composite_count <= 5 || (headless_composite_count % 60) == 0) {
-            LOG_INFO(Render_Vulkan, "Headless Composite #{}, {} framebuffer layers",
-                     headless_composite_count, framebuffers.size());
-            fprintf(stderr, "[suyu-vulkan] Headless Composite #%u, %zu layers\n",
-                    headless_composite_count, framebuffers.size());
-            fflush(stderr);
-        }
-
-        RenderScreenshot(framebuffers);
-
-        if (External::IsActive()) {
-            PresentExternal(framebuffers);
-        } else if (!framebuffers.empty()) {
-            const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
-            headless_width = layout.width;
-            headless_height = layout.height;
-            const VkDeviceSize buffer_size = headless_width * headless_height * 4;
-
-            auto dst_buffer = RenderToBuffer(framebuffers, layout,
-                                             VK_FORMAT_B8G8R8A8_UNORM, buffer_size);
-            headless_frame_data.resize(buffer_size);
-            std::memcpy(headless_frame_data.data(), dst_buffer.Mapped().data(), buffer_size);
-        }
-
-        gpu.RendererFrameEndNotify();
-        rasterizer.TickFrame();
-        return;
-    }
 
     if (!render_window.IsShown()) {
         return;
@@ -261,6 +240,96 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();
+}
+
+void RendererVulkan::CompositeHeadless(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    static unsigned headless_composite_count = 0;
+    ++headless_composite_count;
+    if (headless_composite_count <= 5 || (headless_composite_count % 60) == 0) {
+        LOG_INFO(Render_Vulkan, "Headless Composite #{}, {} framebuffer layers",
+                 headless_composite_count, framebuffers.size());
+        fprintf(stderr, "[suyu-vulkan] Headless Composite #%u, %zu layers\n",
+                headless_composite_count, framebuffers.size());
+        fflush(stderr);
+    }
+
+    RenderScreenshot(framebuffers);
+
+    if (External::IsActive()) {
+        PresentExternal(framebuffers);
+        render_window.OnFrameDisplayed();
+    } else if (!framebuffers.empty()) {
+        const Layout::FramebufferLayout layout{render_window.GetFramebufferLayout()};
+        HeadlessSlot& slot = headless_slots[headless_slot_index];
+        {
+            std::unique_lock lock{headless_slot_mutex};
+            headless_slot_cv.wait(lock, [&slot] { return !slot.busy; });
+        }
+
+        const VkDeviceSize buffer_size = VkDeviceSize{layout.width} * layout.height * 4;
+        if (slot.buffer_size != buffer_size) {
+            slot.buffer = CreateWrappedBuffer(memory_allocator, buffer_size, MemoryUsage::Download);
+            slot.buffer_size = buffer_size;
+        }
+
+        // Drawing to a frame of a new size recreates it and waits for the device to go idle, so
+        // each slot keeps its frame instead of drawing to a new one every time
+        blit_swapchain.DrawToFrame(device, rasterizer, &slot.frame, framebuffers, layout,
+                                   NUM_HEADLESS_SLOTS, VK_FORMAT_B8G8R8A8_UNORM);
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([image = *slot.frame.image, buffer = *slot.buffer,
+                          extent = VkExtent3D{layout.width, layout.height, 1}](
+                             vk::CommandBuffer cmdbuf) {
+            DownloadColorImage(cmdbuf, image, buffer, extent);
+        });
+        slot.width = layout.width;
+        slot.height = layout.height;
+        slot.tick = scheduler.Flush();
+        {
+            std::scoped_lock lock{headless_slot_mutex};
+            slot.busy = true;
+            headless_readback_queue.push_back(headless_slot_index);
+        }
+        headless_slot_cv.notify_all();
+        headless_slot_index = (headless_slot_index + 1) % NUM_HEADLESS_SLOTS;
+    }
+
+    gpu.RendererFrameEndNotify();
+    rasterizer.TickFrame();
+}
+
+void RendererVulkan::HeadlessReadbackLoop(std::stop_token stop_token) {
+    Common::SetCurrentThreadName("VulkanReadback");
+    while (true) {
+        size_t index{};
+        {
+            std::unique_lock lock{headless_slot_mutex};
+            if (!headless_slot_cv.wait(lock, stop_token,
+                                       [this] { return !headless_readback_queue.empty(); })) {
+                return;
+            }
+            index = headless_readback_queue.front();
+            headless_readback_queue.pop_front();
+        }
+
+        HeadlessSlot& slot = headless_slots[index];
+        scheduler.GetMasterSemaphore().Wait(slot.tick);
+        slot.buffer.Invalidate();
+        {
+            std::scoped_lock lock{headless_frame_mutex};
+            const auto mapped = slot.buffer.Mapped();
+            headless_frame_data.assign(mapped.begin(), mapped.begin() + slot.buffer_size);
+            headless_width = slot.width;
+            headless_height = slot.height;
+            render_window.OnFrameDisplayed();
+        }
+
+        {
+            std::scoped_lock lock{headless_slot_mutex};
+            slot.busy = false;
+        }
+        headless_slot_cv.notify_all();
+    }
 }
 
 void RendererVulkan::Report() const {
