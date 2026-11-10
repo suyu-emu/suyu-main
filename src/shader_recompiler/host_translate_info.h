@@ -38,6 +38,8 @@ struct HostTranslateInfo {
                                                 ///< passthrough shaders
     bool support_conditional_barrier{}; ///< True when the device supports barriers in conditional
                                         ///< control flow
+    bool support_attribute_texture_handle{}; ///< True when the host binds texture handles that
+                                             ///< arrive as vertex attributes
 
     void ApplyDescriptorLimitPolicy() noexcept {
         if (min_ssbo_alignment == 0) {
