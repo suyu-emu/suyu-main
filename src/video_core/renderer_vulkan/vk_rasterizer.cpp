@@ -252,6 +252,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
+    attribute_handle_pipeline = nullptr;
+    attribute_handle_runs.clear();
+    if (split_attribute_handles && pipeline->UsesAttributeHandle()) {
+        CollectAttributeHandleRuns(is_indexed);
+        if (!attribute_handle_runs.empty()) {
+            attribute_handle_pipeline = pipeline;
+            pipeline->SetAttributeHandle(attribute_handle_runs.front().handle);
+        }
+    }
     {
         StallProbe::Accum probe{StallProbe::pipeline_configure_ns};
         if (!pipeline->Configure(is_indexed))
@@ -267,6 +276,66 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable);
         draw_func();
+    }
+}
+
+void RasterizerVulkan::CollectAttributeHandleRuns(bool is_indexed) {
+    using VertexAttribute = Maxwell::VertexAttribute;
+    const auto& regs = maxwell3d->regs;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const u32 total = is_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+    if (total == 0) {
+        return;
+    }
+    // The handle is an integer attribute; sprite batches repeat it on every vertex of a quad.
+    const VertexAttribute* source{};
+    for (const auto& attr : regs.vertex_attrib_format) {
+        if (attr.constant || attr.size == VertexAttribute::Size::Invalid) {
+            continue;
+        }
+        if (attr.type == VertexAttribute::Type::UInt || attr.type == VertexAttribute::Type::SInt) {
+            source = &attr;
+            break;
+        }
+    }
+    const auto& stream = regs.vertex_streams[source ? source->buffer.Value() : 0];
+    if (!source || !stream.IsEnabled()) {
+        attribute_handle_runs.push_back({0, total, 0});
+        return;
+    }
+    // Only plain triangle lists are split; anything else keeps the handle of its first vertex.
+    const u32 primitive_size =
+        draw_state.topology == Maxwell::PrimitiveTopology::Triangles ? 3 : total;
+    const GPUVAddr base_address = stream.Address() + source->offset;
+    const auto read_handle = [&](u32 position) {
+        u32 vertex;
+        if (is_indexed) {
+            const auto& index_buffer = draw_state.index_buffer;
+            const GPUVAddr address =
+                index_buffer.IndexStart() + size_t{position} * index_buffer.FormatSizeInBytes();
+            u32 index{};
+            gpu_memory->ReadBlockUnsafe(address, &index, index_buffer.FormatSizeInBytes());
+            vertex = static_cast<u32>(draw_state.base_index + index);
+        } else {
+            vertex = draw_state.vertex_buffer.first + position;
+        }
+        return gpu_memory->Read<u32>(base_address + static_cast<GPUVAddr>(vertex) * stream.stride);
+    };
+    for (u32 position = 0; position + primitive_size <= total; position += primitive_size) {
+        const u32 handle = read_handle(position);
+        if (!attribute_handle_runs.empty() && attribute_handle_runs.back().handle == handle) {
+            attribute_handle_runs.back().count += primitive_size;
+        } else {
+            attribute_handle_runs.push_back({position, primitive_size, handle});
+        }
+    }
+    if (attribute_handle_runs.empty()) {
+        attribute_handle_runs.push_back({0, total, read_handle(0)});
+    } else {
+        const u32 covered = attribute_handle_runs.back().first + attribute_handle_runs.back().count;
+        if (covered < total) {
+            attribute_handle_runs.back().count += total - covered;
+        }
     }
 }
 
@@ -310,21 +379,49 @@ void RasterizerVulkan::EmulateIndirectArgsInit(bool is_indexed) {
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     StallProbe::Accum probe{StallProbe::draw_ns, &StallProbe::draw_count};
     EmulateIndirectArgsInit(is_indexed);
+    split_attribute_handles = true;
+    SCOPE_EXIT {
+        split_attribute_handles = false;
+    };
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
-        scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
-            if (draw_params.is_indexed) {
-                cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
-                                   draw_params.first_index, draw_params.base_vertex,
-                                   draw_params.base_instance);
-            } else {
-                cmdbuf.Draw(draw_params.num_vertices, draw_params.num_instances,
-                            draw_params.base_vertex, draw_params.base_instance);
+        const auto record_draw = [this](const DrawParams& params) {
+            scheduler.Record([params](vk::CommandBuffer cmdbuf) {
+                if (params.is_indexed) {
+                    cmdbuf.DrawIndexed(params.num_vertices, params.num_instances,
+                                       params.first_index, params.base_vertex,
+                                       params.base_instance);
+                } else {
+                    cmdbuf.Draw(params.num_vertices, params.num_instances, params.base_vertex,
+                                params.base_instance);
+                }
+            });
+        };
+        if (attribute_handle_pipeline && attribute_handle_runs.size() > 1) {
+            // The first run is already configured, each further one binds its own texture.
+            for (size_t i = 0; i < attribute_handle_runs.size(); ++i) {
+                const AttributeHandleRun& run = attribute_handle_runs[i];
+                if (i != 0) {
+                    attribute_handle_pipeline->SetAttributeHandle(run.handle);
+                    if (!attribute_handle_pipeline->Configure(is_indexed)) {
+                        continue;
+                    }
+                }
+                DrawParams run_params = draw_params;
+                run_params.num_vertices = run.count;
+                if (is_indexed) {
+                    run_params.first_index += run.first;
+                } else {
+                    run_params.base_vertex += run.first;
+                }
+                record_draw(run_params);
             }
-        });
+        } else {
+            record_draw(draw_params);
+        }
 
         // Log draw call
         if (GPU::Logging::IsActive() &&
