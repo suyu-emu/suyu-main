@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <string_view>
@@ -18,57 +19,6 @@ class System;
 
 namespace AudioCore::Sink {
 
-/**
- * Sample queue shared between the emulated audio renderer (producer, running
- * on suyu's audio thread) and the libretro frontend (consumer, draining once
- * per retro_run on RetroArch's thread).
- *
- * A plain locked deque rather than a lock-free ring: the producer appends in
- * large infrequent chunks and the consumer drains everything at 60Hz, so
- * contention is negligible and the simplicity is worth more than the
- * micro-optimisation.
- */
-class LibretroSampleQueue {
-public:
-    /// Defined in libretro_sink.cpp, not here: a header-inline static would
-    /// give the producer and consumer separate copies of the queue.
-    static LibretroSampleQueue& Instance();
-
-    void Push(std::span<const s16> samples) {
-        std::scoped_lock lock{mutex};
-        // Hard cap the backlog, and keep it short. The renderer hands us audio
-        // in bursts rather than a steady stream (nothing paces it here the way
-        // a real device would), so a large cap just turns into seconds of
-        // latency delivered as one lump, which the frontend then drops. A
-        // quarter second is enough to ride out the bursts while keeping audio
-        // in step with video; anything older than that is stale and is dropped
-        // oldest-first.
-        constexpr size_t kMaxQueuedSamples = 48000 / 4 * 2; // 0.25s stereo
-        if (queue.size() + samples.size() > kMaxQueuedSamples) {
-            const size_t overflow = queue.size() + samples.size() - kMaxQueuedSamples;
-            const size_t to_drop = std::min(overflow, queue.size());
-            queue.erase(queue.begin(), queue.begin() + static_cast<ptrdiff_t>(to_drop));
-        }
-        queue.insert(queue.end(), samples.begin(), samples.end());
-    }
-
-    /// Moves every queued sample into @p out, leaving the queue empty.
-    void Drain(std::vector<s16>& out) {
-        std::scoped_lock lock{mutex};
-        out.assign(queue.begin(), queue.end());
-        queue.clear();
-    }
-
-    void Clear() {
-        std::scoped_lock lock{mutex};
-        queue.clear();
-    }
-
-private:
-    std::mutex mutex;
-    std::vector<s16> queue;
-};
-
 class LibretroSinkStreamImpl final : public SinkStream {
 public:
     explicit LibretroSinkStreamImpl(Core::System& system_, StreamType type_, bool is_primary_,
@@ -79,24 +29,26 @@ public:
     }
     ~LibretroSinkStreamImpl() override = default;
 
-    void AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) override {
-        // An audio out stream (a movie's sound, say) is queued as on a device,
-        // and played by LibretroSink::MixOut at the frontend's pace: the audio
-        // out service releases a game's buffers by the samples played, and
-        // dropped here they were never released, so the game waited on them
-        // and its movie stopped after a few frames.
-        if (type == StreamType::Out) {
-            SinkStream::AppendBuffer(buffer, samples);
-            return;
+    void Start(bool resume = false) override {
+        if (!detached) {
+            paused = false;
         }
-        // Only the primary stream feeds the frontend. The renderer acquires
-        // more than one output stream and they all carry the same mix, so
-        // pushing every one produced audio at a multiple of real time, which
-        // overran the queue and made it dump ~2s at once. Note the streams
-        // arrive as StreamType::Render, not Out - filtering on Out matched
-        // nothing at all, which is why the core was previously silent.
-        if (is_primary && type != StreamType::In) {
-            LibretroSampleQueue::Instance().Push(samples);
+    }
+
+    void Stop() override {
+        SignalPause();
+    }
+
+    void AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) override {
+        // An audio out stream (a movie's sound, say) and the renderer's primary
+        // stream are queued as on a device, and played by LibretroSink::MixOut
+        // at the frontend's pace. Playing a buffer releases it, which is what
+        // paces the game: the audio out service releases its buffers by the
+        // samples played, and the renderer only runs a few buffers ahead of what
+        // has been played. The renderer's other streams carry the same mix and
+        // are dropped.
+        if (type == StreamType::Out || is_primary) {
+            SinkStream::AppendBuffer(buffer, samples);
         }
     }
 
@@ -108,8 +60,19 @@ public:
         return type;
     }
 
+    bool IsPrimary() const {
+        return is_primary;
+    }
+
+    /// Stops the renderer waiting for this stream to be played, for good.
+    void Detach() {
+        detached = true;
+        SignalPause();
+    }
+
 private:
     bool is_primary{false};
+    std::atomic<bool> detached{false};
 };
 
 /**
@@ -129,19 +92,17 @@ public:
     SinkStream* AcquireSinkStream(Core::System& system, u32 stream_channels, const std::string&,
                                   StreamType type) override {
         std::scoped_lock lock{InstanceMutex()};
-        // The audio core makes an output and an input sink from the same
-        // setting; MixOut plays the audio out streams of the one that has them.
-        // Taking whichever was made last pointed it at the input sink, so a
-        // game's audio out was never played or released and a movie stopped
-        // after its first frames.
-        if (type == StreamType::Out) {
-            Instance() = this;
-        }
-        // The renderer's first stream feeds LibretroSampleQueue; audio out
-        // streams are played by MixOut
         const bool primary = (type == StreamType::Render) && !has_primary;
         if (primary) {
             has_primary = true;
+        }
+        // The audio core makes an output and an input sink from the same
+        // setting; MixOut plays the streams of the one that has them. Taking
+        // whichever was made last pointed it at the input sink, so a game's
+        // audio out was never played or released and a movie stopped after its
+        // first frames.
+        if (type == StreamType::Out || primary) {
+            Instance() = this;
         }
         auto stream =
             std::make_unique<LibretroSinkStreamImpl>(system, type, primary, stream_channels);
@@ -164,8 +125,9 @@ public:
         has_primary = false;
     }
 
-    /// From the frontend's thread: @p frames stereo frames of every audio out
-    /// stream played and added into @p out. False when there is none.
+    /// From the frontend's thread: @p frames stereo frames of the renderer's
+    /// output and every audio out stream played and added into @p out, as a
+    /// host device's callback would. False when there is none.
     static bool MixOut(std::span<s16> out, std::size_t frames) {
         std::scoped_lock lock{InstanceMutex()};
         LibretroSink* sink = Instance();
@@ -175,7 +137,8 @@ public:
         bool any = false;
         std::vector<s16> played(frames * 2);
         for (const auto& stream : sink->streams) {
-            if (static_cast<const LibretroSinkStreamImpl*>(stream.get())->Type() != StreamType::Out) {
+            const auto* libretro_stream = static_cast<const LibretroSinkStreamImpl*>(stream.get());
+            if (libretro_stream->Type() != StreamType::Out && !libretro_stream->IsPrimary()) {
                 continue;
             }
             stream->ProcessAudioOutAndRender(played, frames);
@@ -185,6 +148,17 @@ public:
             any = true;
         }
         return any;
+    }
+
+    /// For when MixOut won't be called again, so the emulated system can still
+    /// shut down: the renderer would otherwise wait for its buffers forever.
+    static void Detach() {
+        std::scoped_lock lock{InstanceMutex()};
+        if (LibretroSink* sink = Instance()) {
+            for (const auto& stream : sink->streams) {
+                static_cast<LibretroSinkStreamImpl*>(stream.get())->Detach();
+            }
+        }
     }
 
     f32 GetDeviceVolume() const override {
@@ -198,7 +172,8 @@ public:
     }
 
 private:
-    /// Defined in libretro_sink.cpp, like LibretroSampleQueue::Instance
+    /// Defined in libretro_sink.cpp: a header-inline static would give the
+    /// audio core and the frontend separate copies.
     static LibretroSink*& Instance();
     static std::mutex& InstanceMutex();
 

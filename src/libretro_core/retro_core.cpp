@@ -873,14 +873,9 @@ void PresentVulkanFrame() {
 
 namespace {
 
-// Drains whatever the emulated audio renderer produced since the last call
-// and hands it to the frontend. upload_batch takes frames (L+R pairs), not
-// individual samples. Feed the frontend a steady ~1 frame of audio per call
-// rather than whatever has piled up: RetroArch resamples against its own
-// clock and expects roughly sample_rate/fps frames each call, and handing it
-// a quarter second in one lump and nothing for the next 15 calls is what made
-// the output screech. Anything beyond a small backlog is dropped so latency
-// can't creep up instead.
+// Hands the frontend one frame of the emulated console's audio, taken the way
+// a host device's callback takes it, which is also what paces the emulated
+// audio renderer. upload_batch takes frames (L+R pairs), not samples.
 //
 // Called either from retro_run() (frontends too old to support
 // RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK) or from FrontendAudioCallback()
@@ -891,27 +886,9 @@ void DeliverPendingAudio() {
     }
 
     constexpr size_t kFramesPerCall = 48000 / 60; // stereo frames
-    constexpr size_t kMaxBacklogFrames = kFramesPerCall * 6;
-
-    static std::vector<s16> pending; // interleaved L,R awaiting delivery
-    std::vector<s16> drained;
-    AudioCore::Sink::LibretroSampleQueue::Instance().Drain(drained);
-    if (!drained.empty()) {
-        pending.insert(pending.end(), drained.begin(), drained.end());
-    }
-
-    // Trim from the front if we've fallen behind; stale audio is worse than a
-    // short gap.
-    if (pending.size() > kMaxBacklogFrames * 2) {
-        const size_t excess = pending.size() - kMaxBacklogFrames * 2;
-        pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(excess));
-    }
-
-    const size_t frames = std::min(kFramesPerCall, pending.size() / 2);
-    if (frames > 0) {
-        g_audio_batch_cb(pending.data(), frames);
-        pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(frames * 2));
-    }
+    std::array<s16, kFramesPerCall * 2> samples{};
+    AudioCore::Sink::LibretroSink::MixOut(samples, kFramesPerCall);
+    g_audio_batch_cb(samples.data(), kFramesPerCall);
 }
 
 // Called by the frontend's own audio thread once RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK
@@ -1554,6 +1531,7 @@ RETRO_API void retro_unload_game() {
     if (g_system && g_game_loaded) {
         g_output_scale = 1;
         g_geometry_dirty = false;
+        AudioCore::Sink::LibretroSink::Detach();
         g_system->ShutdownMainProcess();
     }
     if (g_emu_window) {
@@ -1586,9 +1564,6 @@ RETRO_API void retro_unload_game() {
             member->Leave();
         }
     }
-    // Drop any audio still queued from the game that just went away, so it
-    // can't leak into the next one loaded in this session.
-    AudioCore::Sink::LibretroSampleQueue::Instance().Clear();
 }
 
 RETRO_API unsigned retro_get_region() {
