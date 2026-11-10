@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/common_funcs.h"
@@ -52,6 +53,10 @@ public:
     virtual const std::vector<u8>& GetLastRenderedFrame() const {
         static const std::vector<u8> empty;
         return empty;
+    }
+    /// Keeps the frame GetLastRenderedFrame() returns, and its size, from changing while held
+    [[nodiscard]] virtual std::unique_lock<std::mutex> LockLastRenderedFrame() {
+        return {};
     }
     virtual u32 GetHeadlessWidth() const { return 0; }
     virtual u32 GetHeadlessHeight() const { return 0; }
