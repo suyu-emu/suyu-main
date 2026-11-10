@@ -154,6 +154,11 @@ retro_input_state_t g_input_state_cb;
 
 constexpr unsigned kFrameWidth = 1280;
 constexpr unsigned kFrameHeight = 720;
+constexpr unsigned kDockedFrameWidth = 1920;
+constexpr unsigned kDockedFrameHeight = 1080;
+// What the console sends its screen, or the TV when docked, before the output scale
+unsigned g_base_width = kFrameWidth;
+unsigned g_base_height = kFrameHeight;
 
 // System::Initialize() may decrypt firmware metadata. Make the frontend's
 // existing keys visible before that call, not after it has already tried to
@@ -558,13 +563,13 @@ RETRO_API void retro_get_system_info(struct retro_system_info* info) {
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info) {
-    info->geometry.base_width = kFrameWidth;
-    info->geometry.base_height = kFrameHeight;
+    info->geometry.base_width = g_base_width;
+    info->geometry.base_height = g_base_height;
     // Allow up to 4x so raising the internal resolution option doesn't get
     // clamped back down to 720p by the frontend. RetroArch sizes its texture
     // from max_*, and a core may deliver anything up to it.
-    info->geometry.max_width = kFrameWidth * 4;
-    info->geometry.max_height = kFrameHeight * 4;
+    info->geometry.max_width = kDockedFrameWidth * 4;
+    info->geometry.max_height = kDockedFrameHeight * 4;
     info->geometry.aspect_ratio = static_cast<float>(kFrameWidth) / static_cast<float>(kFrameHeight);
     info->timing.fps = 60.0;
     info->timing.sample_rate = 48000.0;
@@ -1013,10 +1018,10 @@ RETRO_API void retro_run() {
         }
     if (g_geometry_dirty && g_environ_cb) {
         retro_game_geometry geom{};
-        geom.base_width = kFrameWidth * g_output_scale;
-        geom.base_height = kFrameHeight * g_output_scale;
-        geom.max_width = kFrameWidth * 4;
-        geom.max_height = kFrameHeight * 4;
+        geom.base_width = g_base_width * g_output_scale;
+        geom.base_height = g_base_height * g_output_scale;
+        geom.max_width = kDockedFrameWidth * 4;
+        geom.max_height = kDockedFrameHeight * 4;
         geom.aspect_ratio = (float)kFrameWidth / (float)kFrameHeight;
         g_environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
         g_geometry_dirty = false;
@@ -1128,9 +1133,11 @@ RETRO_API void retro_run() {
             LOG_WARNING(Frontend, "libretro: frame {} - no rendered frame available, sending black",
                         frame_counter);
         }
-        static const std::vector<u32> black_frame(
-            static_cast<size_t>(kFrameWidth) * kFrameHeight, 0xFF000000);
-        g_video_cb(black_frame.data(), kFrameWidth, kFrameHeight, kFrameWidth * sizeof(u32));
+        const unsigned width = g_base_width * g_output_scale;
+        const unsigned height = g_base_height * g_output_scale;
+        static std::vector<u32> black_frame;
+        black_frame.resize(static_cast<size_t>(width) * height, 0xFF000000);
+        g_video_cb(black_frame.data(), width, height, width * sizeof(u32));
     }
 }
 
@@ -1275,6 +1282,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                 std::string(var.value) == "Yes" ? Settings::ConsoleMode::Docked
                                                 : Settings::ConsoleMode::Handheld);
         }
+        const bool docked =
+            Settings::values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked;
+        g_base_width = docked ? kDockedFrameWidth : kFrameWidth;
+        g_base_height = docked ? kDockedFrameHeight : kFrameHeight;
         var.key = "suyu_cpu_accuracy";
         var.value = nullptr;
         if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
@@ -1344,7 +1355,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         }
         g_system->ApplySettings();
 
-        g_emu_window->UpdateCurrentFramebufferLayout(kFrameWidth * g_output_scale, kFrameHeight * g_output_scale);
+        g_emu_window->UpdateCurrentFramebufferLayout(g_base_width * g_output_scale,
+                                                     g_base_height * g_output_scale);
 
         // Join a suyu room if the user configured one. Done here rather than
         // in retro_init so the options the frontend collected are already
