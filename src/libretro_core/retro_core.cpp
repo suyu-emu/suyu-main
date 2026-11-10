@@ -1011,6 +1011,7 @@ RETRO_API void retro_run() {
             g_perf_frontend_frames = 0;
             g_perf_unique_frames = 0;
         }
+    }
     if (g_geometry_dirty && g_environ_cb) {
         retro_game_geometry geom{};
         geom.base_width = kFrameWidth * g_output_scale;
