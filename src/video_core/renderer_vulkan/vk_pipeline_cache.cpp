@@ -431,11 +431,17 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
 
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,
+        // Adreno too: on a coordinate right at a texel centre it picks the other 2x2 block than
+        // Maxwell does. TOTK rebuilds positions from depth with gathers, and the one-texel shift
+        // made sloped ground shadow itself: 64x64 dark squares in sunlit areas (found for Turnip
+        // in Ryujinx Neo, docs/TOTK-turnip-gather-bias.md).
         .need_gather_subpixel_offset = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                        driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
                                        driver_id == VK_DRIVER_ID_MESA_RADV ||
                                        driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
-                                       driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA,
+                                       driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
+                                       driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
+                                       driver_id == VK_DRIVER_ID_MESA_TURNIP,
 
         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
         .has_broken_spirv_position_input = driver_id == false,
