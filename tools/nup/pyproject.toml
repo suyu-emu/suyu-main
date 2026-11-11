@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nup"
+dynamic = ["version"]
+description = "Reference implementation of the NUP (NX Package) container format for Switch 1/2 game dumps"
+requires-python = ">=3.10"
+#readme = {file = "../../README.md", content-type = "text/markdown"}
+license = "MIT"
+license-files = ["../../LICENSE"]
+dependencies = ["zstandard>=0.22"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nup.__init__.__version__"}
+
+[project.urls]
+"Source" = "https://github.com/a55uka/nup"
+"Bug Tracker" = "https://github.com/a55uka/nup/issues"
+
+[project.scripts]
+nup = "nup.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nup*"]
+
+[project.optional-dependencies]
+tools = [
+    "mypy>=2.4.1",
+]
+
+[tool.setuptools.package-data]
+nup = ["py.typed"]
+
+[tool.mypy]
+files = [
+    "nup/",
+]
+enable_error_code = [
+    "truthy-bool",
+    "mutable-override",
+    "exhaustive-match",
+]
+check_untyped_defs = true
+disallow_any_decorated = true
+disallow_any_generics = true
+disallow_any_unimported = true
+disallow_incomplete_defs = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+local_partial_types = true
+no_implicit_optional = true
+no_implicit_reexport = true
+show_column_numbers = true
+show_error_codes = true
+show_traceback = true
+strict = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+warn_unused_ignores = true

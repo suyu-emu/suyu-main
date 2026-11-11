@@ -1183,6 +1183,8 @@ add_library(core STATIC
     loader/nro.h
     loader/nso.cpp
     loader/nso.h
+    loader/nup.cpp
+    loader/nup.h
     loader/nsp.cpp
     loader/nsp.h
     loader/xci.cpp
