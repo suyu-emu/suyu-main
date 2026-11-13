@@ -62,7 +62,7 @@ public:
     }
 
     bool IsHeadless() const override { return is_headless; }
-    const std::vector<u8>& GetLastRenderedFrame() const override { return headless_frame_data; }
+    std::span<const u8> GetLastRenderedFrame() const override { return headless_frame; }
     std::unique_lock<std::mutex> LockLastRenderedFrame() override {
         return std::unique_lock{headless_frame_mutex};
     }
@@ -73,7 +73,7 @@ public:
     void InitializePlatformSpecific();
 
 private:
-    /// A headless frame being drawn, copied back, or read by the readback thread
+    /// A headless frame being drawn, copied back, or held for the frontend to read
     struct HeadlessSlot {
         Frame frame{};
         vk::Buffer buffer;
@@ -83,7 +83,7 @@ private:
         u64 tick{};
         bool busy{};
     };
-    static constexpr size_t NUM_HEADLESS_SLOTS = 3;
+    static constexpr size_t NUM_HEADLESS_SLOTS = 4;
 
     void CompositeHeadless(std::span<const Tegra::FramebufferConfig> framebuffers);
     void HeadlessReadbackLoop(std::stop_token stop_token);
@@ -132,7 +132,9 @@ private:
 
     bool is_headless{false};
     std::vector<Frame> external_frames;
-    std::vector<u8> headless_frame_data;
+    /// The newest finished frame, in its slot's mapped buffer
+    std::span<const u8> headless_frame;
+    size_t headless_frame_slot{NUM_HEADLESS_SLOTS};
     u32 headless_width{1280};
     u32 headless_height{720};
     std::mutex headless_frame_mutex;
