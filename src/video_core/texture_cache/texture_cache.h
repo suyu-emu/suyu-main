@@ -1757,18 +1757,18 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
         src_id = FindImage(src_info, src_addr, try_options);
         dst_id = FindImage(dst_info, dst_addr, try_options);
         if (!copy.must_accelerate) {
-            do {
-                if (!src_id && !dst_id) {
-                    return std::nullopt;
+            // A render target kept at its surface clip's size doesn't match a surface declared
+            // with the aligned size, and is still to be copied on the GPU
+            const auto is_gpu_modified = [&](ImageId id, const ImageInfo& info, GPUVAddr addr) {
+                if (!id && info.type != ImageType::Linear) {
+                    id = FindImage(info, addr, try_options | RelaxedOptions::Size);
                 }
-                if (src_id && True(slot_images[src_id].flags & ImageFlagBits::GpuModified)) {
-                    break;
-                }
-                if (dst_id && True(slot_images[dst_id].flags & ImageFlagBits::GpuModified)) {
-                    break;
-                }
+                return id && True(slot_images[id].flags & ImageFlagBits::GpuModified);
+            };
+            if (!is_gpu_modified(src_id, src_info, src_addr) &&
+                !is_gpu_modified(dst_id, dst_info, dst_addr)) {
                 return std::nullopt;
-            } while (false);
+            }
         }
         const ImageBase* const src_image = src_id ? &slot_images[src_id] : nullptr;
         if (src_image && src_image->info.num_samples > 1) {
@@ -1977,12 +1977,46 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
 }
 
 template <class P>
+ImageId TextureCache<P>::FindOrInsertRenderTarget(const ImageInfo& info, GPUVAddr gpu_addr) {
+    // NVN declares a render target with the size its block linear layout is aligned to and leaves
+    // the real size to the surface clip, while a texture over the same memory carries the real
+    // size. Draw to the image of the real size, so that the two are one image and not aliases
+    // copied into each other between draws.
+    const auto& clip = maxwell3d->regs.surface_clip;
+    ImageInfo clipped = info;
+    clipped.size.width = clip.width;
+    clipped.size.height = clip.height;
+    const bool is_smaller =
+        clip.width <= info.size.width && clip.height <= info.size.height &&
+        (clip.width != info.size.width || clip.height != info.size.height);
+    if (info.type != ImageType::e2D || info.num_samples != 1 || clip.x != 0 || clip.y != 0 ||
+        clip.width == 0 || clip.height == 0 || !is_smaller ||
+        !IsBlockLinearSizeCompatible(info, clipped, 0, 0, false)) {
+        return FindOrInsertImage(info, gpu_addr);
+    }
+    const ImageId clipped_id = FindImage(clipped, gpu_addr, RelaxedOptions{});
+    const ImageId declared_id = FindImage(info, gpu_addr, RelaxedOptions{});
+    if (!clipped_id) {
+        return declared_id ? declared_id : InsertImage(clipped, gpu_addr, RelaxedOptions{});
+    }
+    if (declared_id && declared_id != clipped_id) {
+        // Keep to the declared size when that is the one textures sample
+        const bool declared_sampled = True(slot_images[declared_id].flags & ImageFlagBits::Strong);
+        const bool clipped_sampled = True(slot_images[clipped_id].flags & ImageFlagBits::Strong);
+        if (declared_sampled && !clipped_sampled) {
+            return declared_id;
+        }
+    }
+    return clipped_id;
+}
+
+template <class P>
 ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr) {
     ImageId image_id{};
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
-        image_id = FindOrInsertImage(info, gpu_addr);
+        image_id = FindOrInsertRenderTarget(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
