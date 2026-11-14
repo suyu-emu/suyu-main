@@ -20,6 +20,7 @@
 #include <boost/container/static_vector.hpp>
 #include <queue>
 
+#include "common/adaptive_mutex.h"
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "common/literals.h"
@@ -257,7 +258,7 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
-    std::recursive_mutex mutex;
+    Common::AdaptiveMutex<std::recursive_mutex> mutex;
 
 private:
     /// Iterate over all page indices in a range

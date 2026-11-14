@@ -21,6 +21,7 @@ include(GenerateSCMRev)
 
 add_library(
     common STATIC
+    adaptive_mutex.h
     address_space.cpp
     address_space.h
     algorithm.h
