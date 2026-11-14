@@ -20,6 +20,7 @@
 #include <boost/container/static_vector.hpp>
 #include <boost/container/small_vector.hpp>
 
+#include "common/adaptive_mutex.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
@@ -321,7 +322,7 @@ public:
         } while (channel_state->has_deleted_buffers);
     }
 
-    std::recursive_mutex mutex;
+    Common::AdaptiveMutex<std::recursive_mutex> mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
 

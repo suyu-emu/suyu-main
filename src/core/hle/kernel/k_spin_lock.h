@@ -5,6 +5,8 @@
 
 #include <mutex>
 
+#include "common/adaptive_mutex.h"
+
 #include "common/common_funcs.h"
 #include "core/hle/kernel/k_scoped_lock.h"
 
@@ -22,7 +24,7 @@ public:
     bool TryLock();
 
 private:
-    std::mutex m_lock;
+    Common::AdaptiveMutex<std::mutex> m_lock;
 };
 
 // TODO(bunnei): Alias for now, in case we want to implement these accurately in the future.
