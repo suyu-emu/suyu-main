@@ -927,6 +927,10 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     if (device.IsStorageImageMultisampleSupported()) {
         msaa_copy_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool, compute_pass_descriptor_queue);
     }
+    // RADV leaves delta color compression, and fast clears with it, off for a storage image whose
+    // format list holds a format that allows atomics. A compressed image needs the care that
+    // comes with the feedback loop layout when a draw samples from it while rendering to it.
+    VideoCore::Surface::SeparateAtomicViewFormats(device.NeedsFeedbackLoopLayout());
     if (!device.IsKhrImageFormatListSupported()) {
         return;
     }
