@@ -9,32 +9,32 @@
 </h1>
 
 <h4 align="center">
-A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit ΓÇö based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
+A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit — based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
 </h4>
 
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
   <a href="#performance">Performance</a> |
-  <a href="docs/releases/v14.1.0.md">Changes in v14.1.0</a> |
+  <a href="docs/releases/v0.1.4.md">Changes in v0.1.4</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
 
 ---
 
-> **Current release: [suyu v14.1.0](https://github.com/suyu-emu/suyu-main/releases/tag/v14.1.0)**
+> **Current release: [suyu v0.1.4](https://github.com/suyu-emu/suyu-main/releases/tag/v0.1.4)**
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
 > archive and no further development was planned there. This repository picks it up
-> from commit `d1d09321d7` and continues development, now at **v14.1.0**.
+> from commit `d1d09321d7` and continues development, now at **v0.1.4**.
 >
-> Tagged builds identify their exact release, such as `suyu v14.1.0`.
+> Tagged builds identify their exact release, such as `suyu v0.1.4`.
 > Development snapshots identify their commit and branch. See
 > [PROVENANCE.md](PROVENANCE.md) for the repository lineage.
 >
 > The default development branch is `mk8-recomp`. Recompiler work is also maintained in
-> [mk8-recomp](https://github.com/dougchansan/mk8-recomp) ΓÇö a project statically
+> [mk8-recomp](https://github.com/dougchansan/mk8-recomp) — a project statically
 > recompiling Switch titles using this recompiler. General emulator and launcher
 > fixes are maintained here alongside that work.
 
@@ -42,14 +42,14 @@ A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit Γ�
 
 suyu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
 
-- **Ordinary emulation** ΓÇö Dynarmic JIT CPU execution with suyu's GPU, audio and service emulation.
-- **Static or Hybrid recompilation** ΓÇö ahead-of-time compilation of AArch64 game code, using the same GPU, audio and HLE services. Hybrid permits JIT fallback; Static requires compiled coverage.
+- **Ordinary emulation** — Dynarmic JIT CPU execution with suyu's GPU, audio and service emulation.
+- **Static or Hybrid recompilation** — ahead-of-time compilation of AArch64 game code, using the same GPU, audio and HLE services. Hybrid permits JIT fallback; Static requires compiled coverage.
 
 Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improvements to UI, recompiler, and platform support.
 
 ## Status
 
-**v14.1.0 corrects NVIDIA pipeline-library rendering and macOS character geometry**,
+**v0.1.4 corrects NVIDIA pipeline-library rendering and macOS character geometry**,
 following v14.0.1. Versions use major.minor.patch numbering. Official packages are
 built by the [tagged release workflow](https://github.com/suyu-emu/suyu-main/actions/workflows/release.yml),
 which checks platform builds and final package contents before publishing.
@@ -57,7 +57,7 @@ which checks platform builds and final package contents before publishing.
 Graphics pipeline libraries and Fast GPU Time are **off by default**. Graphics ΓåÆ
 Advanced exposes the graphics hacks and Vulkan extension controls, supports global
 and per-game settings, and scrolls on smaller windows. Explicit user opt-ins are
-preserved. See the [release notes](docs/releases/v14.1.0.md).
+preserved. See the [release notes](docs/releases/v0.1.4.md).
 
 ### Released platforms
 
@@ -68,7 +68,7 @@ preserved. See the [release notes](docs/releases/v14.1.0.md).
 | macOS arm64 | Application ZIP; libretro ZIP | Apple M5: TOTK JIT and MK8D/TOTK native Static opening checks using MoltenVK |
 | Android arm64 | APK; libretro ZIP | Platform build and package checks; real-device gameplay remains unqualified |
 
-[Download v14.1.0](https://github.com/suyu-emu/suyu-main/releases/tag/v14.1.0).
+[Download v0.1.4](https://github.com/suyu-emu/suyu-main/releases/tag/v0.1.4).
 Project, dependency and AppImage corresponding-source archives accompany the
 downloads. Official packages contain no games, keys or firmware.
 
@@ -108,7 +108,7 @@ Historical measurements are listed separately under [Performance](#performance).
 
 Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Re-export Static and Hybrid games for v14.1.0.** Existing exports embed their own
+**Re-export Static and Hybrid games for v0.1.4.** Existing exports embed their own
 CPU/HLE host; updating the GUI alone does not apply these graphics fixes. Generated images use ABI 6 by
 default, with page-table memory access, guard-generation checks and floating-point
 fast paths. Compatibility output can use ABI 5. Automatic title bundles validate
@@ -117,11 +117,11 @@ current bundle rather than stale detached launchers.
 
 A strict-static MK8D v4.0.0 TAS replay reaches a rendered, controllable race segment with zero JIT fallbacks. Full-race validation remains open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
 
-See [current release notes](docs/releases/v14.1.0.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [current release notes](docs/releases/v0.1.4.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
 ## Performance
 
-### v14.1.0 graphics validation
+### v0.1.4 graphics validation
 
 Native Static opening replays completed with normal exits, all four translated
 modules active, zero JIT transitions and zero unresolved imports for MK8D 4.0.0
@@ -170,7 +170,7 @@ than completion of an entire race or game.
   earlier Static and Hybrid improvements.
 
 Those results belong to their recorded builds and settings. They are not new
-v14.1.0 benchmark results. Controlled comparisons need matching games, saves,
+v0.1.4 benchmark results. Controlled comparisons need matching games, saves,
 mods, caches and work, with interleaved runs on an idle machine; see
 [the measurement safeguards](docs/static-campaign.md).
 
@@ -183,7 +183,7 @@ comparisons remain areas for further work.
 
 ## Changes in recent updates
 
-v14.1.0 fixes corrupted NVIDIA frames when pipeline libraries are enabled and
+v0.1.4 fixes corrupted NVIDIA frames when pipeline libraries are enabled and
 stretched character geometry on macOS MoltenVK. v14.0.1 adds safer graphics
 defaults, complete advanced graphics controls and a working Fast GPU Time switch.
 v0.0.14 fixed startup/export-close crashes and Source
@@ -196,14 +196,14 @@ Earlier correctness fixes and recompiler additions include:
 
 - **Installed updates and DLC in NAND were never indexed.** `GetFileAtID` tried
   eight storage-layout variants but skipped every odd index except 7, so the
-  `.cnmt.nca` suffix was only ever looked for at the cache root ΓÇö never inside a
+  `.cnmt.nca` suffix was only ever looked for at the cache root — never inside a
   `000000XX/` directory, which is exactly where meta NCAs are stored and what
   `InstallEntry` writes. Every meta NCA in NAND was therefore unreachable and no
   installed update or DLC ever entered the cache, silently: a miss is
   indistinguishable from nothing being installed, which is why the frontend's
   installed-title listing reported zero. A second defect behind it let an older
   update overwrite a newer one, because the metadata map is keyed by title id
-  with no version comparison ΓÇö now the higher `GetTitleVersion()` wins.
+  with no version comparison — now the higher `GetTitleVersion()` wins.
 
 - **Service handler registration dropped most commands.** A
   `FunctionInfoTyped<T>` array was walked through a `FunctionInfoBase*` with a
@@ -211,7 +211,7 @@ Earlier correctness fixes and recompiler additions include:
   tells you nothing, but every element after the first was read from the wrong
   offset. `IpcController` registered 2 of its 6 handlers;
   `QueryPointerBufferSize` was among the lost, and it is part of CMIF session
-  setup ΓÇö so titles stalled in early service initialisation.
+  setup — so titles stalled in early service initialisation.
 
 - **RomFS registration was silently dropped.** `emplace` where
   `insert_or_assign` was meant, so re-registration kept the stale entry and the
@@ -242,7 +242,7 @@ Earlier correctness fixes and recompiler additions include:
   `Core::ExclusiveMonitor` interface rather than dynarmic's implementation of
   it. See [Static recompilation](#static-recompilation).
 
-- **Static and runtime coverage instrumentation** ΓÇö per-module JSON of
+- **Static and runtime coverage instrumentation** — per-module JSON of
   emitted/unhandled counts, and runtime histograms of blocks executed,
   transitions by cause, unimplemented opcodes and SVCs.
 
@@ -250,7 +250,7 @@ Earlier correctness fixes and recompiler additions include:
   booting it, reading the update's NPDM as well as the base's. An update can
   change the answer: a title can ship a 32-bit base and a later 64-bit update.
 
-- **Diagnostics** ΓÇö the NPDM log line carries a content hash, because size is not
+- **Diagnostics** — the NPDM log line carries a content hash, because size is not
   an identity - two updates of one title can share a `main.npdm` size while
   differing in architecture - and `PatchExeFS` names which provider slot
   answered for an update.
@@ -316,7 +316,7 @@ git clone --recursive --branch mk8-recomp https://github.com/suyu-emu/suyu-main.
 cd suyu
 ```
 
-Use `--branch v14.1.0` instead to build the released source. The default branch
+Use `--branch v0.1.4` instead to build the released source. The default branch
 can contain later development changes.
 
 CMake **3.31 or newer** is required. `CMakeModules/CPMUtil.cmake` demands it and
@@ -403,7 +403,7 @@ and suyu's CMake still searches for the old name, so if configure stops with
 *"Required program `glslangValidator` not found"*, add
 `-DGLSLANGVALIDATOR="C:/path/to/glslang.exe"`.
 
-`suyu.exe` needs the Qt runtime beside it to start ΓÇö `windeployqt` on the built
+`suyu.exe` needs the Qt runtime beside it to start — `windeployqt` on the built
 executable copies it in.
 
 Keep `build/bin/export-build-kit` beside the application to support Windows
