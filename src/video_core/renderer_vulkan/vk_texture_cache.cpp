@@ -927,23 +927,36 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     if (device.IsStorageImageMultisampleSupported()) {
         msaa_copy_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool, compute_pass_descriptor_queue);
     }
+    // RADV leaves delta color compression, and fast clears with it, off for a storage image whose
+    // format list holds a format that allows atomics. A compressed image needs the care that
+    // comes with the feedback loop layout when a draw samples from it while rendering to it.
+    separate_atomic_view_formats = device.NeedsFeedbackLoopLayout();
     if (!device.IsKhrImageFormatListSupported()) {
+        VideoCore::Surface::SeparateAtomicViewFormats(separate_atomic_view_formats);
         return;
     }
-    for (size_t index_a = 0; index_a < VideoCore::Surface::MaxPixelFormat; index_a++) {
-        const auto image_format = static_cast<PixelFormat>(index_a);
-        if (IsPixelFormatASTC(image_format) && !device.IsOptimalAstcSupported()) {
-            view_formats[index_a].push_back(VK_FORMAT_A8B8G8R8_UNORM_PACK32);
-        }
-        for (size_t index_b = 0; index_b < VideoCore::Surface::MaxPixelFormat; index_b++) {
-            const auto view_format = static_cast<PixelFormat>(index_b);
-            if (VideoCore::Surface::IsViewCompatible(image_format, view_format, false, true)) {
-                const auto view_info =
-                    MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, view_format);
-                view_formats[index_a].push_back(view_info.format);
+    const auto fill = [this](auto& formats) {
+        for (size_t index_a = 0; index_a < VideoCore::Surface::MaxPixelFormat; index_a++) {
+            const auto image_format = static_cast<PixelFormat>(index_a);
+            if (IsPixelFormatASTC(image_format) && !device.IsOptimalAstcSupported()) {
+                formats[index_a].push_back(VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+            }
+            for (size_t index_b = 0; index_b < VideoCore::Surface::MaxPixelFormat; index_b++) {
+                const auto view_format = static_cast<PixelFormat>(index_b);
+                if (VideoCore::Surface::IsViewCompatible(image_format, view_format, false, true)) {
+                    const auto view_info =
+                        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, view_format);
+                    formats[index_a].push_back(view_info.format);
+                }
             }
         }
+    };
+    if (separate_atomic_view_formats) {
+        VideoCore::Surface::SeparateAtomicViewFormats(false);
+        fill(view_formats_with_atomics);
     }
+    VideoCore::Surface::SeparateAtomicViewFormats(separate_atomic_view_formats);
+    fill(view_formats);
 
     if (Settings::values.gpu_unswizzle_enabled.GetValue()) {
         bl3d_unswizzle_pass.emplace(device, scheduler, descriptor_pool,
@@ -2083,7 +2096,9 @@ bool Image::SetCompression(bool compressed) {
         return false;
     }
     vk::Image replacement =
-        MakeImage(device, runtime->memory_allocator, info, runtime->ViewFormats(info.format),
+        MakeImage(device, runtime->memory_allocator, info,
+                  compressed ? runtime->ViewFormats(info.format)
+                             : runtime->ViewFormatsWithAtomics(info.format),
                   std::nullopt, !compressed);
     if (initialized) {
         const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
@@ -2205,9 +2220,9 @@ bool Image::ScaleUp(bool ignore) {
         auto scaled_info = info;
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
+        // It is never replaced, so it has every view format, which RADV does not compress
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format), std::nullopt,
-                                 True(flags & ImageFlagBits::FeedbackLoopSafe));
+                                 runtime->ViewFormatsWithAtomics(info.format));
         ignore = false;
     }
     current_image = &Image::scaled_image;

@@ -189,6 +189,9 @@ public:
     /// Takes note of the draw last checked writing to these color targets
     void NoteFeedbackLoops(u32 written_targets);
 
+    /// Takes note of a shader viewing the image as R32_UINT
+    void NoteIntegerStorageView(ImageId image_id);
+
     /// Color targets the current state writes to, as a mask of their indices
     [[nodiscard]] u32 WrittenColorTargets() const noexcept;
 
@@ -469,6 +472,8 @@ private:
     /// that have been
     std::vector<ImageId> feedback_loop_images;
     std::vector<ImageId> feedback_loop_safe_images;
+    /// Images to give every view format when the frame ends, since shaders view them as R32_UINT
+    std::vector<ImageId> integer_view_images;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 

@@ -177,19 +177,34 @@ void TextureCache<P>::TickFrame() {
         RunGarbageCollector();
     }
     if constexpr (requires { runtime.SetFeedbackLoopSafe(slot_images[ImageId{}], true); }) {
-        for (const ImageId image_id : feedback_loop_images) {
+        const auto make_safe = [this](ImageId image_id) {
             Image& image = slot_images[image_id];
-            if (runtime.SetFeedbackLoopSafe(image, true)) {
-                image.flags |= ImageFlagBits::FeedbackLoopSafe;
-                feedback_loop_safe_images.push_back(image_id);
-                // Its views are of the image it had
-                InvalidateScale(image);
+            if (True(image.flags & ImageFlagBits::FeedbackLoopSafe)) {
+                return true;
+            }
+            if (!runtime.SetFeedbackLoopSafe(image, true)) {
+                return false;
+            }
+            image.flags |= ImageFlagBits::FeedbackLoopSafe;
+            feedback_loop_safe_images.push_back(image_id);
+            // Its views are of the image it had
+            InvalidateScale(image);
+            return true;
+        };
+        for (const ImageId image_id : feedback_loop_images) {
+            make_safe(image_id);
+        }
+        // The uncompressed image has every view format
+        for (const ImageId image_id : integer_view_images) {
+            if (!make_safe(image_id)) {
+                slot_images[image_id].flags &= ~ImageFlagBits::IntegerViews;
             }
         }
         if ((frame_tick & 63) == 0) {
             std::erase_if(feedback_loop_safe_images, [this](ImageId image_id) {
                 Image& image = slot_images[image_id];
                 if (frame_tick < image.feedback_loop_tick + FEEDBACK_LOOP_FRAMES_TO_FORGET ||
+                    True(image.flags & ImageFlagBits::IntegerViews) ||
                     !runtime.SetFeedbackLoopSafe(image, false)) {
                     return false;
                 }
@@ -201,6 +216,7 @@ void TextureCache<P>::TickFrame() {
         }
     }
     feedback_loop_images.clear();
+    integer_view_images.clear();
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
@@ -367,6 +383,22 @@ void TextureCache<P>::NoteFeedbackLoops(u32 written_targets) {
             old_score < FEEDBACK_LOOP_SCORE_TO_SETTLE && score >= FEEDBACK_LOOP_SCORE_TO_SETTLE) {
             feedback_loop_images.push_back(image_id);
         }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteIntegerStorageView(ImageId image_id) {
+    if constexpr (requires { runtime.SeparatesAtomicViewFormats(); }) {
+        ImageBase& image = slot_images[image_id];
+        // A rescaled image is drawn from its scaled copy, which has every view format
+        if (!runtime.SeparatesAtomicViewFormats() ||
+            True(image.flags & (ImageFlagBits::IntegerViews | ImageFlagBits::Rescaled)) ||
+            image.info.format == PixelFormat::R32_UINT ||
+            image.info.format == PixelFormat::R32_SINT) {
+            return;
+        }
+        image.flags |= ImageFlagBits::IntegerViews;
+        integer_view_images.push_back(image_id);
     }
 }
 
@@ -2478,6 +2510,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     std::erase(feedback_loop_images, image_id);
     std::erase(feedback_loop_safe_images, image_id);
+    std::erase(integer_view_images, image_id);
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }

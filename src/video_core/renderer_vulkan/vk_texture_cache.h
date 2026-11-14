@@ -115,6 +115,17 @@ public:
         return view_formats[static_cast<std::size_t>(format)];
     }
 
+    /// View formats that include the ones shaders do atomics with, which RADV does not compress
+    std::span<const VkFormat> ViewFormatsWithAtomics(PixelFormat format) {
+        return separate_atomic_view_formats
+                   ? view_formats_with_atomics[static_cast<std::size_t>(format)]
+                   : ViewFormats(format);
+    }
+
+    bool SeparatesAtomicViewFormats() const noexcept {
+        return separate_atomic_view_formats;
+    }
+
     void BarrierFeedbackLoop();
 
     /// Makes it safe to sample from the image while it is bound as a render target, or undoes
@@ -141,6 +152,8 @@ public:
     std::optional<MSAACopyPass> msaa_copy_pass;
     const Settings::ResolutionScalingInfo& resolution;
     std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats;
+    std::array<std::vector<VkFormat>, VideoCore::Surface::MaxPixelFormat> view_formats_with_atomics;
+    bool separate_atomic_view_formats{};
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
@@ -300,7 +313,7 @@ public:
     bool ScaleDown(bool ignore = false);
 
     /// Replaces the image with one of the same contents that the driver may compress, or may
-    /// not. Returns false if it cannot.
+    /// not, and then has every view format. Returns false if it cannot.
     bool SetCompression(bool compressed);
 
     u64 allocation_tick;

@@ -44,6 +44,7 @@ enum class ImageFlagBits : u32 {
     IsDecoding = 1 << 17, ///< Is currently being decoded asynchronously.
 
     FeedbackLoopSafe = 1 << 18, ///< Sampling from it while drawing to it needs no care
+    IntegerViews = 1 << 19,     ///< Viewed as R32_UINT by shaders, so kept uncompressed
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
