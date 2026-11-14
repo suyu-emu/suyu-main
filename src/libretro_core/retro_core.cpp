@@ -113,6 +113,7 @@ bool HasUsableNcaHeaderKey() {
 
 std::unique_ptr<Core::System> g_system;
 std::unique_ptr<SuyuCli::ExplicitUpdateProvider> g_explicit_provider;
+std::unique_ptr<FileSys::ManualContentProvider> g_content_provider;
 std::unique_ptr<LibretroCore::RetroEmuWindow> g_emu_window;
 std::shared_ptr<InputCommon::InputSubsystem> g_input_subsystem;
 std::string g_game_path;
@@ -529,6 +530,7 @@ RETRO_API void retro_deinit() {
     Network::Shutdown();
     g_system.reset();
     g_explicit_provider.reset();
+    g_content_provider.reset();
     g_emu_window.reset();
     if (g_input_subsystem) { g_input_subsystem->Shutdown(); g_input_subsystem.reset(); }
     Common::Log::Stop();
@@ -1219,6 +1221,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
             return false;
         }
         LOG_INFO(Frontend, "libretro: explicit base/update provider verified for this session");
+    } else {
+        // PatchManager takes the base Program NCA from the content provider to apply an
+        // installed update to the RomFS. The other frontends list a game's NCAs when they
+        // scan it; here the booted file is the only one there is.
+        g_content_provider = std::make_unique<FileSys::ManualContentProvider>();
+        const auto game_file = Core::GetGameFileFromPath(g_system->GetFilesystem(), g_game_path);
+        if (game_file && g_content_provider->AddEntriesFromContainer(game_file)) {
+            g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                              g_content_provider.get());
+        } else {
+            g_content_provider.reset();
+        }
     }
 
     // A verified deconstructed ExeFS/RomFS pair has no CNMT to report the
@@ -1552,10 +1566,11 @@ RETRO_API void retro_unload_game() {
         std::fill(std::begin(buttons), std::end(buttons), false);
     }
     g_game_path.clear();
-    if (g_explicit_provider) {
+    if (g_explicit_provider || g_content_provider) {
         g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
                                           nullptr);
         g_explicit_provider.reset();
+        g_content_provider.reset();
     }
     // Leave any room we joined for this game; the next one loaded in this
     // session gets to make its own decision from its own core options.
