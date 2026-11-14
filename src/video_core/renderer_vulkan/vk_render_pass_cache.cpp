@@ -82,9 +82,11 @@ VkRenderPass RenderPassCache::Get(const RenderPassKey& key) {
     for (size_t index = 0; index < key.color_formats.size(); ++index) {
         const PixelFormat format{key.color_formats[index]};
         const bool is_valid{format != PixelFormat::Invalid};
+        const bool is_feedback_loop{((key.feedback_loop_mask >> index) & 1) != 0};
         references[index] = VkAttachmentReference{
             .attachment = is_valid ? num_colors : VK_ATTACHMENT_UNUSED,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
+            .layout = is_feedback_loop ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                       : VK_IMAGE_LAYOUT_GENERAL,
         };
         if (is_valid) {
             descriptions.push_back(AttachmentDescription(*device, format, key.samples));

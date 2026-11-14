@@ -284,6 +284,11 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        if (stage_infos[NUM_STAGES - 1].stores_frag_color[index]) {
+            fragment_color_outputs |= 1u << index;
+        }
+    }
     auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
         const bool time_pipeline = PipelineTimingEnabled(key.Hash());
         const auto setup_start = time_pipeline ? std::chrono::steady_clock::now()
@@ -564,14 +569,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.any_buffer_uploaded = false;
     }
     texture_cache.UpdateRenderTargets(false);
-    texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
-                                                                                 views.size()});
+    texture_cache.CheckFeedbackLoop(
+        std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()},
+        device.NeedsFeedbackLoopLayout());
     return ConfigureDraw(rescaling, render_area);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (device.NeedsFeedbackLoopLayout()) {
+        // The driver leaves a color buffer the fragment shader has no output for as it is
+        const u32 written_targets = texture_cache.WrittenColorTargets() & fragment_color_outputs;
+        texture_cache.NoteFeedbackLoops(written_targets);
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer(),
+                                    texture_cache.SampledColorTargets(), written_targets);
+    } else {
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    }
     if (!is_built.load(std::memory_order::acquire)) {
         // Wait here rather than from a recorded command. The recorded wait ran
         // on the scheduler thread after this draw had already been queued, so

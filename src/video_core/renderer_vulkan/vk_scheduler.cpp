@@ -95,19 +95,28 @@ void Scheduler::DispatchWork() {
     }
 }
 
-void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
-    const VkRenderPass renderpass = framebuffer->RenderPass();
+void Scheduler::RequestRenderpass(const Framebuffer* framebuffer, u32 sampled_targets,
+                                  u32 written_targets) {
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
-    if (renderpass == state.renderpass && framebuffer_handle == state.framebuffer &&
+    // A color buffer can be sampled from once the writes to it are flushed, which ending the
+    // renderpass does, and written to at the same time only in the feedback loop layout
+    const u32 unsafe_reads =
+        sampled_targets & ~state.feedback_loops & (written_targets | state.written_targets);
+    if (state.renderpass && framebuffer_handle == state.framebuffer && unsafe_reads == 0 &&
         render_area.width == state.render_area.width &&
         render_area.height == state.render_area.height) {
+        state.written_targets |= written_targets;
         return;
     }
     EndRenderPass();
+    const u32 feedback_loops = sampled_targets & written_targets;
+    const VkRenderPass renderpass = framebuffer->RenderPass(feedback_loops);
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+    state.feedback_loops = feedback_loops;
+    state.written_targets = written_targets;
 
     // Log render pass begin
     if (GPU::Logging::IsActive() &&

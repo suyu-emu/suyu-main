@@ -12,6 +12,7 @@
 
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -116,6 +117,13 @@ public:
 
     void BarrierFeedbackLoop();
 
+    /// Makes it safe to sample from the image while it is bound as a render target, or undoes
+    /// that. Returns false if it cannot.
+    bool SetFeedbackLoopSafe(Image& image, bool safe);
+
+    /// Keeps an image that was replaced, and views of it, until the commands using them have run
+    void Retire(vk::Image image, std::vector<vk::ImageView> views);
+
     bool IsFormatDitherable(VideoCore::Surface::PixelFormat format);
     bool IsFormatScalable(VideoCore::Surface::PixelFormat format);
 
@@ -136,6 +144,13 @@ public:
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
+
+    struct RetiredImage {
+        vk::Image image;
+        std::vector<vk::ImageView> views;
+        u32 frames_left;
+    };
+    std::vector<RetiredImage> retired_images;
 };
 
 class Framebuffer {
@@ -165,6 +180,9 @@ public:
     [[nodiscard]] VkRenderPass RenderPass() const noexcept {
         return renderpass;
     }
+
+    /// Render pass for draws that sample from the color buffers in the mask
+    [[nodiscard]] VkRenderPass RenderPass(u32 feedback_loop_mask) const;
 
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
         return render_area;
@@ -209,6 +227,10 @@ public:
 private:
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
+    RenderPassCache* render_pass_cache{};
+    RenderPassKey renderpass_key{};
+    mutable VkRenderPass feedback_loop_renderpass{};
+    mutable u32 feedback_loop_renderpass_mask{};
     VkExtent2D render_area{};
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     u32 num_color_buffers = 0;
@@ -276,6 +298,10 @@ public:
     bool ScaleUp(bool ignore = false);
 
     bool ScaleDown(bool ignore = false);
+
+    /// Replaces the image with one of the same contents that the driver may compress, or may
+    /// not. Returns false if it cannot.
+    bool SetCompression(bool compressed);
 
     u64 allocation_tick;
 
