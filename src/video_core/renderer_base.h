@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <vector>
 
 #include "common/common_funcs.h"
@@ -50,9 +51,8 @@ public:
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
 
     virtual bool IsHeadless() const { return false; }
-    virtual const std::vector<u8>& GetLastRenderedFrame() const {
-        static const std::vector<u8> empty;
-        return empty;
+    virtual std::span<const u8> GetLastRenderedFrame() const {
+        return {};
     }
     /// Keeps the frame GetLastRenderedFrame() returns, and its size, from changing while held
     [[nodiscard]] virtual std::unique_lock<std::mutex> LockLastRenderedFrame() {

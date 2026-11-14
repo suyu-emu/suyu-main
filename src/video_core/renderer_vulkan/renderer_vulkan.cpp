@@ -315,20 +315,26 @@ void RendererVulkan::HeadlessReadbackLoop(std::stop_token stop_token) {
         HeadlessSlot& slot = headless_slots[index];
         scheduler.GetMasterSemaphore().Wait(slot.tick);
         slot.buffer.Invalidate();
+        size_t previous{};
         {
+            // The frontend reads the frame under this lock, so the slot it reads from is only
+            // replaced between two of its reads
             std::scoped_lock lock{headless_frame_mutex};
-            const auto mapped = slot.buffer.Mapped();
-            headless_frame_data.assign(mapped.begin(), mapped.begin() + slot.buffer_size);
+            previous = headless_frame_slot;
+            headless_frame_slot = index;
+            headless_frame = std::as_const(slot.buffer).Mapped().first(slot.buffer_size);
             headless_width = slot.width;
             headless_height = slot.height;
             render_window.OnFrameDisplayed();
         }
 
-        {
-            std::scoped_lock lock{headless_slot_mutex};
-            slot.busy = false;
+        if (previous < headless_slots.size()) {
+            {
+                std::scoped_lock lock{headless_slot_mutex};
+                headless_slots[previous].busy = false;
+            }
+            headless_slot_cv.notify_all();
         }
-        headless_slot_cv.notify_all();
     }
 }
 
