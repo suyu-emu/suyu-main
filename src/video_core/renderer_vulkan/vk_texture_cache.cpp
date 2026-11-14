@@ -163,6 +163,10 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     if (info.type == ImageType::e3D) {
         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     }
+    VkImageUsageFlags usage = ImageUsageFlags(format_info, info.format);
+    if (device.NeedsFeedbackLoopLayout() && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
+        usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    }
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
     return VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -179,7 +183,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         .arrayLayers = static_cast<u32>(info.resources.layers),
         .samples = ConvertSampleCount(info.num_samples),
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = ImageUsageFlags(format_info, info.format),
+        .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -189,7 +193,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
-                                  std::optional<VkFormat> format_override = {}) {
+                                  std::optional<VkFormat> format_override = {},
+                                  bool uncompressed = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -216,6 +221,16 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         if (device.IsKhrImageFormatListSupported()) {
             image_ci.pNext = &image_format_list;
         }
+    }
+    VkImageCompressionControlEXT compression_control{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+        .pNext = image_ci.pNext,
+        .flags = VK_IMAGE_COMPRESSION_DISABLED_EXT,
+        .compressionControlPlaneCount = 0,
+        .pFixedRateFlags = nullptr,
+    };
+    if (uncompressed) {
+        image_ci.pNext = &compression_control;
     }
     return allocator.CreateImage(image_ci);
 }
@@ -1622,7 +1637,27 @@ std::optional<size_t> TextureCacheRuntime::GetSamplerHeapBudget() const {
     return device.GetSamplerHeapBudget();
 }
 
-void TextureCacheRuntime::TickFrame() {}
+void TextureCacheRuntime::TickFrame() {
+    for (RetiredImage& retired : retired_images) {
+        --retired.frames_left;
+    }
+    std::erase_if(retired_images,
+                  [](const RetiredImage& retired) { return retired.frames_left == 0; });
+}
+
+bool TextureCacheRuntime::SetFeedbackLoopSafe(Image& image, bool safe) {
+    return image.SetCompression(!safe);
+}
+
+void TextureCacheRuntime::Retire(vk::Image image, std::vector<vk::ImageView> views) {
+    // Longer than the texture cache keeps the image views it replaces
+    static constexpr u32 FRAMES_TO_KEEP = 16;
+    retired_images.push_back(RetiredImage{
+        .image = std::move(image),
+        .views = std::move(views),
+        .frames_left = FRAMES_TO_KEEP,
+    });
+}
 
 Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu_addr_,
              VAddr cpu_addr_)
@@ -2038,6 +2073,120 @@ bool Image::IsRescaled() const noexcept {
     return True(flags & ImageFlagBits::Rescaled);
 }
 
+bool Image::SetCompression(bool compressed) {
+    const Device& device = runtime->device;
+    if (!device.NeedsFeedbackLoopLayout() || !device.IsExtImageCompressionControlSupported()) {
+        return false;
+    }
+    if (!original_image || scaled_image || scale_view || normal_view ||
+        (original_image.UsageFlags() & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {
+        return false;
+    }
+    vk::Image replacement =
+        MakeImage(device, runtime->memory_allocator, info, runtime->ViewFormats(info.format),
+                  std::nullopt, !compressed);
+    if (initialized) {
+        const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
+        const u32 width = info.size.width >> samples_x;
+        const u32 height = info.size.height >> samples_y;
+        const bool is_3d = info.type == ImageType::e3D;
+        boost::container::small_vector<VkImageCopy, 16> copies;
+        for (s32 level = 0; level < info.resources.levels; ++level) {
+            const VkImageSubresourceLayers subresource{
+                .aspectMask = aspect_mask,
+                .mipLevel = static_cast<u32>(level),
+                .baseArrayLayer = 0,
+                .layerCount = static_cast<u32>(info.resources.layers),
+            };
+            copies.push_back(VkImageCopy{
+                .srcSubresource = subresource,
+                .srcOffset{},
+                .dstSubresource = subresource,
+                .dstOffset{},
+                .extent{
+                    .width = (std::max)(width >> level, 1u),
+                    .height = (std::max)(height >> level, 1u),
+                    .depth = is_3d ? (std::max)(info.size.depth >> level, 1u) : 1u,
+                },
+            });
+        }
+        scheduler->RequestOutsideRenderPassOperationContext();
+        scheduler->Record([src = *original_image, dst = *replacement, aspect = aspect_mask,
+                           copies](vk::CommandBuffer cmdbuf) {
+            const VkImageSubresourceRange range{
+                .aspectMask = aspect,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            };
+            const std::array pre_barriers{
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                     VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = src,
+                    .subresourceRange = range,
+                },
+                VkImageMemoryBarrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = dst,
+                    .subresourceRange = range,
+                },
+            };
+            const VkImageMemoryBarrier post_barrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = dst,
+                .subresourceRange = range,
+            };
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, nullptr,
+                                   pre_barriers);
+            cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VideoCommon::FixSmallVectorADL(copies));
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, post_barrier);
+        });
+    }
+    std::vector<vk::ImageView> storage_views;
+    for (vk::ImageView& view : storage_image_views) {
+        if (view) {
+            storage_views.push_back(std::move(view));
+        }
+    }
+    runtime->Retire(std::move(original_image), std::move(storage_views));
+    original_image = std::move(replacement);
+    if (device.HasDebuggingToolAttached()) {
+        original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
+    }
+    return true;
+}
+
 bool Image::ScaleUp(bool ignore) {
     const auto& resolution = runtime->resolution;
     if (!resolution.active) {
@@ -2057,7 +2206,8 @@ bool Image::ScaleUp(bool ignore) {
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+                                 runtime->ViewFormats(info.format), std::nullopt,
+                                 True(flags & ImageFlagBits::FeedbackLoopSafe));
         ignore = false;
     }
     current_image = &Image::scaled_image;
@@ -2210,7 +2360,10 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     }
     const VkImageUsageFlags requested_view_usage = ImageUsageFlags(format_info, format);
     const VkImageUsageFlags image_usage = image.UsageFlags();
-    const VkImageUsageFlags clamped_view_usage = requested_view_usage & image_usage;
+    VkImageUsageFlags clamped_view_usage = requested_view_usage & image_usage;
+    if ((clamped_view_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0) {
+        clamped_view_usage |= image_usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    }
     const VkImageViewUsageCreateInfo image_view_usage{
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -2513,7 +2666,6 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
                                     std::span<ImageView*, NUM_RT> color_buffers,
                                     ImageView* depth_buffer, bool is_rescaled_) {
     boost::container::small_vector<VkImageView, NUM_RT + 1> attachments;
-    RenderPassKey renderpass_key{};
     s32 num_layers = 1;
 
     is_rescaled = is_rescaled_;
@@ -2562,6 +2714,9 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     renderpass_key.samples = samples;
 
     renderpass = runtime.render_pass_cache.Get(renderpass_key);
+    if (runtime.device.NeedsFeedbackLoopLayout()) {
+        render_pass_cache = &runtime.render_pass_cache;
+    }
     render_area.width = (std::min)(render_area.width, width);
     render_area.height = (std::min)(render_area.height, height);
 
@@ -2577,6 +2732,19 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         .height = render_area.height,
         .layers = static_cast<u32>((std::max)(num_layers, 1)),
     });
+}
+
+VkRenderPass Framebuffer::RenderPass(u32 feedback_loop_mask) const {
+    if (feedback_loop_mask == 0 || !render_pass_cache) {
+        return renderpass;
+    }
+    if (feedback_loop_mask != feedback_loop_renderpass_mask) {
+        RenderPassKey key{renderpass_key};
+        key.feedback_loop_mask = feedback_loop_mask;
+        feedback_loop_renderpass = render_pass_cache->Get(key);
+        feedback_loop_renderpass_mask = feedback_loop_mask;
+    }
+    return feedback_loop_renderpass;
 }
 
 void TextureCacheRuntime::AccelerateImageUpload(

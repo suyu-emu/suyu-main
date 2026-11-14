@@ -42,6 +42,8 @@ enum class ImageFlagBits : u32 {
 
     AsynchronousDecode = 1 << 16,
     IsDecoding = 1 << 17, ///< Is currently being decoded asynchronously.
+
+    FeedbackLoopSafe = 1 << 18, ///< Sampling from it while drawing to it needs no care
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -103,6 +105,11 @@ struct ImageBase {
 
     u64 modification_tick = 0;
     size_t lru_index = SIZE_MAX;
+
+    /// The frame after the last one in which a draw sampled from it and wrote to it
+    u64 feedback_loop_tick = 0;
+    /// Goes up with the frames in which that happens and down with those in which it does not
+    u32 feedback_loop_score = 0;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

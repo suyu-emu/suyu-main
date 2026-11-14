@@ -170,8 +170,27 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
-    /// Handle feedback loops during draws.
-    void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+    /// An image is made safe to sample from while it is drawn to when its score reaches this:
+    /// it gains two in a frame in which that happens and loses one in a frame in which it does
+    /// not
+    static constexpr u32 FEEDBACK_LOOP_SCORE_TO_SETTLE = 8;
+    /// Frames without it after which the image goes back to how it was
+    static constexpr u64 FEEDBACK_LOOP_FRAMES_TO_FORGET = 600;
+
+    /// Handle feedback loops during draws. With color_targets, also works out which color targets
+    /// the draw samples from.
+    void CheckFeedbackLoop(std::span<const ImageViewInOut> views, bool color_targets = false);
+
+    /// Color targets the draw last checked samples from, as a mask of their indices
+    [[nodiscard]] u32 SampledColorTargets() const noexcept {
+        return sampled_color_targets;
+    }
+
+    /// Takes note of the draw last checked writing to these color targets
+    void NoteFeedbackLoops(u32 written_targets);
+
+    /// Color targets the current state writes to, as a mask of their indices
+    [[nodiscard]] u32 WrittenColorTargets() const noexcept;
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
@@ -443,6 +462,13 @@ private:
     u64 last_feedback_loop_serial = 0;
     u64 last_feedback_texture_serial = 0;
     bool last_feedback_loop_result = false;
+    u32 sampled_color_targets = 0;
+    /// The same of images that are safe to sample from while they are drawn to
+    u32 sampled_safe_color_targets = 0;
+    /// Images to make safe to sample from as render targets when the frame ends, and those
+    /// that have been
+    std::vector<ImageId> feedback_loop_images;
+    std::vector<ImageId> feedback_loop_safe_images;
     FramebufferId last_framebuffer_id{};
     u64 last_framebuffer_serial = 0;
 

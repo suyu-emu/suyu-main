@@ -176,6 +176,31 @@ void TextureCache<P>::TickFrame() {
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+    if constexpr (requires { runtime.SetFeedbackLoopSafe(slot_images[ImageId{}], true); }) {
+        for (const ImageId image_id : feedback_loop_images) {
+            Image& image = slot_images[image_id];
+            if (runtime.SetFeedbackLoopSafe(image, true)) {
+                image.flags |= ImageFlagBits::FeedbackLoopSafe;
+                feedback_loop_safe_images.push_back(image_id);
+                // Its views are of the image it had
+                InvalidateScale(image);
+            }
+        }
+        if ((frame_tick & 63) == 0) {
+            std::erase_if(feedback_loop_safe_images, [this](ImageId image_id) {
+                Image& image = slot_images[image_id];
+                if (frame_tick < image.feedback_loop_tick + FEEDBACK_LOOP_FRAMES_TO_FORGET ||
+                    !runtime.SetFeedbackLoopSafe(image, false)) {
+                    return false;
+                }
+                image.flags &= ~ImageFlagBits::FeedbackLoopSafe;
+                image.feedback_loop_score = 0;
+                InvalidateScale(image);
+                return true;
+            });
+        }
+    }
+    feedback_loop_images.clear();
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
@@ -238,67 +263,124 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
-void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
-    if (!Settings::values.barrier_feedback_loops.GetValue()) {
+void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views, bool color_targets) {
+    const bool use_barriers = Settings::values.barrier_feedback_loops.GetValue();
+    if (!use_barriers && !color_targets) {
         return;
     }
-
-    if (render_targets_serial == last_feedback_loop_serial &&
-        texture_bindings_serial == last_feedback_texture_serial) {
+    // The serials do not change with the textures a draw samples from, so what they keep is of no
+    // use for the color targets: those are worked out for every draw
+    const bool is_cached = render_targets_serial == last_feedback_loop_serial &&
+                           texture_bindings_serial == last_feedback_texture_serial;
+    if (is_cached && !color_targets) {
         if (last_feedback_loop_result) {
             runtime.BarrierFeedbackLoop();
         }
         return;
     }
+    sampled_color_targets = 0;
+    sampled_safe_color_targets = 0;
+    bool depth_loop = false;
 
-    if (rt_active_mask == 0) {
-        last_feedback_loop_serial = render_targets_serial;
-        last_feedback_texture_serial = texture_bindings_serial;
-        last_feedback_loop_result = false;
-        return;
-    }
     const u32 depth_bit = 1u << NUM_RT;
     const bool depth_active = (rt_active_mask & depth_bit) != 0;
 
-    const bool requires_barrier = [&] {
-        for (const auto& view : views) {
-            if (!view.id) {
+    for (const auto& view : views) {
+        if (!view.id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[view.id];
+        const ImageId view_image_id = image_view.image_id;
+
+        bool is_color_target = false;
+        for (size_t i = 0; i < NUM_RT; ++i) {
+            if ((rt_active_mask & (1u << i)) == 0 || view_image_id != rt_image_id[i]) {
                 continue;
             }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
+            is_color_target = true;
+            if (!color_targets) {
+                break;
             }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
+            const ImageBase& image = slot_images[view_image_id];
+            // Sampling other levels or layers of the image than the ones drawn to is no loop.
+            // A view of a 3D image covers every slice, whatever its layers say.
+            const SubresourceRange& sampled = image_view.range;
+            const SubresourceRange& target =
+                slot_image_views[render_targets.color_buffer_ids[i]].range;
+            const bool shares_levels =
+                sampled.base.level < target.base.level + target.extent.levels &&
+                target.base.level < sampled.base.level + sampled.extent.levels;
+            const bool shares_layers =
+                image.info.type == ImageType::e3D ||
+                (sampled.base.layer < target.base.layer + target.extent.layers &&
+                 target.base.layer < sampled.base.layer + sampled.extent.layers);
+            if (!shares_levels || !shares_layers) {
                 continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
             }
-            if (depth_active && view_image_id == rt_depth_image_id) {
-                return true;
+            if (True(image.flags & ImageFlagBits::FeedbackLoopSafe)) {
+                sampled_safe_color_targets |= 1u << i;
+            } else {
+                sampled_color_targets |= 1u << i;
             }
         }
-
-        return false;
-    }();
-
-    last_feedback_loop_serial = render_targets_serial;
-    last_feedback_texture_serial = texture_bindings_serial;
-    last_feedback_loop_result = requires_barrier;
-    if (requires_barrier) {
+        if (is_color_target) {
+            continue;
+        }
+        if (depth_active && view.id != render_targets.depth_buffer_id &&
+            view_image_id == rt_depth_image_id) {
+            depth_loop = true;
+        }
+    }
+    if (!is_cached) {
+        last_feedback_loop_serial = render_targets_serial;
+        last_feedback_texture_serial = texture_bindings_serial;
+        last_feedback_loop_result = depth_loop;
+    }
+    if (use_barriers && last_feedback_loop_result) {
         runtime.BarrierFeedbackLoop();
     }
+}
+
+template <class P>
+void TextureCache<P>::NoteFeedbackLoops(u32 written_targets) {
+    const u32 loops = (sampled_color_targets | sampled_safe_color_targets) & written_targets;
+    for (size_t i = 0; (loops >> i) != 0; ++i) {
+        if (((loops >> i) & 1) == 0) {
+            continue;
+        }
+        const ImageId image_id = rt_image_id[i];
+        ImageBase& image = slot_images[image_id];
+        if (image.feedback_loop_tick == frame_tick + 1) {
+            // Not the first time in this frame
+            continue;
+        }
+        const u64 quiet_frames = image.feedback_loop_tick == 0
+                                     ? FEEDBACK_LOOP_SCORE_TO_SETTLE
+                                     : frame_tick - image.feedback_loop_tick;
+        const u32 old_score = image.feedback_loop_score;
+        const u32 score =
+            (std::min)(static_cast<u32>(old_score > quiet_frames ? old_score - quiet_frames : 0) + 2,
+                       FEEDBACK_LOOP_SCORE_TO_SETTLE * 2);
+        image.feedback_loop_score = score;
+        image.feedback_loop_tick = frame_tick + 1;
+        if (False(image.flags & ImageFlagBits::FeedbackLoopSafe) &&
+            old_score < FEEDBACK_LOOP_SCORE_TO_SETTLE && score >= FEEDBACK_LOOP_SCORE_TO_SETTLE) {
+            feedback_loop_images.push_back(image_id);
+        }
+    }
+}
+
+template <class P>
+u32 TextureCache<P>::WrittenColorTargets() const noexcept {
+    const auto& regs = maxwell3d->regs;
+    u32 written = 0;
+    for (size_t i = 0; i < NUM_RT; ++i) {
+        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : i];
+        if (mask.R || mask.G || mask.B || mask.A) {
+            written |= 1u << i;
+        }
+    }
+    return written;
 }
 
 template <class P>
@@ -2394,6 +2476,8 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
+    std::erase(feedback_loop_images, image_id);
+    std::erase(feedback_loop_safe_images, image_id);
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }

@@ -286,6 +286,8 @@ private:
     u32 attribute_handle{};
     bool uses_attribute_handle{};
     bool fragment_has_color0_output{};
+    /// Color targets the fragment shader has an output for, as a mask of their indices
+    u32 fragment_color_outputs{};
     u64 layout_signature{};
     bool precompile_only{};
 
