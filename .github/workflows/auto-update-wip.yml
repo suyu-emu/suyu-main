@@ -1,0 +1,25 @@
+name: Auto Update (WIP)
+
+# Work-in-progress auto-update checker.
+# Checks for new releases and creates update PRs automatically.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-update:
+    name: Check for updates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check for new releases
+        run: echo "Auto-update WIP - checking for new releases"
+      - name: Create update PR
+        run: echo "Auto-update WIP - would create PR here"
