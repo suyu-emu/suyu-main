@@ -90,6 +90,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Install exact SDK and native build tools
         run: |
@@ -232,4 +234,3 @@ jobs:
           gh release edit "$TAG" --repo "$GH_REPO" \
             --draft=false --prerelease --latest=false
           printf '### Nightly published\n\nhttps://github.com/%s/releases/tag/%s\n' "$GH_REPO" "$TAG" >> "$GITHUB_STEP_SUMMARY"
-          
