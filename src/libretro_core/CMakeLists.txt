@@ -22,6 +22,13 @@ set_target_properties(suyu_libretro PROPERTIES
     OUTPUT_NAME "suyu_libretro"
 )
 
+# Where a frontend that builds its cores, such as Kodi's game add-ons, looks for
+# them
+install(TARGETS suyu_libretro
+    LIBRARY DESTINATION lib/libretro
+    RUNTIME DESTINATION lib/libretro
+)
+
 create_target_directory_groups(suyu_libretro)
 
 if (NOT ANDROID)
