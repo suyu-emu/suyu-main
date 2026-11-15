@@ -50,7 +50,7 @@ Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improve
 ## Status
 
 **v0.1.4 corrects NVIDIA pipeline-library rendering and macOS character geometry**,
-following v14.0.1. Versions use major.minor.patch numbering. Official packages are
+following v0.1.4. Versions use major.minor.patch numbering. Official packages are
 built by the [tagged release workflow](https://github.com/suyu-emu/suyu-main/actions/workflows/release.yml),
 which checks platform builds and final package contents before publishing.
 
@@ -138,7 +138,7 @@ observations from separate functional sessions, not a controlled benchmark.
 Fast GPU Time remains off by default. This MoltenVK driver does not support
 graphics pipeline libraries, so requests use the normal pipeline fallback.
 
-### v14.0.1 functional observations
+### v0.1.4 functional observations
 
 These Windows Static opening sessions used a Ryzen 9 9950X3D and Radeon RX 9070 XT
 (AMD driver 2.0.395), with pipeline libraries off. These were functional playtests,
@@ -184,7 +184,7 @@ comparisons remain areas for further work.
 ## Changes in recent updates
 
 v0.1.4 fixes corrupted NVIDIA frames when pipeline libraries are enabled and
-stretched character geometry on macOS MoltenVK. v14.0.1 adds safer graphics
+stretched character geometry on macOS MoltenVK. v0.1.4 adds safer graphics
 defaults, complete advanced graphics controls and a working Fast GPU Time switch.
 v0.0.14 fixed startup/export-close crashes and Source
 exports with complex title names, corrected release version display, and added
