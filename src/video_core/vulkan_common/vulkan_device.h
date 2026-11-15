@@ -50,6 +50,8 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 // Define all features which may be used by the implementation and require an extension here.
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
+    FEATURE(EXT, AttachmentFeedbackLoopLayout, ATTACHMENT_FEEDBACK_LOOP_LAYOUT,                    \
+            attachment_feedback_loop_layout)                                                       \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
     FEATURE(EXT, ColorWriteEnable, COLOR_WRITE_ENABLE, color_write_enable)                         \
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
@@ -60,6 +62,8 @@ VK_DEFINE_HANDLE(VmaAllocator)
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
     FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY, graphics_pipeline_library)   \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
+    FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL,                               \
+            image_compression_control)                                                             \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
@@ -555,6 +559,21 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_EXT_depth_range_unrestricted.
     bool IsExtDepthRangeUnrestrictedSupported() const {
         return extensions.depth_range_unrestricted;
+    }
+
+    /// Returns true if draws that sample from one of their color buffers need care: the writes
+    /// made to it have to be flushed first, and a draw that also writes to it needs it in the
+    /// feedback loop layout.
+    bool NeedsFeedbackLoopLayout() const {
+        // RADV keeps color images compressed in the general layout, and what it samples from a
+        // compressed image it is rendering to is garbage
+        return extensions.attachment_feedback_loop_layout &&
+               GetDriverID() == VK_DRIVER_ID_MESA_RADV;
+    }
+
+    /// Returns true if the device supports VK_EXT_image_compression_control.
+    bool IsExtImageCompressionControlSupported() const {
+        return extensions.image_compression_control;
     }
 
     /// Returns true if the device supports VK_EXT_depth_clip_control.

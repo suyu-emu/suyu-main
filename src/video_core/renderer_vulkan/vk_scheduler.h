@@ -56,8 +56,10 @@ public:
     /// Sends currently recorded work to the worker thread.
     void DispatchWork();
 
-    /// Requests to begin a renderpass.
-    void RequestRenderpass(const Framebuffer* framebuffer);
+    /// Requests to begin a renderpass. The draws that follow sample from the color buffers in
+    /// sampled_targets and may write to those in written_targets.
+    void RequestRenderpass(const Framebuffer* framebuffer, u32 sampled_targets = 0,
+                           u32 written_targets = ~0u);
 
     /// Requests the current execution context to be able to execute operations only allowed outside
     /// of a renderpass.
@@ -245,6 +247,10 @@ private:
         VkRenderPass renderpass{};
         VkFramebuffer framebuffer{};
         VkExtent2D render_area = {0, 0};
+        /// Color buffers the renderpass has in the feedback loop layout
+        u32 feedback_loops = 0;
+        /// Color buffers that may have been written to since the renderpass began
+        u32 written_targets = 0;
         GraphicsPipeline* graphics_pipeline = nullptr;
         bool is_rescaling = false;
         bool rescaling_defined = false;

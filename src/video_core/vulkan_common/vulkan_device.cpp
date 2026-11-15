@@ -1238,6 +1238,20 @@ void Device::RemoveUnsuitableExtensions() {
                                        features.border_color_swizzle,
                                        VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME);
 
+    // VK_EXT_attachment_feedback_loop_layout
+    extensions.attachment_feedback_loop_layout =
+        features.attachment_feedback_loop_layout.attachmentFeedbackLoopLayout;
+    RemoveExtensionFeatureIfUnsuitable(extensions.attachment_feedback_loop_layout,
+                                       features.attachment_feedback_loop_layout,
+                                       VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+
+    // VK_EXT_image_compression_control
+    extensions.image_compression_control =
+        features.image_compression_control.imageCompressionControl;
+    RemoveExtensionFeatureIfUnsuitable(extensions.image_compression_control,
+                                       features.image_compression_control,
+                                       VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);
+
     // VK_EXT_depth_bias_control
     extensions.depth_bias_control =
         features.depth_bias_control.depthBiasControl &&
