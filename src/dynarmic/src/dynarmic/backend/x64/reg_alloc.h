@@ -64,7 +64,21 @@ public:
         ASSERT(size_t(accumulated_uses) + current_references <= size_t(total_uses));
     }
     void ReleaseOne() noexcept;
-    void ReleaseAll() noexcept;
+    void ReleaseAll() noexcept {
+        DEBUG_ASSERT(size_t(accumulated_uses) + current_references < (std::numeric_limits<decltype(accumulated_uses)>::max)());
+        accumulated_uses += current_references;
+        current_references = 0;
+        is_set_last_use = false;
+        if (total_uses == accumulated_uses) {
+            values.clear();
+            accumulated_uses = 0;
+            total_uses = 0;
+            max_bit_width = 0;
+        }
+
+        is_being_used_count = 0;
+        is_scratch = false;
+    }
     constexpr size_t GetMaxBitWidth() const noexcept { return 1 << max_bit_width; }
     void AddValue(HostLoc loc, IR::Inst* inst) noexcept;
     /// Checks if the given instruction is in our values set
