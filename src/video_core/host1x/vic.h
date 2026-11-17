@@ -616,6 +616,10 @@ private:
     void ReadInterlacedY8__V8U8_N420(const SlotStruct& slot, std::span<const PlaneOffsets> offsets, std::shared_ptr<const FFmpeg::Frame> frame, bool planar, bool top_field) noexcept;
     void ReadY8__V8U8_N420(const SlotStruct& slot, std::span<const PlaneOffsets> offsets, std::shared_ptr<const FFmpeg::Frame> frame, bool planar) noexcept;
     void WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) noexcept;
+    /// A single progressive NV12/YUV420 frame shown whole at its own size into a pitch-linear
+    /// NV12 surface needs no conversion: its planes are copied as they are
+    bool CanWriteDirect(const ConfigStruct& config, const SlotStruct& slot, const FFmpeg::Frame& frame) const noexcept;
+    void WriteDirectY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config, const FFmpeg::Frame& frame) noexcept;
     void WriteABGR(const OutputSurfaceConfig& output_surface_config, VideoPixelFormat format) noexcept;
 
     VicRegisters regs{};

@@ -898,7 +898,8 @@ bool Device::ShouldBoostClocks() const {
 }
 
 bool Device::HasTimelineSemaphore() const {
-    if (GetDriverID() == VK_DRIVER_ID_MESA_TURNIP) {
+    if (GetDriverID() == VK_DRIVER_ID_MESA_TURNIP &&
+        properties.properties.driverVersion < VK_MAKE_API_VERSION(0, 23, 2, 0)) {
         return false;
     }
     return features.timeline_semaphore.timelineSemaphore;
@@ -1237,6 +1238,20 @@ void Device::RemoveUnsuitableExtensions() {
                                        features.border_color_swizzle,
                                        VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME);
 
+    // VK_EXT_attachment_feedback_loop_layout
+    extensions.attachment_feedback_loop_layout =
+        features.attachment_feedback_loop_layout.attachmentFeedbackLoopLayout;
+    RemoveExtensionFeatureIfUnsuitable(extensions.attachment_feedback_loop_layout,
+                                       features.attachment_feedback_loop_layout,
+                                       VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+
+    // VK_EXT_image_compression_control
+    extensions.image_compression_control =
+        features.image_compression_control.imageCompressionControl;
+    RemoveExtensionFeatureIfUnsuitable(extensions.image_compression_control,
+                                       features.image_compression_control,
+                                       VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);
+
     // VK_EXT_depth_bias_control
     extensions.depth_bias_control =
         features.depth_bias_control.depthBiasControl &&
@@ -1523,9 +1538,16 @@ void Device::CollectPhysicalMemoryInfo() {
         device_access_memory += mem_properties.memoryHeaps[element].size;
     }
     if (is_integrated) {
+        // An integrated GPU's memory is the system's: take what is left with 8 GiB set aside for
+        // everything else, within limits, and no less than a system with little memory gets
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
-        const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
-        device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
+        const bool is_aggressive =
+            Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive;
+        const u64 max_memory = is_aggressive ? 12_GiB : 8_GiB;
+        const u64 min_memory = is_aggressive ? 6_GiB : 4_GiB;
+        device_access_memory = static_cast<u64>(
+            std::max<s64>(std::min<s64>(available_memory - 8_GiB, max_memory),
+                          std::min<s64>(local_memory, min_memory)));
     } else {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;

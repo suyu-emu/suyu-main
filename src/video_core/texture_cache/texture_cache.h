@@ -176,6 +176,47 @@ void TextureCache<P>::TickFrame() {
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+    if constexpr (requires { runtime.SetFeedbackLoopSafe(slot_images[ImageId{}], true); }) {
+        const auto make_safe = [this](ImageId image_id) {
+            Image& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::FeedbackLoopSafe)) {
+                return true;
+            }
+            if (!runtime.SetFeedbackLoopSafe(image, true)) {
+                return false;
+            }
+            image.flags |= ImageFlagBits::FeedbackLoopSafe;
+            feedback_loop_safe_images.push_back(image_id);
+            // Its views are of the image it had
+            InvalidateScale(image);
+            return true;
+        };
+        for (const ImageId image_id : feedback_loop_images) {
+            make_safe(image_id);
+        }
+        // The uncompressed image has every view format
+        for (const ImageId image_id : integer_view_images) {
+            if (!make_safe(image_id)) {
+                slot_images[image_id].flags &= ~ImageFlagBits::IntegerViews;
+            }
+        }
+        if ((frame_tick & 63) == 0) {
+            std::erase_if(feedback_loop_safe_images, [this](ImageId image_id) {
+                Image& image = slot_images[image_id];
+                if (frame_tick < image.feedback_loop_tick + FEEDBACK_LOOP_FRAMES_TO_FORGET ||
+                    True(image.flags & ImageFlagBits::IntegerViews) ||
+                    !runtime.SetFeedbackLoopSafe(image, false)) {
+                    return false;
+                }
+                image.flags &= ~ImageFlagBits::FeedbackLoopSafe;
+                image.feedback_loop_score = 0;
+                InvalidateScale(image);
+                return true;
+            });
+        }
+    }
+    feedback_loop_images.clear();
+    integer_view_images.clear();
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
@@ -238,67 +279,140 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 }
 
 template <class P>
-void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
-    if (!Settings::values.barrier_feedback_loops.GetValue()) {
+void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views, bool color_targets) {
+    const bool use_barriers = Settings::values.barrier_feedback_loops.GetValue();
+    if (!use_barriers && !color_targets) {
         return;
     }
-
-    if (render_targets_serial == last_feedback_loop_serial &&
-        texture_bindings_serial == last_feedback_texture_serial) {
+    // The serials do not change with the textures a draw samples from, so what they keep is of no
+    // use for the color targets: those are worked out for every draw
+    const bool is_cached = render_targets_serial == last_feedback_loop_serial &&
+                           texture_bindings_serial == last_feedback_texture_serial;
+    if (is_cached && !color_targets) {
         if (last_feedback_loop_result) {
             runtime.BarrierFeedbackLoop();
         }
         return;
     }
+    sampled_color_targets = 0;
+    sampled_safe_color_targets = 0;
+    bool depth_loop = false;
 
-    if (rt_active_mask == 0) {
-        last_feedback_loop_serial = render_targets_serial;
-        last_feedback_texture_serial = texture_bindings_serial;
-        last_feedback_loop_result = false;
-        return;
-    }
     const u32 depth_bit = 1u << NUM_RT;
     const bool depth_active = (rt_active_mask & depth_bit) != 0;
 
-    const bool requires_barrier = [&] {
-        for (const auto& view : views) {
-            if (!view.id) {
+    for (const auto& view : views) {
+        if (!view.id) {
+            continue;
+        }
+        const ImageViewBase& image_view = slot_image_views[view.id];
+        const ImageId view_image_id = image_view.image_id;
+
+        bool is_color_target = false;
+        for (size_t i = 0; i < NUM_RT; ++i) {
+            if ((rt_active_mask & (1u << i)) == 0 || view_image_id != rt_image_id[i]) {
                 continue;
             }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
+            is_color_target = true;
+            if (!color_targets) {
+                break;
             }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
+            const ImageBase& image = slot_images[view_image_id];
+            // Sampling other levels or layers of the image than the ones drawn to is no loop.
+            // A view of a 3D image covers every slice, whatever its layers say.
+            const SubresourceRange& sampled = image_view.range;
+            const SubresourceRange& target =
+                slot_image_views[render_targets.color_buffer_ids[i]].range;
+            const bool shares_levels =
+                sampled.base.level < target.base.level + target.extent.levels &&
+                target.base.level < sampled.base.level + sampled.extent.levels;
+            const bool shares_layers =
+                image.info.type == ImageType::e3D ||
+                (sampled.base.layer < target.base.layer + target.extent.layers &&
+                 target.base.layer < sampled.base.layer + sampled.extent.layers);
+            if (!shares_levels || !shares_layers) {
                 continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
             }
-            if (depth_active && view_image_id == rt_depth_image_id) {
-                return true;
+            if (True(image.flags & ImageFlagBits::FeedbackLoopSafe)) {
+                sampled_safe_color_targets |= 1u << i;
+            } else {
+                sampled_color_targets |= 1u << i;
             }
         }
-
-        return false;
-    }();
-
-    last_feedback_loop_serial = render_targets_serial;
-    last_feedback_texture_serial = texture_bindings_serial;
-    last_feedback_loop_result = requires_barrier;
-    if (requires_barrier) {
+        if (is_color_target) {
+            continue;
+        }
+        if (depth_active && view.id != render_targets.depth_buffer_id &&
+            view_image_id == rt_depth_image_id) {
+            depth_loop = true;
+        }
+    }
+    if (!is_cached) {
+        last_feedback_loop_serial = render_targets_serial;
+        last_feedback_texture_serial = texture_bindings_serial;
+        last_feedback_loop_result = depth_loop;
+    }
+    if (use_barriers && last_feedback_loop_result) {
         runtime.BarrierFeedbackLoop();
     }
+}
+
+template <class P>
+void TextureCache<P>::NoteFeedbackLoops(u32 written_targets) {
+    const u32 loops = (sampled_color_targets | sampled_safe_color_targets) & written_targets;
+    for (size_t i = 0; (loops >> i) != 0; ++i) {
+        if (((loops >> i) & 1) == 0) {
+            continue;
+        }
+        const ImageId image_id = rt_image_id[i];
+        ImageBase& image = slot_images[image_id];
+        if (image.feedback_loop_tick == frame_tick + 1) {
+            // Not the first time in this frame
+            continue;
+        }
+        const u64 quiet_frames = image.feedback_loop_tick == 0
+                                     ? FEEDBACK_LOOP_SCORE_TO_SETTLE
+                                     : frame_tick - image.feedback_loop_tick;
+        const u32 old_score = image.feedback_loop_score;
+        const u32 score =
+            (std::min)(static_cast<u32>(old_score > quiet_frames ? old_score - quiet_frames : 0) + 2,
+                       FEEDBACK_LOOP_SCORE_TO_SETTLE * 2);
+        image.feedback_loop_score = score;
+        image.feedback_loop_tick = frame_tick + 1;
+        if (False(image.flags & ImageFlagBits::FeedbackLoopSafe) &&
+            old_score < FEEDBACK_LOOP_SCORE_TO_SETTLE && score >= FEEDBACK_LOOP_SCORE_TO_SETTLE) {
+            feedback_loop_images.push_back(image_id);
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteIntegerStorageView(ImageId image_id) {
+    if constexpr (requires { runtime.SeparatesAtomicViewFormats(); }) {
+        ImageBase& image = slot_images[image_id];
+        // A rescaled image is drawn from its scaled copy, which has every view format
+        if (!runtime.SeparatesAtomicViewFormats() ||
+            True(image.flags & (ImageFlagBits::IntegerViews | ImageFlagBits::Rescaled)) ||
+            image.info.format == PixelFormat::R32_UINT ||
+            image.info.format == PixelFormat::R32_SINT) {
+            return;
+        }
+        image.flags |= ImageFlagBits::IntegerViews;
+        integer_view_images.push_back(image_id);
+    }
+}
+
+template <class P>
+u32 TextureCache<P>::WrittenColorTargets() const noexcept {
+    const auto& regs = maxwell3d->regs;
+    u32 written = 0;
+    for (size_t i = 0; i < NUM_RT; ++i) {
+        const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : i];
+        if (mask.R || mask.G || mask.B || mask.A) {
+            written |= 1u << i;
+        }
+    }
+    return written;
 }
 
 template <class P>
@@ -1564,7 +1678,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
             return;
         }
-        constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        auto options = RelaxedOptions::Size | RelaxedOptions::Format;
+        if (gpu_addr == overlap.gpu_addr && CanAliasDifferentSamples(new_info, overlap.info)) {
+            options |= RelaxedOptions::Samples;
+        }
         const ImageBase new_image_base(new_info, gpu_addr, cpu_addr);
         if (IsSubresource(new_info, overlap, gpu_addr, options, broken_views, native_bgr)) {
             join_left_aliased_ids.push_back(overlap_id);
@@ -1691,7 +1808,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
-            if (!overlap.IsSafeDownload()) {
+            const bool can_copy_msaa = CanAliasDifferentSamples(new_image.info, overlap.info) &&
+                                      True(overlap.flags & ImageFlagBits::GpuModified) &&
+                                      False(overlap.flags & ImageFlagBits::CpuModified);
+            if (!can_copy_msaa && !overlap.IsSafeDownload()) {
                 continue;
             }
             const auto alias_pointer = join_alias_indices.find(copy_object.id);
@@ -1751,18 +1871,18 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
         src_id = FindImage(src_info, src_addr, try_options);
         dst_id = FindImage(dst_info, dst_addr, try_options);
         if (!copy.must_accelerate) {
-            do {
-                if (!src_id && !dst_id) {
-                    return std::nullopt;
+            // A render target kept at its surface clip's size doesn't match a surface declared
+            // with the aligned size, and is still to be copied on the GPU
+            const auto is_gpu_modified = [&](ImageId id, const ImageInfo& info, GPUVAddr addr) {
+                if (!id && info.type != ImageType::Linear) {
+                    id = FindImage(info, addr, try_options | RelaxedOptions::Size);
                 }
-                if (src_id && True(slot_images[src_id].flags & ImageFlagBits::GpuModified)) {
-                    break;
-                }
-                if (dst_id && True(slot_images[dst_id].flags & ImageFlagBits::GpuModified)) {
-                    break;
-                }
+                return id && True(slot_images[id].flags & ImageFlagBits::GpuModified);
+            };
+            if (!is_gpu_modified(src_id, src_info, src_addr) &&
+                !is_gpu_modified(dst_id, dst_info, dst_addr)) {
                 return std::nullopt;
-            } while (false);
+            }
         }
         const ImageBase* const src_image = src_id ? &slot_images[src_id] : nullptr;
         if (src_image && src_image->info.num_samples > 1) {
@@ -1971,12 +2091,46 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
 }
 
 template <class P>
+ImageId TextureCache<P>::FindOrInsertRenderTarget(const ImageInfo& info, GPUVAddr gpu_addr) {
+    // NVN declares a render target with the size its block linear layout is aligned to and leaves
+    // the real size to the surface clip, while a texture over the same memory carries the real
+    // size. Draw to the image of the real size, so that the two are one image and not aliases
+    // copied into each other between draws.
+    const auto& clip = maxwell3d->regs.surface_clip;
+    ImageInfo clipped = info;
+    clipped.size.width = clip.width;
+    clipped.size.height = clip.height;
+    const bool is_smaller =
+        clip.width <= info.size.width && clip.height <= info.size.height &&
+        (clip.width != info.size.width || clip.height != info.size.height);
+    if (info.type != ImageType::e2D || info.num_samples != 1 || clip.x != 0 || clip.y != 0 ||
+        clip.width == 0 || clip.height == 0 || !is_smaller ||
+        !IsBlockLinearSizeCompatible(info, clipped, 0, 0, false)) {
+        return FindOrInsertImage(info, gpu_addr);
+    }
+    const ImageId clipped_id = FindImage(clipped, gpu_addr, RelaxedOptions{});
+    const ImageId declared_id = FindImage(info, gpu_addr, RelaxedOptions{});
+    if (!clipped_id) {
+        return declared_id ? declared_id : InsertImage(clipped, gpu_addr, RelaxedOptions{});
+    }
+    if (declared_id && declared_id != clipped_id) {
+        // Keep to the declared size when that is the one textures sample
+        const bool declared_sampled = True(slot_images[declared_id].flags & ImageFlagBits::Strong);
+        const bool clipped_sampled = True(slot_images[clipped_id].flags & ImageFlagBits::Strong);
+        if (declared_sampled && !clipped_sampled) {
+            return declared_id;
+        }
+    }
+    return clipped_id;
+}
+
+template <class P>
 ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr) {
     ImageId image_id{};
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
-        image_id = FindOrInsertImage(info, gpu_addr);
+        image_id = FindOrInsertRenderTarget(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
@@ -2354,6 +2508,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
+    std::erase(feedback_loop_images, image_id);
+    std::erase(feedback_loop_safe_images, image_id);
+    std::erase(integer_view_images, image_id);
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
@@ -2592,6 +2749,9 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
+    if (CanAliasDifferentSamples(dst.info, src.info)) {
+        return runtime.CopyImageMSAA(dst, src, copies);
+    }
     if (src_format_type == dst_format_type) {
         if constexpr (HAS_EMULATED_COPIES) {
             if (!runtime.CanImageBeCopied(dst, src)) {
@@ -2711,9 +2871,42 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     const Extent3D size = image_view.size;
     const auto& regs = maxwell3d->regs;
     const auto& scissor = regs.scissor_test[0];
+    // Only the attachment and aspects targeted by this clear lose their previous contents.
+    // Invalidating anything else skips alias synchronization and drops data written through
+    // an alias (e.g. split-screen HUDs drawn into a non-MSAA view of an MSAA target).
+    const auto& clear = regs.clear_surface;
+    if (id == render_targets.depth_buffer_id) {
+        if (!clear.Z) {
+            return false;
+        }
+        const auto surface_type = VideoCore::Surface::GetFormatType(image.info.format);
+        if (surface_type == VideoCore::Surface::SurfaceType::DepthStencil && !clear.S) {
+            return false;
+        }
+    } else {
+        if (!(clear.R && clear.G && clear.B && clear.A)) {
+            return false;
+        }
+        if (clear.RT >= NUM_RT || render_targets.color_buffer_ids[clear.RT] != id) {
+            return false;
+        }
+    }
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
+    }
+    if (regs.clear_control.use_clear_rect) {
+        const auto& rect = regs.clear_rect;
+        if (rect.x_min != 0 || rect.y_min != 0 || rect.x_max < size.width ||
+            rect.y_max < size.height) {
+            return false;
+        }
+    }
+    if (regs.clear_control.use_viewport_clip0) {
+        const auto& vp = regs.viewports[0];
+        if (vp.x != 0 || vp.y != 0 || vp.width < size.width || vp.height < size.height) {
+            return false;
+        }
     }
     if (regs.clear_control.use_scissor == 0) {
         // If scissor testing is disabled, the clear is always full

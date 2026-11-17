@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <charconv>
 #include <chrono>
+#include <stop_token>
 #include <cmath>
 #include <fstream>
 #include <memory>
@@ -65,7 +66,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
+#include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/drivers/tas_input.h"
 #include "input_common/main.h"
@@ -74,8 +77,12 @@
 #include "libretro_core/retro_emu_window.h"
 #include "suyu_cmd/explicit_update.h"
 #include "video_core/gpu.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/vulkan_common/vulkan_external.h"
+// After vulkan_external.h, which sets VK_NO_PROTOTYPES: the core types, no platform headers
+#include "libretro_core/libretro_vulkan.h"
 
 namespace {
 
@@ -106,6 +113,7 @@ bool HasUsableNcaHeaderKey() {
 
 std::unique_ptr<Core::System> g_system;
 std::unique_ptr<SuyuCli::ExplicitUpdateProvider> g_explicit_provider;
+std::unique_ptr<FileSys::ManualContentProvider> g_content_provider;
 std::unique_ptr<LibretroCore::RetroEmuWindow> g_emu_window;
 std::shared_ptr<InputCommon::InputSubsystem> g_input_subsystem;
 std::string g_game_path;
@@ -127,9 +135,18 @@ u64 g_presented_frame = 0;
 bool g_have_presented = false;
 unsigned g_perf_frontend_frames = 0;
 unsigned g_perf_unique_frames = 0;
+
+unsigned g_output_scale = 1;
+bool g_geometry_dirty = false;
+
 // False: suyu drives a host audio device directly (default, sounds correct).
 // True: samples are handed to the frontend via retro_audio_sample_batch.
 bool g_use_frontend_audio = false;
+// Set once RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK registration succeeds (see
+// retro_load_game()). When true, retro_run() leaves audio delivery to
+// FrontendAudioCallback() instead of doing it inline, since both draining the
+// same queue would just race pointlessly.
+bool g_audio_callback_registered = false;
 
 retro_environment_t g_environ_cb;
 retro_video_refresh_t g_video_cb;
@@ -140,6 +157,11 @@ retro_input_state_t g_input_state_cb;
 
 constexpr unsigned kFrameWidth = 1280;
 constexpr unsigned kFrameHeight = 720;
+constexpr unsigned kDockedFrameWidth = 1920;
+constexpr unsigned kDockedFrameHeight = 1080;
+// What the console sends its screen, or the TV when docked, before the output scale
+unsigned g_base_width = kFrameWidth;
+unsigned g_base_height = kFrameHeight;
 
 // System::Initialize() may decrypt firmware metadata. Make the frontend's
 // existing keys visible before that call, not after it has already tried to
@@ -231,6 +253,118 @@ void ShowPerfMessage(std::string text) {
         g_environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
     }
 }
+// Points a single suyu data directory at a subfolder of a frontend-provided
+// base directory, creating it first since Common::FS::SetSuyuPath silently
+// refuses to point at a path that doesn't exist yet (or isn't a directory).
+bool RedirectSuyuDir(Common::FS::SuyuPath suyu_path, const std::filesystem::path& base,
+                      const char* sub_dir) {
+    if (base.empty()) {
+        return false;
+    }
+    const auto target = base / sub_dir;
+    std::error_code ec;
+    std::filesystem::create_directories(target, ec);
+    if (ec) {
+        LOG_ERROR(Frontend, "libretro: failed to create {} ({})", target.string(), ec.message());
+        return false;
+    }
+    Common::FS::SetSuyuPath(suyu_path, target);
+    return true;
+}
+
+// Redirects suyu's persistent data out of %APPDATA%\suyu (or <retroarch>\user
+// in portable mode) and into the directories RetroArch itself hands the core:
+//   - RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY for config/keys/cache/logs
+//   - RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY for NAND/SDMC/saves/screenshots,
+//     so RetroArch's own save handling (per-core folders, backups, cloud
+//     sync, etc.) covers suyu's data the same way it covers any other core
+// Each is placed directly in the frontend-provided directory (e.g.
+// <system_directory>\config, <save_directory>\nand) with no extra "suyu"
+// subfolder, so per-core RetroArch overrides that already point
+// system_directory/save_directory somewhere suyu-specific (as set up in a
+// core override .cfg) land exactly where they say, with nothing extra
+// appended. If you share that base directory with another emulator, point
+// the override somewhere suyu-specific instead of relying on this code to
+// namespace it for you.
+// Controlled by the "suyu_use_frontend_dirs" core option, enabled by default.
+// Must run before anything (including keys import, below) touches
+// Common::FS::GetSuyuPath, or those uses will already have grabbed the old,
+// non-redirected paths.
+void RedirectSuyuPathsToFrontend() {
+    if (!g_environ_cb) {
+        return;
+    }
+
+    struct retro_variable var {
+        "suyu_use_frontend_dirs", nullptr
+    };
+    // Frontends make the declared default available as soon as
+    // RETRO_ENVIRONMENT_SET_VARIABLES has run, i.e. before retro_init() is
+    // even called, so this reads correctly on a completely fresh install too.
+    bool use_frontend_dirs = true;
+    if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+        use_frontend_dirs = std::strcmp(var.value, "Disabled") != 0;
+    }
+    if (!use_frontend_dirs) {
+        LOG_INFO(Frontend, "libretro: suyu_use_frontend_dirs disabled, keeping default data location");
+        return;
+    }
+
+    const char* system_dir = nullptr;
+    const char* save_dir = nullptr;
+    g_environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
+    g_environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
+
+    const std::filesystem::path system_base =
+        (system_dir && *system_dir) ? std::filesystem::path(system_dir) : std::filesystem::path{};
+    // Some setups (e.g. RetroArch's "Save files in content directory") can
+    // report an empty save directory even though a system directory exists.
+    // Fall back to the system directory as the root for save-type data too,
+    // rather than silently reverting to %APPDATA% for just those folders.
+    const std::filesystem::path save_base =
+        (save_dir && *save_dir) ? std::filesystem::path(save_dir) : system_base;
+
+    if (system_base.empty()) {
+        LOG_WARNING(Frontend, "libretro: frontend gave no system directory; "
+                              "keeping suyu's default (%APPDATA%/portable) data location");
+        return;
+    }
+
+    using Common::FS::SuyuPath;
+
+    // Save-type data: goes under RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY.
+    RedirectSuyuDir(SuyuPath::NANDDir, save_base, "nand");
+    RedirectSuyuDir(SuyuPath::SaveDir, save_base, "nand"); // suyu aliases SaveDir to the NAND dir
+    RedirectSuyuDir(SuyuPath::SDMCDir, save_base, "sdmc");
+    RedirectSuyuDir(SuyuPath::ScreenshotsDir, save_base, "screenshots");
+    RedirectSuyuDir(SuyuPath::TASDir, save_base, "tas");
+    RedirectSuyuDir(SuyuPath::PlayTimeDir, save_base, "play_time");
+    RedirectSuyuDir(SuyuPath::AmiiboDir, save_base, "amiibo");
+    RedirectSuyuDir(SuyuPath::LoadDir, save_base, "load");
+    RedirectSuyuDir(SuyuPath::DumpDir, save_base, "dump");
+
+    // Fixed/system-type data: goes under RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY.
+    RedirectSuyuDir(SuyuPath::ConfigDir, system_base, "config");
+    RedirectSuyuDir(SuyuPath::KeysDir, system_base, "keys");
+    RedirectSuyuDir(SuyuPath::CacheDir, system_base, "cache");
+    RedirectSuyuDir(SuyuPath::ShaderDir, system_base, "cache/shader");
+    RedirectSuyuDir(SuyuPath::LogDir, system_base, "log");
+    RedirectSuyuDir(SuyuPath::CrashDumpsDir, system_base, "crash_dumps");
+
+    // Root path that a couple of rarely-used secondary subsystems read
+    // directly (a nested-libretro-core loader's default firmware directory,
+    // and the hactool integration helper's temp-extraction and tool-search
+    // paths). Pointed at the system directory itself, with no subfolder, so
+    // nothing is ever written under %APPDATA% even for these.
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(system_base, ec);
+        Common::FS::SetSuyuPath(SuyuPath::EdenDir, system_base);
+    }
+
+    LOG_INFO(Frontend, "libretro: redirected suyu data - system={} save={}", system_base.string(),
+              save_base.string());
+}
 
 } // namespace
 
@@ -248,12 +382,19 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     static const struct retro_variable vars[] = {
         // This headless readback window only implements Vulkan. Advertising
         // other renderers would claim an option that cannot take effect.
-        {"suyu_resolution", "Internal Resolution (reload content); 1x|2x|3x|4x"},
+        {"suyu_resolution", "Internal Resolution (reload content); 1x|0.25x|0.5x|0.75x|2x|3x|4x"},
         {"suyu_scaling_filter", "Window Adapting Filter (reload content); Bilinear|Bicubic|Lanczos|ScaleForce|FSR|NearestNeighbor"},
         {"suyu_anti_aliasing", "Anti-Aliasing (reload content); None|FXAA|SMAA"},
         {"suyu_cpu_accuracy", "CPU Accuracy (reload content); Auto|Accurate|Unsafe"},
         {"suyu_use_docked", "Docked Mode (reload content); Yes|No"},
         {"suyu_fastmem", "Fastmem (reload content); Enabled|Disabled"},
+        // Redirects suyu's data (NAND/SDMC/saves/config/keys/cache/logs) into
+        // RetroArch's own system/save directories instead of suyu's normal
+        // %APPDATA%\suyu (or <retroarch>\user in portable mode) location.
+        // Default is Enabled so the core behaves like other libretro cores
+        // out of the box; switch to Disabled to keep using a standalone
+        // suyu install's existing data instead.
+        {"suyu_use_frontend_dirs", "Use RetroArch System/Save Directories; Enabled|Disabled"},
         {"suyu_audio_output", "Audio Output (reload content); Host (direct)|Frontend (libretro)"},
         // suyu's own online play. RetroArch's netplay can't drive this core
         // (see retro_serialize_size), but suyu's room system tunnels the
@@ -276,6 +417,17 @@ RETRO_API void retro_set_environment(retro_environment_t cb) {
     // instead of being offered and then failing mid-session.
     uint64_t quirks = RETRO_SERIALIZATION_QUIRK_INCOMPLETE;
     cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
+
+    // Four players, each a Pro Controller or nothing; RetroArch lists these per
+    // port under Controls, and None takes a port's input away from the game
+    static const struct retro_controller_description pads[] = {
+        {"Pro Controller", RETRO_DEVICE_JOYPAD},
+        {"None", RETRO_DEVICE_NONE},
+    };
+    static const struct retro_controller_info ports[] = {
+        {pads, 2}, {pads, 2}, {pads, 2}, {pads, 2}, {nullptr, 0},
+    };
+    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) {
@@ -317,6 +469,11 @@ RETRO_API void retro_init() {
     Common::FS::SetAppDirectory(user_directory.string());
     Common::FS::CreateSuyuPaths();
 #endif
+    // Must happen before any Common::FS::GetSuyuPath() call (including the
+    // key-import block just below), or those calls will already have latched
+    // onto the old %APPDATA%/portable paths.
+    RedirectSuyuPathsToFrontend();
+  
     Common::Log::Initialize();
     Common::Log::Start();
 
@@ -373,6 +530,7 @@ RETRO_API void retro_deinit() {
     Network::Shutdown();
     g_system.reset();
     g_explicit_provider.reset();
+    g_content_provider.reset();
     g_emu_window.reset();
     if (g_input_subsystem) { g_input_subsystem->Shutdown(); g_input_subsystem.reset(); }
     Common::Log::Stop();
@@ -409,19 +567,36 @@ RETRO_API void retro_get_system_info(struct retro_system_info* info) {
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info) {
-    info->geometry.base_width = kFrameWidth;
-    info->geometry.base_height = kFrameHeight;
+    info->geometry.base_width = g_base_width;
+    info->geometry.base_height = g_base_height;
     // Allow up to 4x so raising the internal resolution option doesn't get
     // clamped back down to 720p by the frontend. RetroArch sizes its texture
     // from max_*, and a core may deliver anything up to it.
-    info->geometry.max_width = kFrameWidth * 4;
-    info->geometry.max_height = kFrameHeight * 4;
+    info->geometry.max_width = kDockedFrameWidth * 4;
+    info->geometry.max_height = kDockedFrameHeight * 4;
     info->geometry.aspect_ratio = static_cast<float>(kFrameWidth) / static_cast<float>(kFrameHeight);
     info->timing.fps = 60.0;
     info->timing.sample_rate = 48000.0;
 }
 
-RETRO_API void retro_set_controller_port_device(unsigned /*port*/, unsigned /*device*/) {}
+namespace {
+constexpr unsigned kMaxPlayers = 4;
+// What RetroArch has on each port: RETRO_DEVICE_JOYPAD or RETRO_DEVICE_NONE
+unsigned g_port_device[kMaxPlayers] = {RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD,
+                                       RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD};
+// Players 2-4 the core has connected. Player 1 is connected by suyu's own
+// defaults; the others are not, and connecting all of them at the start
+// would show every game four controllers whether or not anyone holds them.
+// So a player's controller is connected when its port is first used, as
+// plugging one in on the console, and disconnected when the port is set to None.
+bool g_player_connected[kMaxPlayers] = {};
+} // namespace
+
+RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) {
+    if (port < kMaxPlayers) {
+        g_port_device[port] = device == RETRO_DEVICE_NONE ? RETRO_DEVICE_NONE : RETRO_DEVICE_JOYPAD;
+    }
+}
 
 RETRO_API void retro_reset() {
     LOG_WARNING(Frontend, "libretro core: retro_reset() requested but not yet implemented "
@@ -452,7 +627,302 @@ constexpr RetroToVirtual kButtonMap[] = {
     {RETRO_DEVICE_ID_JOYPAD_LEFT, VB::ButtonLeft},
     {RETRO_DEVICE_ID_JOYPAD_RIGHT, VB::ButtonRight},
 };
-bool g_prev_buttons[20] = {};
+bool g_prev_buttons[kMaxPlayers][20] = {};
+
+// The Switch's names for what each RetroPad input does, so RetroArch can show
+// and remap them (without these it hides every input as unbound)
+void SetInputDescriptors() {
+    static const char* const names[][2] = {
+        {"A", nullptr}, {"B", nullptr}, {"X", nullptr}, {"Y", nullptr}, {"L", nullptr},
+        {"R", nullptr}, {"ZL", nullptr}, {"ZR", nullptr}, {"Left Stick Press", nullptr},
+        {"Right Stick Press", nullptr}, {"+", nullptr}, {"-", nullptr}, {"D-Pad Up", nullptr},
+        {"D-Pad Down", nullptr}, {"D-Pad Left", nullptr}, {"D-Pad Right", nullptr},
+    };
+    static_assert(std::size(names) == std::size(kButtonMap));
+    std::vector<retro_input_descriptor> descriptors;
+    for (unsigned port = 0; port < kMaxPlayers; ++port) {
+        for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+            descriptors.push_back({port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id, names[i][0]});
+        }
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Left Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Left Stick Y"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_X, "Right Stick X"});
+        descriptors.push_back({port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+                               RETRO_DEVICE_ID_ANALOG_Y, "Right Stick Y"});
+    }
+    descriptors.push_back({0, 0, 0, 0, nullptr});
+    g_environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, descriptors.data());
+}
+
+// A player's Pro Controller plugged in or pulled out (players 2-4)
+void SetPlayerConnected(unsigned player, bool connected) {
+    if (g_player_connected[player] == connected) {
+        return;
+    }
+    auto* controller = g_system->HIDCore().GetEmulatedControllerByIndex(player);
+    if (!controller) {
+        return;
+    }
+    if (connected) {
+        controller->SetNpadStyleIndex(Core::HID::NpadStyleIndex::Fullkey);
+        controller->Connect();
+    } else {
+        controller->Disconnect();
+    }
+    g_player_connected[player] = connected;
+    LOG_INFO(Frontend, "libretro: player {} {}", player + 1, connected ? "connected" : "disconnected");
+}
+} // namespace
+
+
+// ---------------------------------------------------------------------------
+// Vulkan presentation through the frontend's context (RETRO_HW_CONTEXT_VULKAN).
+//
+// The frontend makes the instance and, through context negotiation v2, the device
+// with the renderer's create info plus what it needs itself; the renderer works on
+// that device (Vulkan::External), takes the frontend's queue lock around its
+// submits and hands each finished frame over as an image, given to the frontend
+// with set_image from retro_run. No frame is read back to the CPU. The game only
+// starts once the device exists, so retro_load_game leaves that to create_device2.
+// Without negotiation v2 the core reads frames back as before.
+// ---------------------------------------------------------------------------
+namespace {
+bool g_vulkan_present = false;     // the frontend took the HW render request
+bool g_start_deferred = false;     // retro_load_game left the start to create_device2
+retro_hw_render_interface_vulkan* g_vulkan = nullptr;
+std::array<retro_vulkan_image, 8> g_vulkan_images{};  // per slot; the frontend keeps the pointer
+bool StartLoadedGame();
+
+retro_hw_render_interface_vulkan* CurrentVulkanInterface() {
+    // Asked every frame: RetroArch rebuilds its video driver behind the core's back
+    // (fullscreen toggle) and frees the interface it handed out before.
+    retro_hw_render_interface* iface = nullptr;
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &iface) || !iface ||
+        iface->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN) {
+        return nullptr;
+    }
+    return reinterpret_cast<retro_hw_render_interface_vulkan*>(iface);
+}
+
+void UseVulkanInterface(retro_hw_render_interface_vulkan* vulkan) {
+    if (vulkan == g_vulkan) {
+        return;
+    }
+    g_vulkan = vulkan;
+    if (vulkan) {
+        Vulkan::External::SetQueueLock([vulkan] { vulkan->lock_queue(vulkan->handle); },
+                                       [vulkan] { vulkan->unlock_queue(vulkan->handle); });
+    } else {
+        Vulkan::External::SetQueueLock(nullptr, nullptr);
+    }
+}
+
+void OnVulkanContextReset() {
+    UseVulkanInterface(CurrentVulkanInterface());
+}
+
+void OnVulkanContextDestroy() {
+    UseVulkanInterface(nullptr);
+}
+
+const VkApplicationInfo* GetVulkanApplicationInfo() {
+    static const VkApplicationInfo info{
+        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pNext = nullptr,
+        .pApplicationName = "suyu",
+        .applicationVersion = 0,
+        .pEngineName = "suyu",
+        .engineVersion = 0,
+        .apiVersion = VK_API_VERSION_1_3,
+    };
+    return &info;
+}
+
+// Negotiation v1 cannot pass the renderer's create info to the frontend; only v2 is offered
+bool CreateVulkanDeviceV1(retro_vulkan_context*, VkInstance, VkPhysicalDevice, VkSurfaceKHR,
+                          PFN_vkGetInstanceProcAddr, const char**, unsigned, const char**,
+                          unsigned, const VkPhysicalDeviceFeatures*) {
+    return false;
+}
+
+bool CreateVulkanDevice2(retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu,
+                         VkSurfaceKHR, PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                         retro_vulkan_create_device_wrapper_t create_device_wrapper,
+                         void* opaque) {
+    if (gpu == VK_NULL_HANDLE) {
+        // The frontend leaves the choice to the core: the first device
+        const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+            get_instance_proc_addr(instance, "vkEnumeratePhysicalDevices"));
+        u32 count = 1;
+        if (!enumerate || enumerate(instance, &count, &gpu) < 0 || count == 0) {
+            LOG_CRITICAL(Frontend, "libretro: no Vulkan device to run on");
+            return false;
+        }
+    }
+    auto& external = Vulkan::External::GetContext();
+    external = {};
+    external.get_instance_proc_addr = get_instance_proc_addr;
+    external.instance = instance;
+    external.gpu = gpu;
+    external.create_device = [create_device_wrapper, opaque](VkPhysicalDevice physical,
+                                                             const VkDeviceCreateInfo* info) {
+        return create_device_wrapper(physical, opaque, info);
+    };
+    Vulkan::External::SetActive(true);
+    Vulkan::External::ResetFrames();
+
+    // The game starts here, so that the renderer makes its device through the frontend
+    const bool started = !g_start_deferred || StartLoadedGame();
+    g_start_deferred = false;
+    external.create_device = nullptr;
+    if (!started || external.device == VK_NULL_HANDLE) {
+        Vulkan::External::SetActive(false);
+        return false;
+    }
+    context->gpu = gpu;
+    context->device = external.device;
+    context->queue = external.queue;
+    context->queue_family_index = external.queue_family;
+    context->presentation_queue = external.queue;
+    context->presentation_queue_family_index = external.queue_family;
+    return true;
+}
+
+void DestroyVulkanDevice() {
+    // The frontend destroys the device it made; the renderer is gone by now (retro_unload_game)
+    UseVulkanInterface(nullptr);
+    Vulkan::External::SetActive(false);
+}
+
+// Asks the frontend for a Vulkan context made through negotiation v2. False leaves the
+// core on the read-back path.
+bool RequestVulkanPresent() {
+    retro_hw_render_context_negotiation_interface support{
+        RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0};
+    if (!g_environ_cb ||
+        !g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT,
+                      &support) ||
+        support.interface_version < 2) {
+        LOG_INFO(Frontend, "libretro: no Vulkan context negotiation v2, frames are read back");
+        return false;
+    }
+    static retro_hw_render_callback hw_render{};
+    hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+    hw_render.version_major = VK_API_VERSION_1_3;
+    hw_render.version_minor = 0;
+    hw_render.context_reset = OnVulkanContextReset;
+    hw_render.context_destroy = OnVulkanContextDestroy;
+    // The renderer cannot move to another device: RetroArch keeps this one when it rebuilds
+    // its video driver (a fullscreen toggle, a driver setting) instead of destroying it
+    // under the running renderer. Its interface is asked for every frame anyway.
+    hw_render.cache_context = true;
+    if (!g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render)) {
+        LOG_INFO(Frontend, "libretro: the frontend has no Vulkan context, frames are read back");
+        return false;
+    }
+    static retro_hw_render_context_negotiation_interface_vulkan negotiation{};
+    negotiation.interface_type = RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN;
+    negotiation.interface_version = 2;
+    negotiation.get_application_info = GetVulkanApplicationInfo;
+    negotiation.create_device = CreateVulkanDeviceV1;
+    negotiation.destroy_device = DestroyVulkanDevice;
+    negotiation.create_instance = nullptr;
+    negotiation.create_device2 = CreateVulkanDevice2;
+    g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, &negotiation);
+    LOG_INFO(Frontend, "libretro: frames are handed to the frontend's Vulkan context");
+    return true;
+}
+
+// retro_run: the newest finished frame to the frontend, or a repeat of the last one
+void PresentVulkanFrame() {
+    auto* vulkan = CurrentVulkanInterface();
+    UseVulkanInterface(vulkan);
+    ++g_perf_frontend_frames;
+    Vulkan::External::Frame frame;
+    if (vulkan && Vulkan::External::Consume(frame)) {
+        auto& image = g_vulkan_images[frame.slot % g_vulkan_images.size()];
+        image = {};
+        image.image_view = frame.view;
+        image.image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        image.create_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = frame.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = frame.format,
+            .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        vulkan->set_image(vulkan->handle, &image, 0, nullptr, vulkan->queue_index);
+        Vulkan::External::MarkShown(frame.slot);
+        ++g_perf_unique_frames;
+        g_have_presented = true;
+        g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, frame.width, frame.height, 0);
+        return;
+    }
+    // Nothing new: the frontend repeats the last image
+    auto& renderer = g_system->Renderer();
+    g_video_cb(g_have_presented ? RETRO_HW_FRAME_BUFFER_VALID : nullptr,
+               renderer.GetHeadlessWidth(), renderer.GetHeadlessHeight(), 0);
+}
+} // namespace
+
+namespace {
+
+// Hands the frontend one frame of the emulated console's audio, taken the way
+// a host device's callback takes it, which is also what paces the emulated
+// audio renderer. upload_batch takes frames (L+R pairs), not samples.
+//
+// Called either from retro_run() (frontends too old to support
+// RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK) or from FrontendAudioCallback()
+// below, never both - see g_audio_callback_registered.
+void DeliverPendingAudio() {
+    if (!g_use_frontend_audio || !g_audio_batch_cb || !g_game_loaded) {
+        return;
+    }
+
+    constexpr size_t kFramesPerCall = 48000 / 60; // stereo frames
+    std::array<s16, kFramesPerCall * 2> samples{};
+    AudioCore::Sink::LibretroSink::MixOut(samples, kFramesPerCall);
+    g_audio_batch_cb(samples.data(), kFramesPerCall);
+}
+
+// Called by the frontend's own audio thread once RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK
+// is registered, independently of whether retro_run() is being called at all.
+void RETRO_CALLCONV FrontendAudioCallback() {
+    DeliverPendingAudio();
+}
+
+// The actual reason to register SET_AUDIO_CALLBACK at all: its set_state
+// half is the one libretro hook that still fires while the frontend has
+// stopped calling retro_run() entirely (RetroArch's menu open, content
+// paused, rewind, etc.). Without this, suyu's own CPU/GPU threads - kicked
+// off once by g_system->Run() in retro_load_game() and never revisited -
+// keep running regardless of whether the frontend is still ticking us, which
+// is why the game previously kept advancing behind the RetroArch menu.
+// enabled=false means "the frontend has gone quiet"; enabled=true means
+// "resume normal operation".
+void RETRO_CALLCONV FrontendAudioSetState(bool enabled) {
+    if (!g_system || !g_game_loaded) {
+        return;
+    }
+    if (enabled) {
+        if (g_system->IsPaused()) {
+            g_system->Run();
+        }
+    } else {
+        if (!g_system->IsPaused()) {
+            g_system->Pause();
+        }
+    }
+}
+
 } // namespace
 
 RETRO_API void retro_run() {
@@ -528,30 +998,65 @@ RETRO_API void retro_run() {
             g_perf_unique_frames = 0;
         }
     }
+    if (g_geometry_dirty && g_environ_cb) {
+        retro_game_geometry geom{};
+        geom.base_width = g_base_width * g_output_scale;
+        geom.base_height = g_base_height * g_output_scale;
+        geom.max_width = kDockedFrameWidth * 4;
+        geom.max_height = kDockedFrameHeight * 4;
+        geom.aspect_ratio = (float)kFrameWidth / (float)kFrameHeight;
+        g_environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+        g_geometry_dirty = false;
+    }
     if (g_input_poll_cb) {
         g_input_poll_cb();
     }
 
-    // Bridge libretro input to suyu HID via VirtualGamepad.
+    // Bridge libretro input to suyu HID via VirtualGamepad, a port per player.
     if (g_input_state_cb && g_input_subsystem && g_game_loaded) {
         auto* vgp = g_input_subsystem->GetVirtualGamepad();
         if (vgp) {
-            for (const auto& m : kButtonMap) {
-                const bool pressed = g_input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro_id) != 0;
-                const int idx = static_cast<int>(m.virtual_button);
-                if (pressed != g_prev_buttons[idx]) {
-                    g_prev_buttons[idx] = pressed;
-                    vgp->SetButtonState(0, m.virtual_button, pressed);
+            using VS = InputCommon::VirtualGamepad::VirtualStick;
+            for (unsigned port = 0; port < kMaxPlayers; ++port) {
+                if (g_port_device[port] == RETRO_DEVICE_NONE) {
+                    if (port > 0) {
+                        SetPlayerConnected(port, false);
+                    }
+                    continue;
                 }
+                const auto axis = [port](unsigned index, unsigned id) {
+                    return g_input_state_cb(port, RETRO_DEVICE_ANALOG, index, id) / 32768.0f;
+                };
+                const float lx = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ly = -axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+                const float rx = axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+                const float ry = -axis(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+                bool pressed[std::size(kButtonMap)];
+                bool any = false;
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    pressed[i] = g_input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, kButtonMap[i].retro_id) != 0;
+                    any = any || pressed[i];
+                }
+                if (port > 0 && !g_player_connected[port]) {
+                    // Not plugged in until someone uses it: a button, or a stick
+                    // pushed past where a resting stick drifts to
+                    constexpr float kWake = 0.5f;
+                    if (!any && std::abs(lx) < kWake && std::abs(ly) < kWake &&
+                        std::abs(rx) < kWake && std::abs(ry) < kWake) {
+                        continue;
+                    }
+                    SetPlayerConnected(port, true);
+                }
+                for (std::size_t i = 0; i < std::size(kButtonMap); ++i) {
+                    const int idx = static_cast<int>(kButtonMap[i].virtual_button);
+                    if (pressed[i] != g_prev_buttons[port][idx]) {
+                        g_prev_buttons[port][idx] = pressed[i];
+                        vgp->SetButtonState(port, kButtonMap[i].virtual_button, pressed[i]);
+                    }
+                }
+                vgp->SetStickPosition(port, VS::Left, lx, ly);
+                vgp->SetStickPosition(port, VS::Right, rx, ry);
             }
-            // Left analog stick
-            const float lx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ly = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Left, lx, ly);
-            // Right analog stick
-            const float rx = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X) / 32768.0f;
-            const float ry = g_input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y) / -32768.0f;
-            vgp->SetStickPosition(0, InputCommon::VirtualGamepad::VirtualStick::Right, rx, ry);
         }
     }
 
@@ -564,43 +1069,23 @@ RETRO_API void retro_run() {
         fflush(stderr);
     }
 
-    // Hand over whatever the emulated audio renderer produced since the last
-    // frame. upload_batch takes frames (L+R pairs), not individual samples.
-    // Feed the frontend a steady ~1 frame of audio per call rather than
-    // whatever has piled up. RetroArch resamples against its own clock and
-    // expects roughly sample_rate/fps frames each retro_run; handing it a
-    // quarter second in one lump and nothing for the next 15 calls is what
-    // made the output screech. Anything beyond a small backlog is dropped so
-    // latency can't creep up instead.
-    if (g_use_frontend_audio && g_audio_batch_cb && g_game_loaded) {
-        constexpr size_t kFramesPerCall = 48000 / 60;   // stereo frames
-        constexpr size_t kMaxBacklogFrames = kFramesPerCall * 6;
-
-        static std::vector<s16> pending;   // interleaved L,R awaiting delivery
-        std::vector<s16> drained;
-        AudioCore::Sink::LibretroSampleQueue::Instance().Drain(drained);
-        if (!drained.empty()) {
-            pending.insert(pending.end(), drained.begin(), drained.end());
-        }
-
-        // Trim from the front if we've fallen behind; stale audio is worse
-        // than a short gap.
-        if (pending.size() > kMaxBacklogFrames * 2) {
-            const size_t excess = pending.size() - kMaxBacklogFrames * 2;
-            pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(excess));
-        }
-
-        const size_t frames = std::min(kFramesPerCall, pending.size() / 2);
-        if (frames > 0) {
-            g_audio_batch_cb(pending.data(), frames);
-            pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(frames * 2));
-        }
+    // Only handle audio here ourselves if no async audio callback took over
+    // in retro_load_game() - otherwise FrontendAudioCallback() is already
+    // draining the same queue from the frontend's audio thread, and doing it
+    // in both places would just race for no benefit.
+    if (!g_audio_callback_registered) {
+        DeliverPendingAudio();
     }
 
+    if (g_video_cb && g_system && g_game_loaded && Vulkan::External::IsActive()) {
+        PresentVulkanFrame();
+        return;
+    }
     if (g_video_cb && g_system && g_game_loaded) {
         auto& renderer = g_system->Renderer();
         if (renderer.IsHeadless()) {
-            // Read before the upload: a frame composited during it is shown next call.
+            // A frame read back while this is held waits, and is shown on the next call
+            const auto frame_lock = renderer.LockLastRenderedFrame();
             const u64 displayed = g_emu_window ? g_emu_window->FramesDisplayed() : 0;
             ++g_perf_frontend_frames;
             if (g_can_dupe && g_have_presented && displayed == g_presented_frame) {
@@ -631,9 +1116,11 @@ RETRO_API void retro_run() {
             LOG_WARNING(Frontend, "libretro: frame {} - no rendered frame available, sending black",
                         frame_counter);
         }
-        static const std::vector<u32> black_frame(
-            static_cast<size_t>(kFrameWidth) * kFrameHeight, 0xFF000000);
-        g_video_cb(black_frame.data(), kFrameWidth, kFrameHeight, kFrameWidth * sizeof(u32));
+        const unsigned width = g_base_width * g_output_scale;
+        const unsigned height = g_base_height * g_output_scale;
+        static std::vector<u32> black_frame;
+        black_frame.resize(static_cast<size_t>(width) * height, 0xFF000000);
+        g_video_cb(black_frame.data(), width, height, width * sizeof(u32));
     }
 }
 
@@ -672,6 +1159,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                      !!g_system, !!g_emu_window, !!game, game ? !!game->path : false);
         return false;
     }
+
+    SetInputDescriptors();
 
     g_game_path = game->path;
     // need_fullpath makes content availability the core's responsibility. Avoid
@@ -732,6 +1221,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
             return false;
         }
         LOG_INFO(Frontend, "libretro: explicit base/update provider verified for this session");
+    } else {
+        // PatchManager takes the base Program NCA from the content provider to apply an
+        // installed update to the RomFS. The other frontends list a game's NCAs when they
+        // scan it; here the booted file is the only one there is.
+        g_content_provider = std::make_unique<FileSys::ManualContentProvider>();
+        const auto game_file = Core::GetGameFileFromPath(g_system->GetFilesystem(), g_game_path);
+        if (game_file && g_content_provider->AddEntriesFromContainer(game_file)) {
+            g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                              g_content_provider.get());
+        } else {
+            g_content_provider.reset();
+        }
     }
 
     // A verified deconstructed ExeFS/RomFS pair has no CNMT to report the
@@ -776,6 +1277,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                 std::string(var.value) == "Yes" ? Settings::ConsoleMode::Docked
                                                 : Settings::ConsoleMode::Handheld);
         }
+        const bool docked =
+            Settings::values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked;
+        g_base_width = docked ? kDockedFrameWidth : kFrameWidth;
+        g_base_height = docked ? kDockedFrameHeight : kFrameHeight;
         var.key = "suyu_cpu_accuracy";
         var.value = nullptr;
         if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
@@ -792,9 +1297,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
             const std::string v(var.value);
             auto res = Settings::ResolutionSetup::Res1X;
-            if (v == "2x") res = Settings::ResolutionSetup::Res2X;
-            else if (v == "3x") res = Settings::ResolutionSetup::Res3X;
-            else if (v == "4x") res = Settings::ResolutionSetup::Res4X;
+            if (v == "2x") {
+                res = Settings::ResolutionSetup::Res2X;
+                g_output_scale = 2;
+            } else if (v == "3x") {
+                res = Settings::ResolutionSetup::Res3X;
+                g_output_scale = 3;
+            }
+            else if (v == "4x") {
+                res = Settings::ResolutionSetup::Res4X;
+                g_output_scale = 4;
+            }
             Settings::values.resolution_setup.SetValue(res);
         }
         var.key = "suyu_scaling_filter";
@@ -836,6 +1349,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
             Settings::values.cpuopt_fastmem_exclusives.SetValue(enabled);
         }
         g_system->ApplySettings();
+
+        g_emu_window->UpdateCurrentFramebufferLayout(g_base_width * g_output_scale,
+                                                     g_base_height * g_output_scale);
 
         // Join a suyu room if the user configured one. Done here rather than
         // in retro_init so the options the frontend collected are already
@@ -920,6 +1436,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         g_tas_playback = true;
     }
 
+    // With the frontend's Vulkan context the game starts in create_device2, where the renderer
+    // can make its device through the frontend; otherwise here, reading frames back
+    g_vulkan_present = RequestVulkanPresent();
+    if (g_vulkan_present) {
+        g_start_deferred = true;
+        return true;
+    }
+    return StartLoadedGame();
+}
+
+namespace {
+bool StartLoadedGame() {
     Service::AM::FrontendAppletParameters load_parameters{};
     load_parameters.applet_id = Service::AM::AppletId::Application;
 
@@ -946,6 +1474,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     }
     auto& gpu = g_system->GPU();
     gpu.ObtainContext();
+    // Builds the pipelines earlier sessions saved before the game runs, and saves the ones
+    // this session builds, so a shader is only compiled during play the first time
+    if (Settings::values.use_disk_shader_cache.GetValue()) {
+        g_system->Renderer().ReadRasterizer()->LoadDiskResources(
+            g_system->GetApplicationProcessProgramID(), std::stop_token{},
+            [](VideoCore::LoadCallbackStage, std::size_t, std::size_t) {});
+    }
     gpu.ReleaseContext();
     gpu.Start();
     g_system->GetCpuManager().OnGpuReady();
@@ -969,9 +1504,28 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     g_perf_start = g_perf_last_sample = std::chrono::steady_clock::now();
     g_system->Run();
     g_game_loaded = true;
+
+    // Register for the frontend's audio-pause notification (see
+    // FrontendAudioSetState's comment) so opening the RetroArch menu, or
+    // pausing content, actually pauses suyu's own CPU/GPU threads instead of
+    // letting them run on unattended in the background.
+    struct retro_audio_callback audio_cb {};
+    audio_cb.callback = FrontendAudioCallback;
+    audio_cb.set_state = FrontendAudioSetState;
+    g_audio_callback_registered = g_environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK, &audio_cb);
+    if (g_audio_callback_registered) {
+        LOG_INFO(Frontend, "libretro core: registered async audio callback - "
+                            "frontend pause/menu will now pause emulation");
+    } else {
+        LOG_WARNING(Frontend, "libretro core: frontend doesn't support "
+                               "RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK - opening the menu or "
+                               "pausing content won't pause suyu's own emulation");
+    }
+
     LOG_INFO(Frontend, "libretro core: game loaded and running");
     return true;
 }
+} // namespace
 
 RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retro_game_info* /*info*/,
                                        size_t /*num_info*/) {
@@ -981,7 +1535,17 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 RETRO_API void retro_unload_game() {
     g_sample_perf = false;
     g_have_presented = false;
+    g_start_deferred = false;
+    if (g_vulkan) {
+        // The frontend repeats the last image; take it back and let the frontend finish with
+        // it before the renderer that owns it goes
+        g_vulkan->set_image(g_vulkan->handle, nullptr, 0, nullptr, g_vulkan->queue_index);
+        g_vulkan->wait_sync_index(g_vulkan->handle);
+    }
     if (g_system && g_game_loaded) {
+        g_output_scale = 1;
+        g_geometry_dirty = false;
+        AudioCore::Sink::LibretroSink::Detach();
         g_system->ShutdownMainProcess();
     }
     if (g_emu_window) {
@@ -996,11 +1560,17 @@ RETRO_API void retro_unload_game() {
     }
     g_tas_playback = false;
     g_game_loaded = false;
+    // The next title starts with only player 1, and every button up
+    std::fill(std::begin(g_player_connected), std::end(g_player_connected), false);
+    for (auto& buttons : g_prev_buttons) {
+        std::fill(std::begin(buttons), std::end(buttons), false);
+    }
     g_game_path.clear();
-    if (g_explicit_provider) {
+    if (g_explicit_provider || g_content_provider) {
         g_system->RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
                                           nullptr);
         g_explicit_provider.reset();
+        g_content_provider.reset();
     }
     // Leave any room we joined for this game; the next one loaded in this
     // session gets to make its own decision from its own core options.
@@ -1009,9 +1579,6 @@ RETRO_API void retro_unload_game() {
             member->Leave();
         }
     }
-    // Drop any audio still queued from the game that just went away, so it
-    // can't leak into the next one loaded in this session.
-    AudioCore::Sink::LibretroSampleQueue::Instance().Clear();
 }
 
 RETRO_API unsigned retro_get_region() {

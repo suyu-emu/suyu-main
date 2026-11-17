@@ -21,8 +21,11 @@ import kotlinx.coroutines.withContext
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.YuzuApplication
-import org.yuzu.yuzu_emu.adapters.InstallableAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentInstallablesBinding
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.InstallablesScreen
 import org.yuzu.yuzu_emu.model.AddonViewModel
 import org.yuzu.yuzu_emu.model.DriverViewModel
 import org.yuzu.yuzu_emu.model.GamesViewModel
@@ -41,8 +44,7 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
 class InstallableFragment : Fragment() {
-    private var _binding: FragmentInstallablesBinding? = null
-    private val binding get() = _binding!!
+    private var installables by mutableStateOf<List<Installable>>(emptyList())
 
     private val homeViewModel: HomeViewModel by activityViewModels()
     private val gamesViewModel: GamesViewModel by activityViewModels()
@@ -60,19 +62,17 @@ class InstallableFragment : Fragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        _binding = FragmentInstallablesBinding.inflate(layoutInflater)
-        return binding.root
+    ): View = suyuComposeView {
+        InstallablesScreen(
+            installables = installables,
+            onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() }
+        )
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
         homeViewModel.setStatusBarShadeVisibility(visible = false)
-
-        binding.toolbarInstallables.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
 
         homeViewModel.openImportSaves.collect(viewLifecycleOwner) {
             if (it) {
@@ -81,7 +81,7 @@ class InstallableFragment : Fragment() {
             }
         }
 
-        val installables = listOf(
+        installables = listOf(
             Installable(
                 R.string.user_data,
                 R.string.user_data_description,
@@ -165,35 +165,7 @@ class InstallableFragment : Fragment() {
                 installLabelId = R.string.install_amiibo_keys
             )
         )
-
-        binding.listInstallables.apply {
-            layoutManager = GridLayoutManager(
-                requireContext(),
-                resources.getInteger(R.integer.grid_columns)
-            )
-            adapter = InstallableAdapter(installables)
-        }
-
-        setInsets()
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.toolbarInstallables.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listInstallables.updateMargins(left = leftInsets, right = rightInsets)
-
-            binding.listInstallables.updatePadding(bottom = barInsets.bottom)
-
-            windowInsets
-        }
 
     private val getProdKeyLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { result ->

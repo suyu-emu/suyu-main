@@ -274,6 +274,9 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             if (desc.is_written) {
                 texture_cache.MarkModification(image_view.image_id);
             }
+            if (desc.format == Shader::ImageFormat::R32_UINT) {
+                texture_cache.NoteIntegerStorageView(image_view.image_id);
+            }
             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};

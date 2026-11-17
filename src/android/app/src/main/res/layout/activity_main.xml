@@ -19,8 +19,7 @@
         app:layout_constraintLeft_toLeftOf="parent"
         app:layout_constraintRight_toRightOf="parent"
         app:layout_constraintTop_toTopOf="parent"
-        app:navGraph="@navigation/home_navigation"
-        tools:layout="@layout/fragment_games" />
+        app:navGraph="@navigation/home_navigation" />
 
     <View
         android:id="@+id/status_bar_shade"

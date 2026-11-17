@@ -46,8 +46,9 @@ Opcode Decode(u64 insn) {
         return Opcode::name;
 #include "maxwell.inc"
 #undef INST
-    ASSERT_MSG(false, "Invalid insn 0x{:016x}", insn);
-    return Opcode::NOP;
+    // Translating an unknown instruction as NOP produced shaders that crash the host driver's
+    // compiler (Minecraft inventory); fail this shader so the pipeline cache skips it instead.
+    throw NotImplementedException("Invalid insn 0x{:016x}", insn);
 }
 
 } // namespace Shader::Maxwell

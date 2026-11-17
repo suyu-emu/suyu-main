@@ -12,4 +12,7 @@ bool IsViewCompatible(PixelFormat format_a, PixelFormat format_b, bool broken_vi
 
 bool IsCopyCompatible(PixelFormat format_a, PixelFormat format_b, bool native_bgr);
 
+/// Makes the formats shaders can do atomic operations on view compatible with each other only
+void SeparateAtomicViewFormats(bool separate);
+
 } // namespace VideoCore::Surface

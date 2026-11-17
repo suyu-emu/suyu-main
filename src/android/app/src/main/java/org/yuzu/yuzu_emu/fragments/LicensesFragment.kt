@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Author: Ghael_V - Lemon Switch Emu - Suyu Team
 
 package org.yuzu.yuzu_emu.fragments
 
@@ -8,24 +9,16 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.google.android.material.transition.MaterialSharedAxis
 import org.yuzu.yuzu_emu.R
-import org.yuzu.yuzu_emu.adapters.LicenseAdapter
-import org.yuzu.yuzu_emu.databinding.FragmentLicensesBinding
 import org.yuzu.yuzu_emu.model.HomeViewModel
 import org.yuzu.yuzu_emu.model.License
-import org.yuzu.yuzu_emu.utils.ViewUtils.updateMargins
+import org.yuzu.yuzu_emu.ui.compose.common.suyuComposeView
+import org.yuzu.yuzu_emu.ui.compose.screens.LicensesScreen
 
 class LicensesFragment : Fragment() {
-    private var _binding: FragmentLicensesBinding? = null
-    private val binding get() = _binding!!
-
     private val homeViewModel: HomeViewModel by activityViewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -39,17 +32,6 @@ class LicensesFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        _binding = FragmentLicensesBinding.inflate(layoutInflater)
-        return binding.root
-    }
-
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        homeViewModel.setStatusBarShadeVisibility(visible = false)
-
-        binding.toolbarLicenses.setNavigationOnClickListener {
-            requireActivity().onBackPressedDispatcher.onBackPressed()
-        }
-
         val licenses = listOf(
             License(
                 R.string.license_fidelityfx_fsr,
@@ -102,29 +84,21 @@ class LicensesFragment : Fragment() {
             )
         )
 
-        binding.listLicenses.apply {
-            layoutManager = LinearLayoutManager(requireContext())
-            adapter = LicenseAdapter(requireActivity() as AppCompatActivity, licenses)
+        return suyuComposeView {
+            LicensesScreen(
+                licenses = licenses,
+                onBack = { requireActivity().onBackPressedDispatcher.onBackPressed() },
+                onOpen = { license ->
+                    LicenseBottomSheetDialogFragment.newInstance(license).show(
+                        (requireActivity() as AppCompatActivity).supportFragmentManager,
+                        LicenseBottomSheetDialogFragment.TAG
+                    )
+                }
+            )
         }
-
-        setInsets()
     }
 
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            val leftInsets = barInsets.left + cutoutInsets.left
-            val rightInsets = barInsets.right + cutoutInsets.right
-
-            binding.appbarLicenses.updateMargins(left = leftInsets, right = rightInsets)
-            binding.listLicenses.updateMargins(left = leftInsets, right = rightInsets)
-
-            binding.listLicenses.updatePadding(bottom = barInsets.bottom)
-
-            windowInsets
-        }
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        homeViewModel.setStatusBarShadeVisibility(visible = false)
+    }
 }

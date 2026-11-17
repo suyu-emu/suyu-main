@@ -207,6 +207,16 @@ public:
         return configure_func(this, is_indexed);
     }
 
+    /// True when a shader samples a texture whose handle arrives as a vertex attribute.
+    [[nodiscard]] bool UsesAttributeHandle() const noexcept {
+        return uses_attribute_handle;
+    }
+
+    /// Handle bound to those textures by the next Configure.
+    void SetAttributeHandle(u32 handle) noexcept {
+        attribute_handle = handle;
+    }
+
     [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
         if (key == current_key) {
             return this;
@@ -223,6 +233,10 @@ public:
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+    }
+
+    [[nodiscard]] const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
     }
 
     void SetEngine(Tegra::Engines::Maxwell3D* maxwell3d_, Tegra::MemoryManager* gpu_memory_) {
@@ -269,7 +283,11 @@ private:
     u32 num_descriptor_entries{};
     size_t num_image_elements{};
     u32 num_textures{};
+    u32 attribute_handle{};
+    bool uses_attribute_handle{};
     bool fragment_has_color0_output{};
+    /// Color targets the fragment shader has an output for, as a mask of their indices
+    u32 fragment_color_outputs{};
     u64 layout_signature{};
     bool precompile_only{};
 

@@ -10,6 +10,8 @@ add_library(suyu_libretro SHARED
 
 target_link_libraries(suyu_libretro PRIVATE common core input_common frontend_common audio_core network)
 target_link_libraries(suyu_libretro PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+# The Vulkan types of RetroArch's HW render interface (libretro_vulkan.h)
+target_link_libraries(suyu_libretro PRIVATE Vulkan::Headers)
 
 if (ANDROID)
     target_link_options(suyu_libretro PRIVATE "-Wl,-Bsymbolic")
@@ -18,6 +20,13 @@ endif()
 set_target_properties(suyu_libretro PROPERTIES
     PREFIX ""
     OUTPUT_NAME "suyu_libretro"
+)
+
+# Where a frontend that builds its cores, such as Kodi's game add-ons, looks for
+# them
+install(TARGETS suyu_libretro
+    LIBRARY DESTINATION lib/libretro
+    RUNTIME DESTINATION lib/libretro
 )
 
 create_target_directory_groups(suyu_libretro)

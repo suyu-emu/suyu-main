@@ -23,6 +23,7 @@ import androidx.core.view.updatePadding
 import androidx.documentfile.provider.DocumentFile
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
+import androidx.navigation.NavDirections
 import androidx.navigation.findNavController
 import androidx.navigation.fragment.findNavController
 import androidx.recyclerview.widget.GridLayoutManager
@@ -31,7 +32,6 @@ import org.yuzu.yuzu_emu.HomeNavigationDirections
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.YuzuApplication
-import org.yuzu.yuzu_emu.adapters.HomeSettingAdapter
 import org.yuzu.yuzu_emu.databinding.FragmentHomeSettingsBinding
 import org.yuzu.yuzu_emu.features.DocumentProvider
 import org.yuzu.yuzu_emu.features.fetcher.SpacingItemDecoration
@@ -40,6 +40,9 @@ import org.yuzu.yuzu_emu.features.settings.ui.SettingsSubscreen
 import org.yuzu.yuzu_emu.model.DriverViewModel
 import org.yuzu.yuzu_emu.model.HomeSetting
 import org.yuzu.yuzu_emu.model.HomeViewModel
+import org.yuzu.yuzu_emu.ui.compose.games.LibraryDestination
+import org.yuzu.yuzu_emu.ui.compose.settings.SettingsHomeScreen
+import org.yuzu.yuzu_emu.ui.compose.theme.SuyuTheme
 import org.yuzu.yuzu_emu.ui.main.MainActivity
 import org.yuzu.yuzu_emu.utils.FileUtil
 import org.yuzu.yuzu_emu.utils.GpuDriverHelper
@@ -71,13 +74,8 @@ class HomeSettingsFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-        homeViewModel.setStatusBarShadeVisibility(visible = false)
+        homeViewModel.setStatusBarShadeVisibility(visible = true)
         mainActivity = requireActivity() as MainActivity
-        binding.toolbarHomeSettings.setNavigationOnClickListener {
-            findNavController().popBackStack()
-        }
-        binding.toolbarHomeSettings.title = getString(R.string.preferences_settings)
-
         val optionsList: MutableList<HomeSetting> = mutableListOf<HomeSetting>().apply {
             add(
                 HomeSetting(
@@ -314,19 +312,50 @@ class HomeSettingsFragment : Fragment() {
             )
         }
 
-        binding.homeSettingsList.apply {
-            layoutManager =
-                GridLayoutManager(requireContext(), resources.getInteger(R.integer.grid_columns))
-            adapter = HomeSettingAdapter(
-                requireActivity() as AppCompatActivity,
-                viewLifecycleOwner,
-                optionsList
-            )
-            val spacing = resources.getDimensionPixelSize(R.dimen.spacing_small)
-            addItemDecoration(SpacingItemDecoration(spacing))
+        val navigate: (NavDirections) -> Unit = { findNavController().navigate(it) }
+        binding.composeHomeSettings.setContent {
+            SuyuTheme {
+                SettingsHomeScreen(
+                    settings = optionsList,
+                    firmwareVersion = if (NativeLibrary.isFirmwareAvailable()) {
+                        NativeLibrary.firmwareVersion()
+                    } else {
+                        null
+                    },
+                    keysPresent = NativeLibrary.areKeysPresent(),
+                    onBack = { findNavController().popBackStack() },
+                    onSettingClick = { setting ->
+                        if (setting.isEnabled()) {
+                            setting.onClick()
+                        } else {
+                            MessageDialogFragment.newInstance(
+                                mainActivity,
+                                titleId = setting.disabledTitleId,
+                                descriptionId = setting.disabledMessageId
+                            ).show(parentFragmentManager, MessageDialogFragment.TAG)
+                        }
+                    },
+                    onNavigate = { destination ->
+                        when (destination) {
+                            LibraryDestination.LIBRARY -> findNavController().popBackStack()
+                            LibraryDestination.CONTROLS -> navigate(
+                                HomeNavigationDirections.actionGlobalSettingsActivity(
+                                    null,
+                                    Settings.MenuTag.SECTION_INPUT
+                                )
+                            )
+                            LibraryDestination.DRIVERS -> navigate(
+                                HomeNavigationDirections.actionGlobalSettingsSubscreenActivity(
+                                    SettingsSubscreen.DRIVER_MANAGER,
+                                    null
+                                )
+                            )
+                            LibraryDestination.SETTINGS -> Unit
+                        }
+                    }
+                )
+            }
         }
-
-        setInsets()
     }
 
     override fun onStart() {
@@ -500,26 +529,4 @@ class HomeSettingsFragment : Fragment() {
             ).show()
         }
     }
-
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { _, windowInsets ->
-            val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
-
-            binding.appbarHomeSettings.updateMargins(
-                left = barInsets.left + cutoutInsets.left,
-                right = barInsets.right + cutoutInsets.right
-            )
-
-            binding.scrollViewSettings.updatePadding(
-                bottom = barInsets.bottom
-            )
-
-            binding.homeSettingsList.updatePadding(
-                left = barInsets.left + cutoutInsets.left,
-                right = barInsets.right + cutoutInsets.right
-            )
-
-            windowInsets
-        }
 }

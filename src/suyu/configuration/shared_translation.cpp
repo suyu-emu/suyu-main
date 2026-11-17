@@ -241,15 +241,45 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QWidget* parent) {
            tr("Enables Fast GPU Time. This option will force most games to run at their highest "
               "native resolution."));
     INSERT(Settings, fast_gpu_time, tr("Fast GPU Time divisor (Hack)"),
-           tr("Overclocks the emulated GPU to increase dynamic resolution and render distance.\n"
-              "Use 128 for maximal performance and 512 for maximal graphics fidelity (default 256)."));
+           tr("Selects the GPU tick divisor while Fast GPU Time is enabled. Normal keeps the "
+              "original tick rate; the other choices divide ticks by 256 or 512."));
+    INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU inner invalidation (Hack)"),
+           tr("Skips invalidating cached GPU data after CPU memory changes. May improve performance "
+              "but can cause incorrect rendering."));
+    INSERT(Settings, fix_bloom_effects, tr("Fix bloom effects (Hack)"),
+           tr("Uses an alternate depth-to-color blit for bloom effects. Requires a restart."));
+    INSERT(Settings, emulate_bgr565, tr("Emulate BGR565 textures (Hack)"),
+           tr("Emulates BGR565 texture support for Vulkan. Requires a restart."));
+    INSERT(Settings, rescale_hack, tr("Enable legacy rescale pass (Hack)"),
+           tr("Uses legacy shader rescaling behavior as a compatibility workaround. "
+              "Requires a restart."));
+    INSERT(Settings, gpu_unswizzle_enabled, tr("Use GPU texture unswizzling (Hack)"),
+           tr("Uses Vulkan compute to decode supported textures. Disable if it causes driver or "
+              "rendering issues. Requires a restart."));
+    INSERT(Settings, gpu_unswizzle_texture_size, tr("GPU unswizzle texture threshold (MiB)"),
+           tr("Selects the minimum texture size eligible for GPU unswizzling. Requires a restart."));
+    INSERT(Settings, gpu_unswizzle_stream_size, tr("GPU unswizzle stream size (MiB)"),
+           tr("Selects the size of texture data chunks used for GPU unswizzling. "
+              "Requires a restart."));
+    INSERT(Settings, gpu_unswizzle_chunk_size, tr("GPU unswizzle batch size (slices)"),
+           tr("Selects the number of depth slices processed in each GPU dispatch. Larger batches "
+              "can increase the risk of driver timeouts. Requires a restart."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
-    INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries"),
+    INSERT(Settings, use_graphics_pipeline_library, tr("Use graphics pipeline libraries (Experimental)"),
            tr("Builds Vulkan graphics pipelines from reusable parts when supported by the driver. "
-              "Disable this if a driver shows rendering issues. Requires a restart."));
+              "Keeping this disabled is recommended for compatibility. Requires a restart."));
+    INSERT(Settings, dyna_state, tr("Extended dynamic state"),
+           tr("Selects the Vulkan extended dynamic state level when supported by the driver. "
+              "Select Disabled to turn off these extensions. Requires a restart."));
+    INSERT(Settings, sample_shading, tr("Sample shading (%)"),
+           tr("Sets the minimum percentage of samples shaded individually for multisampled "
+              "rendering. Higher values may reduce performance. Requires a restart."));
+    INSERT(Settings, vertex_input_dynamic_state, tr("Use dynamic vertex input state"),
+           tr("Uses Vulkan dynamic vertex input state when supported by the driver. "
+              "Disable this to use fixed vertex input state. Requires a restart."));
     INSERT(
         Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
         tr("Enable compute pipelines, required by some games.\nThis setting only exists for Intel "
@@ -353,6 +383,43 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QWidget* parent) {
 #define PAIR(ENUM, VALUE, TRANSLATION) {static_cast<u32>(Settings::ENUM::VALUE), (TRANSLATION)}
 
     // Intentionally skipping VSyncMode to let the UI fill that one out
+    translations->insert({Settings::EnumMetadata<Settings::GpuOverclock>::Index(),
+                          {
+                              PAIR(GpuOverclock, Normal, tr("Normal (no divisor)")),
+                              PAIR(GpuOverclock, Medium, tr("Medium (256)")),
+                              PAIR(GpuOverclock, High, tr("High (512)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzleSize>::Index(),
+                          {
+                              PAIR(GpuUnswizzleSize, VerySmall, tr("16 MiB")),
+                              PAIR(GpuUnswizzleSize, Small, tr("32 MiB")),
+                              PAIR(GpuUnswizzleSize, Normal, tr("128 MiB")),
+                              PAIR(GpuUnswizzleSize, Large, tr("256 MiB")),
+                              PAIR(GpuUnswizzleSize, VeryLarge, tr("512 MiB")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzle>::Index(),
+                          {
+                              PAIR(GpuUnswizzle, VeryLow, tr("4 MiB")),
+                              PAIR(GpuUnswizzle, Low, tr("8 MiB")),
+                              PAIR(GpuUnswizzle, Normal, tr("16 MiB")),
+                              PAIR(GpuUnswizzle, Medium, tr("32 MiB")),
+                              PAIR(GpuUnswizzle, High, tr("64 MiB")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::GpuUnswizzleChunk>::Index(),
+                          {
+                              PAIR(GpuUnswizzleChunk, VeryLow, tr("32 slices")),
+                              PAIR(GpuUnswizzleChunk, Low, tr("64 slices")),
+                              PAIR(GpuUnswizzleChunk, Normal, tr("128 slices")),
+                              PAIR(GpuUnswizzleChunk, Medium, tr("256 slices")),
+                              PAIR(GpuUnswizzleChunk, High, tr("512 slices")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::ExtendedDynamicState>::Index(),
+                          {
+                              PAIR(ExtendedDynamicState, Disabled, tr("Disabled")),
+                              PAIR(ExtendedDynamicState, EDS1, tr("EDS1")),
+                              PAIR(ExtendedDynamicState, EDS2, tr("EDS2")),
+                              PAIR(ExtendedDynamicState, EDS3, tr("EDS3")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::AppletMode>::Index(),
                           {
                               PAIR(AppletMode, HLE, tr("Custom frontend")),

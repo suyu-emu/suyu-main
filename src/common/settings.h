@@ -543,7 +543,7 @@ struct Values {
 
     // Renderer Hacks //
     SwitchableSetting<bool> use_fast_gpu_time{linkage,
-                                              true,
+                                              false,
                                               "use_fast_gpu_time",
                                               Category::RendererHacks,
                                               Specialization::Default,
@@ -597,12 +597,7 @@ struct Values {
     SwitchableSetting<bool> use_asynchronous_shaders{linkage, false, "use_asynchronous_shaders",
                                                      Category::RendererHacks};
     SwitchableSetting<bool> use_graphics_pipeline_library{
-        linkage,
-#ifdef __ANDROID__
-        false,
-#else
-        true,
-#endif
+        linkage, false,
         "use_graphics_pipeline_library", Category::RendererExtensions};
 
     SwitchableSetting<GpuUnswizzleSize> gpu_unswizzle_texture_size{linkage,
@@ -888,6 +883,12 @@ struct Values {
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
                                            Category::Network};
     SwitchableSetting<bool> airplane_mode{linkage, false, "airplane_mode", Category::Network};
+
+    // Nextendo Network integration. Disabled by default; when enabled, Nintendo
+    // online-service DNS lookups are redirected to the configured Nextendo endpoint.
+    Setting<bool> enable_nextendo{linkage, false, "enable_nextendo", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "", "nextendo_server_ip", Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "", "nextendo_nat_ip", Category::Network};
 
     /// Hostname to answer with when a game asks for one of Nintendo's online
     /// services. Those are unreachable and are otherwise refused; pointing this

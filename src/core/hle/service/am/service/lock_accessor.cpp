@@ -39,6 +39,7 @@ Result ILockAccessor::TryLock(Out<bool> out_is_locked,
             *out_is_locked = false;
         } else {
             m_is_locked = true;
+            m_event.Clear(system.Kernel());
             *out_is_locked = true;
         }
     }
@@ -56,9 +57,9 @@ Result ILockAccessor::Unlock() {
     {
         std::scoped_lock lk{m_mutex};
         m_is_locked = false;
+        m_event.Signal(system.Kernel());
     }
 
-    m_event.Signal(system.Kernel());
     R_SUCCEED();
 }
 

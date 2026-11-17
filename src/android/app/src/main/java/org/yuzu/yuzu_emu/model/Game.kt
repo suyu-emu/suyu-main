@@ -34,6 +34,8 @@ class Game(
 ) : Parcelable {
     val keyAddedToLibraryTime get() = "${path}_AddedToLibraryTime"
     val keyLastPlayedTime get() = "${path}_LastPlayed"
+    val keyFavorite get() = "${path}_Favorite"
+    val keyAverageFps get() = "${path}_AverageFps"
 
     val settingsName: String
         get() {

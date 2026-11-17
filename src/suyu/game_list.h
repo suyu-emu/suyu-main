@@ -100,6 +100,9 @@ public:
     void LoadCompatibilityList();
     void PopulateAsync(QVector<UISettings::GameDir>& game_dirs);
     void CancelPopulate();
+    /// Permanently stop population and join its worker before referenced owners die.
+    /// Called on the GUI thread; ordinary CancelPopulate permits later scans.
+    void ShutdownPopulate();
 
     QString GetSelectedGamePath() const;
     u64 GetSelectedProgramId() const;
@@ -190,6 +193,7 @@ private:
     QTreeView* tree_view = nullptr;
     QStandardItemModel* item_model = nullptr;
     std::unique_ptr<GameListWorker> current_worker;
+    bool population_shutdown{false};
     QFileSystemWatcher* watcher = nullptr;
     ControllerNavigation* controller_navigation = nullptr;
     CompatibilityList compatibility_list;

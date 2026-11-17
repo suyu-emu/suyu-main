@@ -275,9 +275,8 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the suyu-cli executable" ON "NOT ANDROID" OFF)
-if(NOT ENABLE_SDL3 AND (ENABLE_QT OR YUZU_CMD))
-    message(FATAL_ERROR "SDL3-disabled core builds require ENABLE_QT=OFF and YUZU_CMD=OFF")
-endif()
+cmake_dependent_option(SUYU_RECOMPILER_CLI "Compile the suyu-recomp AOT tool" ON
+                       "NOT ANDROID" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR PLATFORM_LINUX" OFF)
 
@@ -429,10 +428,7 @@ set(BUILD_TESTING OFF)
 set(ENABLE_TESTING OFF)
 
 # boost
-set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem context crc variant)
-if(IOS)
-    list(REMOVE_ITEM BOOST_INCLUDE_LIBRARIES process)
-endif()
+set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem regex crc variant)
 
 AddJsonPackage(boost)
 
@@ -805,6 +801,10 @@ if(SUYU_BUILD_IOS_CORE_PROBE)
     endif()
     set_target_properties(iHorizon PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST "${IHORIZON_APP_SOURCE}/apple/Info.plist.in")
+endif()
+
+if (SUYU_RECOMPILER_CLI)
+    add_subdirectory(tools/static_recompiler)
 endif()
 
 if (ENABLE_DEBUG_TOOLS)

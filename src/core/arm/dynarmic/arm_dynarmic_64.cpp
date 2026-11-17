@@ -359,6 +359,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     case Settings::CpuAccuracy::Auto:
         config.unsafe_optimizations = true;
         config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP;
+        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
         config.fastmem_address_space_bits = 64;
         break;
     // Paranoia mode for debugging optimizations

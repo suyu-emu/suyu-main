@@ -278,9 +278,17 @@ GraphicsPipeline::GraphicsPipeline(
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
+        for (const auto& desc : info->texture_descriptors) {
+            uses_attribute_handle |= desc.cbuf_index == Shader::ATTRIBUTE_HANDLE_CBUF_INDEX;
+        }
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        if (stage_infos[NUM_STAGES - 1].stores_frag_color[index]) {
+            fragment_color_outputs |= 1u << index;
+        }
+    }
     auto func{[this, shader_notify, &render_pass_cache, &descriptor_pool, pipeline_statistics] {
         const bool time_pipeline = PipelineTimingEnabled(key.Hash());
         const auto setup_start = time_pipeline ? std::chrono::steady_clock::now()
@@ -380,6 +388,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
+            if (desc.cbuf_index == Shader::ATTRIBUTE_HANDLE_CBUF_INDEX) {
+                return TexturePair(attribute_handle, via_header_index);
+            }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
             const u32 offset{desc.cbuf_offset + index_offset};
@@ -558,14 +569,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.any_buffer_uploaded = false;
     }
     texture_cache.UpdateRenderTargets(false);
-    texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
-                                                                                 views.size()});
+    texture_cache.CheckFeedbackLoop(
+        std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()},
+        device.NeedsFeedbackLoopLayout());
     return ConfigureDraw(rescaling, render_area);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
-    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (device.NeedsFeedbackLoopLayout()) {
+        // The driver leaves a color buffer the fragment shader has no output for as it is
+        const u32 written_targets = texture_cache.WrittenColorTargets() & fragment_color_outputs;
+        texture_cache.NoteFeedbackLoops(written_targets);
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer(),
+                                    texture_cache.SampledColorTargets(), written_targets);
+    } else {
+        scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    }
     if (!is_built.load(std::memory_order::acquire)) {
         // Wait here rather than from a recorded command. The recorded wait ran
         // on the scheduler thread after this draw had already been queued, so
@@ -718,10 +738,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
+            VkFormat vertex_format =
+                MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size());
+            const u32 stride = key.state.vertex_strides[attribute.buffer];
+            // MoltenVK translates attributes crossing a stride into another binding,
+            // which misreads packed RGBA8 weights on Apple M5. If W is unused,
+            // RGB8 preserves XYZ within the original vertex record. Static stride
+            // mode also keeps this format decision in the pipeline cache key.
+            if (device.IsMoltenVK() && !key.state.extended_dynamic_state &&
+                vertex_format == VK_FORMAT_R8G8B8A8_UNORM && stride != 0 &&
+                u64{attribute.offset.Value()} + 3 <= stride &&
+                u64{attribute.offset.Value()} + 4 > stride &&
+                !stage_infos[0].loads.Generic(index, 3) &&
+                device.IsFormatSupported(VK_FORMAT_R8G8B8_UNORM,
+                                         VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT, FormatType::Buffer)) {
+                vertex_format = VK_FORMAT_R8G8B8_UNORM;
+            }
             vertex_attributes.push_back({
                 .location = static_cast<u32>(index),
                 .binding = attribute.buffer,
-                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .format = vertex_format,
                 .offset = attribute.offset,
             });
         }
@@ -1216,27 +1252,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                     cache_key.pipeline.unique_hashes = {};
                     cache_key.variant = static_cast<u32>(fragment_has_color0_output) |
                                         (Settings::values.sample_shading.GetValue() << 1);
-                    auto& state = cache_key.pipeline.state;
-                    // Fragment output consumes blend, multisample, and render-pass state.
-                    // Preserve flags that determine the serialized state size.
-                    constexpr u32 output_bits = (1U << 0) | (1U << 2) | (1U << 3) |
-                                                (1U << 4) | (1U << 5) | (3U << 20) |
-                                                (0xFU << 28);
-                    constexpr u32 render_pass_and_alpha = (1U << 5) | (0x1FU << 6) |
-                                                          (3U << 15);
-                    state.raw1 &= output_bits;
-                    state.raw2 &= render_pass_and_alpha;
-                    state.alpha_test_ref = 0;
-                    state.point_size = 0;
-                    state.viewport_swizzles.fill(0);
-                    state.attribute_types = 0;
-                    state.dynamic_state.raw1 &= (0xFU << 6) | (1U << 10);
-                    state.dynamic_state.raw2 = 0;
-                    for (auto& attribute : state.attributes) {
-                        attribute.raw = 0;
-                    }
-                    state.binding_divisors.fill(0);
-                    state.vertex_strides.fill(0);
+                    // Keep the full fixed state for fragment-output library reuse. Reducing
+                    // it to blend/render-pass state corrupts rendering on NVIDIA (580.159.03).
+                    // The other three library parts still use their narrower state keys.
                 }
                 const auto part_start = time_pipeline ? std::chrono::steady_clock::now()
                                                       : std::chrono::steady_clock::time_point{};

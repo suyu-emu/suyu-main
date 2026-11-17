@@ -1,0 +1,313 @@
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+import json
+import os
+import subprocess
+import hashlib
+import struct
+from unittest import mock
+
+TOOLS = Path(__file__).resolve().parents[2] / 'tools/appimage'
+sys.path.insert(0, str(TOOLS))
+import runtime
+import build
+import collect_sources
+from build import inventory, fetch, sha, apprun_script, deployment_env, retain_optional_translations
+from collect_sources import validate
+
+
+class Packaging(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_final_layout_preserves_payload_and_records_tool_scaffolding(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); app = root / 'AppDir'; (app / 'usr/bin').mkdir(parents=True)
+            (app / 'usr/bin/suyu').write_bytes(b'fixture')
+            (app / 'suyu.svg').write_bytes(b'fixture icon')
+            (app / 'AppRun.wrapped').symlink_to('usr/bin/suyu')
+            for size in ('16x16', '32x32', '64x64', '128x128', '256x256'):
+                (app / 'usr/share/icons/hicolor' / size / 'apps').mkdir(parents=True)
+            (app / 'usr/share/pixmaps').mkdir()
+            receipt = build.finalize_deployment_layout(app, root)
+            self.assertFalse((app / 'AppRun.wrapped').is_symlink())
+            self.assertEqual(receipt['launcher_backup'], 'usr/bin/suyu')
+            self.assertEqual(len(receipt['empty_directories_removed']), 11)
+            self.assertEqual(os.readlink(app / '.DirIcon'), 'suyu.svg')
+            self.assertEqual((app / 'usr/bin/suyu').read_bytes(), b'fixture')
+            _, links = inventory(app)
+            self.assertEqual(links['.DirIcon'], 'suyu.svg')
+            unexpected = app / 'usr/share/pixmaps'; unexpected.mkdir()
+            payload = unexpected / 'preserve.txt'; payload.write_text('preserve')
+            with self.assertRaisesRegex(ValueError, 'unexpected payload'):
+                build.finalize_deployment_layout(app, root)
+            self.assertEqual(payload.read_text(), 'preserve')
+
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_launcher_backup_requires_exact_target_and_unused_hook(self):
+        for target, hook in (('../../foreign', ''), ('usr/bin/suyu', 'exec "$APPDIR/AppRun.wrapped"')):
+            with self.subTest(target=target, hook=hook), tempfile.TemporaryDirectory() as d:
+                root = Path(d); app = root / 'AppDir'; (app / 'usr/bin').mkdir(parents=True)
+                (app / 'usr/bin/suyu').write_text('fixture')
+                (app / 'apprun-hooks').mkdir()
+                (app / 'apprun-hooks/fixture.sh').write_text(hook)
+                backup = app / 'AppRun.wrapped'; backup.symlink_to(target)
+                with self.assertRaises(ValueError):
+                    build.finalize_deployment_layout(app, root)
+                self.assertTrue(backup.is_symlink())
+
+    @unittest.skipIf(os.name == 'nt', 'actual symlink layout runs in Linux CI')
+    def test_icon_scaffolding_cannot_follow_foreign_parent_link(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); app = root / 'AppDir'; (app / 'usr/share/icons/hicolor').mkdir(parents=True)
+            outside = root / 'foreign'; (outside / 'apps').mkdir(parents=True)
+            (app / 'usr/share/icons/hicolor/16x16').symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                build.finalize_deployment_layout(app, root)
+            self.assertTrue((outside / 'apps').is_dir())
+    def test_only_pinned_runtime_md5_bytes_restored(self):
+        original = bytearray(512); original[:6] = b'\x7fELF\x02\x01'
+        struct.pack_into('<Q', original, 40, 128)
+        struct.pack_into('<HHH', original, 58, 64, 3, 2)
+        names = b'\0.digest_md5\0.shstrtab\0'; original[416:416 + len(names)] = names
+        struct.pack_into('<IIQQQQIIQQ', original, 192, 1, 1, 0, 80, 80, 16, 0, 0, 1, 0)
+        struct.pack_into('<IIQQQQIIQQ', original, 256, names.index(b'.shstrtab'), 3,
+                         0, 0, 416, len(names), 0, 0, 1, 0)
+        original = bytes(original); digest = hashlib.sha256(original).hexdigest()
+        with tempfile.TemporaryDirectory() as d:
+            runtime_file = Path(d) / 'runtime'; runtime_file.write_bytes(original)
+            artifact = Path(d) / 'image'
+            changed = bytearray(original); changed[80:96] = b'0123456789abcdef'
+            payload = b'hsqsfixture payload'
+            artifact.write_bytes(changed + payload)
+            receipt = build.restore_runtime_digest(artifact, runtime_file, len(original), digest)
+            self.assertEqual(artifact.read_bytes(), original + payload)
+            self.assertEqual(runtime_file.read_bytes(), original)
+            self.assertEqual(receipt['restored_bytes'], 16)
+            # Arbitrary changes outside the exact pinned section remain fatal,
+            # and a rejected image is preserved byte-for-byte.
+            changed[32] = 1; bad = bytes(changed) + payload
+            artifact.write_bytes(bad)
+            with self.assertRaisesRegex(ValueError, 'outside pinned MD5'):
+                build.restore_runtime_digest(artifact, runtime_file, len(original), digest)
+            self.assertEqual(artifact.read_bytes(), bad)
+            for expected, body in (('0' * 64, original + payload),
+                                   (digest, original + b'wrong offset'),
+                                   (digest, original[:-1])):
+                artifact.write_bytes(body)
+                with self.assertRaises(ValueError):
+                    build.restore_runtime_digest(artifact, runtime_file, len(original), expected)
+                self.assertEqual(artifact.read_bytes(), body)
+
+    def test_apt_signature_collector_preserves_verified_receipt(self):
+        fixture = Path(__file__).resolve().parents[1] / 'package_policy/fixtures/libxau_1.0.9.orig.tar.gz.asc'
+        valid = fixture.read_bytes()
+        secret = b'-----BEGIN PGP PRIVATE KEY BLOCK-----\nnot a source signature\n'
+        for authentication, digest, succeeds, payload in (
+                ('apt signed Sources index', sha(fixture), True, valid),
+                ('untrusted download', sha(fixture), False, valid),
+                ('apt signed Sources index', '0' * 64, False, valid),
+                ('apt signed Sources index', hashlib.sha256(secret).hexdigest(), False, secret)):
+            with self.subTest(authentication=authentication, digest=digest), tempfile.TemporaryDirectory() as d:
+                root = Path(d); app = root / 'AppDir'; app.mkdir()
+                output = root / 'sources'; manifest = root / 'input.json'
+                incoming = root / fixture.name; incoming.write_bytes(payload)
+                source = dict(name=fixture.name, url=incoming.as_uri(), sha256=digest,
+                              authentication=authentication)
+                manifest.write_text(json.dumps({'libraries': {}, 'release_name': 'v0.0.14'}))
+                with mock.patch.object(collect_sources, 'validate', return_value={fixture.name: source}), \
+                     mock.patch.dict(os.environ, {'SOURCE_DATE_EPOCH': '1'}), \
+                     mock.patch.object(sys, 'argv', ['collect_sources.py', '--appdir', str(app),
+                                                    '--manifest', str(manifest), '--output', str(output)]):
+                    if succeeds:
+                        collect_sources.main()
+                        self.assertEqual((output / fixture.name).read_bytes(), fixture.read_bytes())
+                        receipt = json.loads((output / 'MANIFEST.json').read_text())
+                        self.assertEqual(receipt['collected_files'][fixture.name], digest)
+                    else:
+                        with self.assertRaises(ValueError):
+                            collect_sources.main()
+    def test_extracted_qt_plugin_does_not_collide_with_discovery_wrapper(self):
+        class DeploymentReached(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); package = root / 'package'; package.mkdir()
+            for name in ('suyu', 'suyu-cmd', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt'):
+                (package / name).write_bytes(b'fixture')
+            (package / 'LICENSES').mkdir()
+            work = root / 'work'
+            extractions = []
+
+            def fetch_fixture(url, target, expected):
+                target.write_bytes(b'mocked pinned tool or license')
+                return target
+
+            def tool_fixture(command, **kwargs):
+                if command[-1] == '--appimage-extract':
+                    directory = kwargs['cwd']; extractions.append(directory)
+                    extracted = directory / 'squashfs-root'; extracted.mkdir()
+                    (extracted / 'AppRun').write_text('fixture extracted entry point')
+                    return
+                self.assertEqual(command[-2:], ['--plugin', 'qt'])
+                # Pinned PlatformPluginsDeployer.cpp reads this exact key and
+                # treats its value as a filename relative to platforms/.
+                self.assertEqual(kwargs['env']['EXTRA_PLATFORM_PLUGINS'], 'libqoffscreen.so')
+                wrapper = work / 'tools/linuxdeploy-plugin-qt'
+                self.assertTrue(wrapper.is_file())
+                plugin = next(p for p in extractions if p.name == 'linuxdeploy-plugin-qt')
+                self.assertTrue(plugin.is_dir())
+                self.assertNotEqual(wrapper, plugin)
+                self.assertIn(str(plugin / 'squashfs-root/AppRun'), wrapper.read_text())
+                self.assertEqual(kwargs['env']['PATH'].split(os.pathsep)[0], str(work / 'tools'))
+                raise DeploymentReached
+
+            with mock.patch.object(build, 'fetch', side_effect=fetch_fixture), \
+                 mock.patch.object(build.subprocess, 'run', side_effect=tool_fixture), \
+                 mock.patch.object(build.platform, 'freedesktop_os_release',
+                                   return_value={'ID': 'ubuntu', 'VERSION_ID': '24.04'}), \
+                 mock.patch.object(build.platform, 'machine', return_value='x86_64'), \
+                 mock.patch.dict(os.environ, {'SOURCE_DATE_EPOCH': '1'}), \
+                 mock.patch.object(sys, 'argv', ['build.py', '--package-dir', str(package),
+                       '--work-dir', str(work), '--runtime-dir', str(root / 'runtime'),
+                       '--source-revision', 'a' * 40, '--repository', 'fixture/repository',
+                       '--release-name', 'v0.0.14']):
+                with self.assertRaises(DeploymentReached):
+                    build.main()
+
+    @unittest.skipIf(os.name == 'nt' or not hasattr(os, 'geteuid') or os.geteuid() == 0,
+                     'requires a non-root POSIX user for directory permission enforcement')
+    def test_runtime_handoff_reads_without_mutating_source_parent(self):
+        payload = b'verified tiny runtime fixture\n'
+        recipe_bytes = b'fixture recipe; Docker execution is mocked\n'
+        download = b'verified download fixture\n'
+        digest = lambda data: hashlib.sha256(data).hexdigest()
+        lock = json.loads((TOOLS / 'runtime.lock.json').read_text())
+        lock.update(sha256=digest(payload), size=len(payload),
+                    recipe_sha256=digest(recipe_bytes))
+        for entry in lock['sources'] + lock['apks']:
+            entry['sha256'] = digest(download)
+        archives = ['/usr/lib/libc.a', '/usr/lib/libfuse3.a', '/usr/lib/libmimalloc.a',
+                    '/usr/lib/libz.a', '/usr/lib/libzstd.a',
+                    '/usr/local/lib/libsquashfuse.a', '/usr/local/lib/libsquashfuse_ll.a']
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); fixture_tools = root / 'tools'; fixture_tools.mkdir()
+            (fixture_tools / 'runtime-build.sh').write_bytes(recipe_bytes)
+            (fixture_tools / 'runtime.lock.json').write_text(json.dumps(lock))
+            work = root / 'work'; result_dir = work / 'result'
+
+            def fetch_fixture(url, target, expected):
+                target.write_bytes(download)
+                self.assertEqual(sha(target), expected)
+
+            def docker_fixture(command, **kwargs):
+                self.assertEqual(command[:4], ['fixture-docker', 'run', '--rm', '--cpus'])
+                self.assertTrue(kwargs['check'])
+                result_dir.mkdir()
+                binary = result_dir / 'runtime-x86_64'; binary.write_bytes(payload)
+                binary.chmod(0o755)
+                (result_dir / 'runtime.map').write_text('\n'.join(a + '(fixture.o)' for a in archives))
+                records = ['P:' + item['package'] + '\nV:' + item['version'] + '\nc:' + item['commit']
+                           for item in lock['aports_build_commits'].values()]
+                (result_dir / 'apk-installed-db.txt').write_text('\n\n'.join(records))
+                # Model a Docker-owned0755 parent: the host user can read its
+                # files but cannot remove entries. chmod0555 enforces the same
+                # handoff constraint without requiring privileged chown.
+                result_dir.chmod(0o555)
+                self.assertFalse(os.access(result_dir, os.W_OK))
+                with self.assertRaises(PermissionError):
+                    binary.rename(work / 'forbidden-rename')
+
+            try:
+                with mock.patch.object(runtime, 'HERE', fixture_tools), \
+                     mock.patch.object(runtime, 'fetch', side_effect=fetch_fixture), \
+                     mock.patch.object(runtime.subprocess, 'run', side_effect=docker_fixture), \
+                     mock.patch.object(sys, 'argv', ['runtime.py', '--work-dir', str(work),
+                                                    '--docker', 'fixture-docker']):
+                    runtime.main()
+                self.assertEqual((work / 'runtime-x86_64').read_bytes(), payload)
+                self.assertEqual(sha(work / 'runtime-x86_64'), lock['sha256'])
+                self.assertEqual((work / 'runtime-x86_64').stat().st_size, lock['size'])
+                self.assertEqual((result_dir / 'runtime-x86_64').read_bytes(), payload)
+                self.assertEqual(result_dir.stat().st_mode & 0o777, 0o555)
+                receipt = json.loads((work / 'runtime-receipt.json').read_text())
+                self.assertTrue(receipt['reproducibility_pin_verified'])
+                self.assertEqual(receipt['contributed_archives'], archives)
+            finally:
+                if result_dir.exists():
+                    result_dir.chmod(0o755)
+
+    def test_offscreen_plugin_explicitly_deployed(self):
+        env = deployment_env('private-qmake')
+        self.assertEqual(env['EXTRA_PLATFORM_PLUGINS'], 'libqoffscreen.so')
+        self.assertNotIn('EXTRAPLATFORM_PLUGINS', env)
+        self.assertEqual(env['QMAKE'], 'private-qmake')
+        self.assertEqual(env['DISABLE_COPYRIGHT_FILES_DEPLOYMENT'], '1')
+
+    def test_optional_translation_bytes_retained_outside_release(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); app = work / 'AppDir'
+            translations = app / 'usr/translations'; translations.mkdir(parents=True)
+            original = translations / 'qtbase_fr.qm'; original.write_bytes(b'fixture-translation')
+            digest = sha(original)
+            self.assertEqual(retain_optional_translations(app, work), {'qtbase_fr.qm': digest})
+            self.assertFalse(translations.exists())
+            self.assertEqual(sha(work / 'omitted-qt-translations/qtbase_fr.qm'), digest)
+
+    def test_unexpected_translation_subtree_preserved_and_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); app = work / 'AppDir'
+            translations = app / 'usr/translations'; translations.mkdir(parents=True)
+            unexpected = translations / 'unexpected.txt'; unexpected.write_text('preserve')
+            with self.assertRaisesRegex(ValueError, 'unexpected file'):
+                retain_optional_translations(app, work)
+            self.assertTrue(unexpected.is_file())
+
+    @unittest.skipIf(os.name == 'nt', 'actual POSIX launcher runs in Linux CI')
+    def test_actual_root_hook_and_missing_desktop_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = Path(d)
+            (app / 'apprun-hooks').mkdir(); (app / 'usr/bin').mkdir(parents=True)
+            (app / 'apprun-hooks/linuxdeploy-plugin-qt-hook.sh').write_text(
+                'test "$XDG_CURRENT_DESKTOP" = ""\nexport FIXTURE_QT_HOOK=root-hook\n')
+            for command in ('suyu', 'suyu-cmd'):
+                executable = app / 'usr/bin' / command
+                executable.write_text('#!/bin/sh\nprintf "%s:%s" "$FIXTURE_QT_HOOK" "$*"\n')
+                executable.chmod(0o755)
+            run = app / 'AppRun'; run.write_text(apprun_script()); run.chmod(0o755)
+            env = dict(os.environ); env.pop('XDG_CURRENT_DESKTOP', None)
+            result = subprocess.run([str(run), '--suyu-cmd', '--help'], env=env,
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout, 'root-hook:--help')
+
+    def test_uncovered_library_rejected(self):
+        runtime = json.loads((TOOLS / 'runtime.lock.json').read_text())
+        m = dict(schema='suyu-appimage-sources-v1', runtime_complete=True,
+                 runtime_sha256=runtime['sha256'],
+                 runtime_build_receipt=dict(runtime, lock_sha256=sha(TOOLS / 'runtime.lock.json')),
+                 runtime_components=runtime['components'], sources=runtime['sources'], libraries={})
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            validate(m, {'usr/lib/libQt6Core.so.6': 'a' * 64})
+
+    def test_runtime_closure_required(self):
+        with self.assertRaisesRegex(ValueError, 'runtime'):
+            validate(dict(schema='suyu-appimage-sources-v1'), {})
+
+    def test_wrong_cached_download_never_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'tool'; f.write_bytes(b'wrong')
+            with self.assertRaisesRegex(ValueError, 'SHA256'):
+                fetch('https://example.invalid/tool', f, '0' * 64)
+
+    def test_inventory_excludes_self_and_hashes_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); meta = root / 'usr/share/suyu'; meta.mkdir(parents=True)
+            (meta / 'appimage-provenance.json').write_text('self')
+            (root / 'AppRun').write_text('payload')
+            files, links = inventory(root)
+            self.assertEqual(list(files), ['AppRun'])
+            self.assertEqual(len(files['AppRun']), 64)
+            self.assertEqual(links, {})
+
+
+if __name__ == '__main__': unittest.main()

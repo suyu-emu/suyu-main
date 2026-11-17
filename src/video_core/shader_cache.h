@@ -142,6 +142,7 @@ private:
 
     /// @brief Create a new shader entry and register it
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+    const ShaderInfo* TryMakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
@@ -151,6 +152,7 @@ private:
     ankerl::unordered_dense::map<u64, std::unique_ptr<Entry>> lookup_cache;
     ankerl::unordered_dense::map<u64, std::vector<Entry*>> invalidation_cache;
     std::vector<std::unique_ptr<ShaderInfo>> storage;
+    ankerl::unordered_dense::set<VAddr> failed_shader_addrs;
     std::vector<Entry*> marked_for_removal;
 };
 

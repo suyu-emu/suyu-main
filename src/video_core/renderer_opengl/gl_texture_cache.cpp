@@ -14,6 +14,7 @@
 #include "common/bit_util.h"
 #include "common/literals.h"
 #include "common/settings.h"
+#include "video_core/compatible_formats.h"
 #include "video_core/renderer_opengl/gl_device.h"
 #include "video_core/renderer_opengl/gl_shader_manager.h"
 #include "video_core/renderer_opengl/gl_state_tracker.h"
@@ -467,6 +468,7 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, ProgramManager& 
     : device{device_}, state_tracker{state_tracker_}, staging_buffer_pool{staging_buffer_pool_},
       util_shaders(program_manager), format_conversion_pass{util_shaders},
       resolution{Settings::values.resolution_info} {
+    VideoCore::Surface::SeparateAtomicViewFormats(false);
     static constexpr std::array TARGETS{GL_TEXTURE_1D_ARRAY, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_3D};
     for (size_t i = 0; i < TARGETS.size(); ++i) {
         const GLenum target = TARGETS[i];

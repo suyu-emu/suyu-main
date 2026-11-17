@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "common/demangle.h"
 #include "core/arm/debug.h"
 #include "core/arm/recomp/recomp_gaps.h"
@@ -90,7 +92,7 @@ void SymbolicateBacktrace(Kernel::KProcess* process, std::vector<BacktraceEntry>
 
     std::map<std::string, Symbols::Symbols> symbols;
     for (const auto& module : modules) {
-        symbols.insert_or_assign(module.second,
+        symbols.insert_or_assign(module.second.name,
                                  Symbols::GetSymbols(module.first, process->GetMemory(), is_64));
     }
 
@@ -99,7 +101,7 @@ void SymbolicateBacktrace(Kernel::KProcess* process, std::vector<BacktraceEntry>
         for (auto iter = modules.rbegin(); iter != modules.rend(); ++iter) {
             const auto& module{*iter};
             if (entry.original_address >= module.first) {
-                entry.module = module.second;
+                entry.module = module.second.name;
                 base = module.first;
                 break;
             }
@@ -252,6 +254,87 @@ Kernel::KProcessAddress GetModuleEnd(const Kernel::KProcess* process,
     return cur_addr - 1;
 }
 
+std::optional<NsoModuleImageLayout> GetNsoModuleImageLayout(const Kernel::KProcess* process,
+                                                            Kernel::KProcessAddress base) {
+    if (process == nullptr) {
+        return std::nullopt;
+    }
+
+    struct MemoryRegion {
+        u64 address;
+        u64 end;
+        Kernel::Svc::MemoryState state;
+        Kernel::Svc::MemoryPermission permission;
+    };
+
+    const auto& page_table = process->GetPageTable();
+    const auto query_region = [&page_table](u64 address) -> std::optional<MemoryRegion> {
+        if (!page_table.Contains(address, 1)) {
+            return std::nullopt;
+        }
+
+        Kernel::KMemoryInfo memory_info{};
+        Kernel::Svc::PageInfo page_info{};
+        const auto query_result =
+            page_table.QueryInfo(std::addressof(memory_info), std::addressof(page_info), address);
+        if (query_result.IsFailure()) {
+            return std::nullopt;
+        }
+
+        const Kernel::Svc::MemoryInfo info = memory_info.GetSvcMemoryInfo();
+        if (info.size == 0 || info.size > std::numeric_limits<u64>::max() - info.base_address) {
+            return std::nullopt;
+        }
+        const u64 end = info.base_address + info.size;
+        if (info.base_address > address || address >= end) {
+            return std::nullopt;
+        }
+        return MemoryRegion{
+            .address = info.base_address,
+            .end = end,
+            .state = info.state,
+            .permission = info.permission,
+        };
+    };
+
+    const u64 module_base = GetInteger(base);
+    const auto text = query_region(module_base);
+    // Executable images mapped through the alias-code path use the same permission sequence;
+    // accepting that family is safe only when all three regions remain consistently aliased.
+    if (!text || text->address != module_base ||
+        text->permission != Kernel::Svc::MemoryPermission::ReadExecute ||
+        (text->state != Kernel::Svc::MemoryState::Code &&
+         text->state != Kernel::Svc::MemoryState::AliasCode)) {
+        return std::nullopt;
+    }
+
+    const auto rodata = query_region(text->end);
+    if (!rodata || rodata->address != text->end || rodata->state != text->state ||
+        rodata->permission != Kernel::Svc::MemoryPermission::Read) {
+        return std::nullopt;
+    }
+
+    const Kernel::Svc::MemoryState expected_data_state =
+        text->state == Kernel::Svc::MemoryState::Code ? Kernel::Svc::MemoryState::CodeData
+                                                      : Kernel::Svc::MemoryState::AliasCodeData;
+    const auto data = query_region(rodata->end);
+    if (!data || data->address != rodata->end || data->state != expected_data_state ||
+        data->permission != Kernel::Svc::MemoryPermission::ReadWrite || data->end <= module_base) {
+        return std::nullopt;
+    }
+
+    return NsoModuleImageLayout{
+        .image_size = data->end - module_base,
+        .text_size = text->end - module_base,
+    };
+}
+
+std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
+                                         Kernel::KProcessAddress base) {
+    const auto layout = GetNsoModuleImageLayout(process, base);
+    return layout ? std::optional<u64>{layout->image_size} : std::nullopt;
+}
+
 Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {
     Loader::AppLoader::Modules modules;
 
@@ -270,19 +353,38 @@ Loader::AppLoader::Modules FindModules(Kernel::KProcess* process) {
         if (svc_mem_info.permission == Kernel::Svc::MemoryPermission::ReadExecute &&
             (svc_mem_info.state == Kernel::Svc::MemoryState::Code ||
              svc_mem_info.state == Kernel::Svc::MemoryState::AliasCode)) {
-            // Try to read the module name from its path, which starts the
-            // read-only segment right after the code.
-            std::array<u8, Core::RecompGaps::kRodataModuleNameBytes> rodata{};
-            const VAddr rodata_start = svc_mem_info.base_address + svc_mem_info.size;
-            // The longest read can run past a small module's last mapped page;
-            // the older layout never needed its first 12 bytes.
-            const bool read = memory.ReadBlock(rodata_start, rodata.data(), rodata.size()) ||
-                              memory.ReadBlock(rodata_start, rodata.data(), rodata.size() - 12);
-            if (read) {
-                std::string name =
-                    Core::RecompGaps::ModuleNameFromRodata(rodata.data(), rodata.size());
-                if (!name.empty()) {
-                    modules.emplace(svc_mem_info.base_address, std::move(name));
+            // Try to read the module name from its path.
+            constexpr s32 PathLengthMax = 0x200;
+            struct {
+                u32 zero;
+                s32 path_length;
+                std::array<char, PathLengthMax> path;
+            } module_path;
+
+            if (memory.ReadBlock(svc_mem_info.base_address + svc_mem_info.size, &module_path,
+                                 sizeof(module_path))) {
+                if (module_path.zero == 0 && module_path.path_length > 0) {
+                    // Truncate module name.
+                    module_path.path[PathLengthMax - 1] = '\0';
+
+                    // Ignore leading directories.
+                    char* path_pointer = module_path.path.data();
+                    char* path_end =
+                        path_pointer + (std::min)(PathLengthMax, module_path.path_length);
+
+                    for (s32 i = 0; i < (std::min)(PathLengthMax, module_path.path_length) &&
+                                    module_path.path[i] != '\0';
+                         i++) {
+                        if (module_path.path[i] == '/' || module_path.path[i] == '\\') {
+                            path_pointer = module_path.path.data() + i + 1;
+                        }
+                    }
+
+                    // Insert output.
+                    modules.emplace(
+                        svc_mem_info.base_address,
+                        Loader::AppLoader::NsoModuleInfo{
+                            std::string{std::string_view(path_pointer, path_end)}, {}});
                 }
             }
         }

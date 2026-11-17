@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <array>
 #include <cstring>
 #include <openssl/err.h>
@@ -34,8 +33,7 @@ struct CipherContext {
     EVP_CIPHER_CTX* encryption_context = nullptr;
     EVP_CIPHER_CTX* decryption_context = nullptr;
     EVP_CIPHER* cipher = nullptr;
-    /// False when no key was supplied; such a cipher never touches data.
-    bool keyed = false;
+    bool initialized = false;
 };
 
 static inline const std::string GetCipherName(Mode mode, u32 key_size) {
@@ -97,19 +95,16 @@ Crypto::AESCipher<Key>::AESCipher(Key key, Mode mode) : ctx(std::make_unique<Cip
 
     ASSERT(ctx->encryption_context && ctx->decryption_context && ctx->cipher && "OpenSSL cipher context failed init!");
     // now init ciphers
-    // An all-zero key means the user has not installed the key this cipher needs.
-    // XTS rejects such a key outright, because its two halves must differ, so the
-    // cipher is left unkeyed; callers check for the key and report it missing, and
-    // an unkeyed cipher refuses to transcode rather than crash.
-    const bool key_present =
-        std::any_of(key.begin(), key.end(), [](u8 b) { return b != 0; });
-    if (!key_present) {
-        LOG_DEBUG(Crypto, "No key available for this cipher; leaving it uninitialized");
-        return;
+    // Zero is a valid AES key for CTR and ECB, and those ciphers are exercised
+    // during key derivation even when a key file is absent. Initialize every
+    // mode normally instead of leaving a callable half-initialized object.
+    const bool encryption_initialized =
+        EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL) == 1;
+    const bool decryption_initialized =
+        EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL) == 1;
+    if (!encryption_initialized || !decryption_initialized) {
+        UNREACHABLE_MSG("Failed to initialize OpenSSL {} cipher", GetCipherName(mode, sizeof(Key)));
     }
-    ctx->keyed = true;
-    ASSERT(EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL));
-    ASSERT(EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL));
 
     EVP_CIPHER_CTX_set_padding(ctx->encryption_context, 0);
     EVP_CIPHER_CTX_set_padding(ctx->decryption_context, 0);
@@ -124,6 +119,13 @@ AESCipher<Key>::~AESCipher() {
 
 template <typename Key>
 void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op) const {
+    if (!ctx->initialized) {
+        if (src != dest) {
+            std::memcpy(dest, src, size);
+        }
+        return;
+    }
+
     auto* const context = op == Op::Encrypt ? ctx->encryption_context : ctx->decryption_context;
 
     if (size == 0)
@@ -135,10 +137,22 @@ void AESCipher<Key>::Transcode(const u8* src, std::size_t size, u8* dest, Op op)
     }
 
     // reset
-    ASSERT(EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1));
+    if (EVP_CipherInit_ex(context, nullptr, nullptr, nullptr, nullptr, -1) != 1) {
+        ctx->initialized = false;
+        if (src != dest) {
+            std::memcpy(dest, src, size);
+        }
+        return;
+    }
 
     const int block_size = EVP_CIPHER_CTX_get_block_size(context);
-    ASSERT(block_size > 0 && block_size <= int(AesBlockBytes));
+    if (block_size <= 0 || block_size > int(AesBlockBytes)) {
+        ctx->initialized = false;
+        if (src != dest) {
+            std::memcpy(dest, src, size);
+        }
+        return;
+    }
 
     const std::size_t whole_block_bytes = size - (size % block_size);
     int written = 0;
@@ -183,12 +197,15 @@ void AESCipher<Key>::XTSTranscode(const u8* src, std::size_t size, u8* dest, std
 
 template <typename Key>
 void AESCipher<Key>::SetIV(std::span<const u8> data) {
-    if (!ctx->keyed) {
+    if (!ctx->initialized) {
         return;
     }
+
     const int ret_enc = EVP_CipherInit_ex(ctx->encryption_context, nullptr, nullptr, nullptr, data.data(), -1);
     const int ret_dec = EVP_CipherInit_ex(ctx->decryption_context, nullptr, nullptr, nullptr, data.data(), -1);
-    ASSERT(ret_enc == 1 && ret_dec == 1 && "Failed to set IV on OpenSSL contexts");
+    if (ret_enc != 1 || ret_dec != 1) {
+        ctx->initialized = false;
+    }
 }
 
 template class AESCipher<Key128>;

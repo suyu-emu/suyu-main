@@ -208,9 +208,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return load_base + image_size;
     }
 
+    // Preserve the immutable module identity even for a directly opened NSO,
+    // where no PatchManager exists. Hosted recompiled images use this together
+    // with the live mapped-text hash to prove they came from the loaded code.
+    system.SetApplicationProcessBuildID(nso_header.build_id);
+
     // Apply cheats if they exist and the program has a valid title ID
     if (pm) {
-        system.SetApplicationProcessBuildID(nso_header.build_id);
         const auto cheats = pm->CreateCheatList(nso_header.build_id);
         if (!cheats.empty()) {
             system.RegisterCheatList(cheats, nso_header.build_id, load_base, image_size);
@@ -239,7 +243,9 @@ AppLoader_NSO::LoadResult AppLoader_NSO::Load(Kernel::KProcess& process, Core::S
         return {ResultStatus::ErrorLoadingNSO, {}};
     }
 
-    modules.insert_or_assign(base_address, file->GetName());
+    modules.insert_or_assign(
+        base_address,
+        AppLoader::NsoModuleInfo{file->GetName(), system.GetApplicationProcessBuildID()});
     LOG_DEBUG(Loader, "loaded module {} @ {:#X}", file->GetName(), base_address);
 
     is_loaded = true;

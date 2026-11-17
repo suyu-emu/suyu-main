@@ -15,13 +15,21 @@ void LoopProcess(Core::System& system) {
                                              system, "pctl",
                                              Capability::Application | Capability::SnsPost |
                                                  Capability::Status | Capability::StereoVision));
-    // TODO(ogniK): Implement remaining capabilities
-    server_manager->RegisterNamedService("pctl:a", std::make_shared<IParentalControlServiceFactory>(
-                                                       system, "pctl:a", Capability::None));
-    server_manager->RegisterNamedService("pctl:r", std::make_shared<IParentalControlServiceFactory>(
-                                                       system, "pctl:r", Capability::None));
-    server_manager->RegisterNamedService("pctl:s", std::make_shared<IParentalControlServiceFactory>(
-                                                       system, "pctl:s", Capability::None));
+    // These named services expose different permission masks. Model the capability bits that are
+    // currently implemented by IParentalControlService; the remaining mask bits are still TODO.
+    server_manager->RegisterNamedService("pctl:a",
+                                         std::make_shared<IParentalControlServiceFactory>(
+                                             system, "pctl:a",
+                                             Capability::SnsPost | Capability::Status |
+                                                 Capability::StereoVision | Capability::System));
+    server_manager->RegisterNamedService(
+        "pctl:r", std::make_shared<IParentalControlServiceFactory>(
+                      system, "pctl:r", Capability::Recovery | Capability::System));
+    server_manager->RegisterNamedService("pctl:s",
+                                         std::make_shared<IParentalControlServiceFactory>(
+                                             system, "pctl:s",
+                                             Capability::SnsPost | Capability::Status |
+                                                 Capability::StereoVision | Capability::System));
     ServerManager::RunServer(std::move(server_manager));
 }
 

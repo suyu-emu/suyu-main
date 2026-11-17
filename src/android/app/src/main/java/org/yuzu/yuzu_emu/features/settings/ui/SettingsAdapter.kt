@@ -17,104 +17,34 @@ import androidx.navigation.findNavController
 import androidx.recyclerview.widget.AsyncDifferConfig
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
+import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.datepicker.MaterialDatePicker
 import com.google.android.material.timepicker.MaterialTimePicker
 import com.google.android.material.timepicker.TimeFormat
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.SettingsNavigationDirections
-import org.yuzu.yuzu_emu.databinding.ListItemSettingBinding
-import org.yuzu.yuzu_emu.databinding.ListItemSettingInputBinding
-import org.yuzu.yuzu_emu.databinding.ListItemSettingSwitchBinding
-import org.yuzu.yuzu_emu.databinding.ListItemSettingsHeaderBinding
 import org.yuzu.yuzu_emu.features.input.NativeInput
 import org.yuzu.yuzu_emu.features.input.model.AnalogDirection
 import org.yuzu.yuzu_emu.features.settings.model.AbstractIntSetting
 import org.yuzu.yuzu_emu.features.settings.model.Settings
 import org.yuzu.yuzu_emu.features.settings.model.view.*
-import org.yuzu.yuzu_emu.features.settings.ui.viewholder.*
 import org.yuzu.yuzu_emu.utils.ParamPackage
 
 class SettingsAdapter(
     private val fragment: Fragment,
     private val context: Context
-) : ListAdapter<SettingsItem, SettingViewHolder>(
+) : ListAdapter<SettingsItem, RecyclerView.ViewHolder>(
     AsyncDifferConfig.Builder(DiffCallback()).build()
 ) {
     private val settingsViewModel: SettingsViewModel
         get() = ViewModelProvider(fragment.requireActivity())[SettingsViewModel::class.java]
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): SettingViewHolder {
-        val inflater = LayoutInflater.from(parent.context)
-        return when (viewType) {
-            SettingsItem.TYPE_HEADER -> {
-                HeaderViewHolder(ListItemSettingsHeaderBinding.inflate(inflater), this)
-            }
+    // Rows are drawn by Compose (see SettingsRows); this adapter only keeps the list, the diffing
+    // and the click handlers, so it is never attached to a RecyclerView.
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder =
+        throw UnsupportedOperationException("Settings rows are rendered with Compose")
 
-            SettingsItem.TYPE_SWITCH -> {
-                SwitchSettingViewHolder(ListItemSettingSwitchBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_SINGLE_CHOICE, SettingsItem.TYPE_STRING_SINGLE_CHOICE -> {
-                SingleChoiceViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_SLIDER -> {
-                SliderViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_SPINBOX -> {
-                SpinBoxViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_SUBMENU -> {
-                SubmenuViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_DATETIME_SETTING -> {
-                DateTimeViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_RUNNABLE -> {
-                RunnableViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_INPUT -> {
-                InputViewHolder(ListItemSettingInputBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_INT_SINGLE_CHOICE -> {
-                SingleChoiceViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_INPUT_PROFILE -> {
-                InputProfileViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_STRING_INPUT -> {
-                StringInputViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_LAUNCHABLE -> {
-                LaunchableViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-			
-            SettingsItem.TYPE_PATH -> {
-                PathViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            SettingsItem.TYPE_GPU_UNSWIZZLE -> {
-                GpuUnswizzleViewHolder(ListItemSettingBinding.inflate(inflater), this)
-            }
-
-            else -> {
-                HeaderViewHolder(ListItemSettingsHeaderBinding.inflate(inflater), this)
-            }
-        }
-    }
-
-    override fun onBindViewHolder(holder: SettingViewHolder, position: Int) {
-        holder.bind(currentList[position])
-    }
+    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) = Unit
 
     override fun getItemCount(): Int = currentList.size
 

@@ -16,6 +16,19 @@ std::string GetThreadState(const Kernel::KThread* thread);
 
 Loader::AppLoader::Modules FindModules(Kernel::KProcess* process);
 Kernel::KProcessAddress GetModuleEnd(const Kernel::KProcess* process, Kernel::KProcessAddress base);
+struct NsoModuleImageLayout {
+    u64 image_size;
+    u64 text_size;
+};
+/// Returns the mapped image and executable-text extents after proving the exact contiguous
+/// text/rodata/data mapping shape. Both extents use exclusive ends relative to `base`.
+std::optional<NsoModuleImageLayout> GetNsoModuleImageLayout(const Kernel::KProcess* process,
+                                                            Kernel::KProcessAddress base);
+/// Returns the byte size of a loader-mapped NSO image after proving the exact contiguous
+/// text/rodata/data mapping shape. Unlike GetModuleEnd, malformed mappings are rejected without
+/// asserting and the returned extent uses an exclusive end.
+std::optional<u64> GetNsoModuleImageSize(const Kernel::KProcess* process,
+                                         Kernel::KProcessAddress base);
 Kernel::KProcessAddress FindMainModuleEntrypoint(Kernel::KProcess* process);
 
 void InvalidateInstructionCacheRange(const Kernel::KProcess* process, u64 address, u64 size);

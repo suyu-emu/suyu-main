@@ -86,6 +86,7 @@ public:
     ~RasterizerVulkan() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
+    void EmulateIndirectArgsInit(bool is_indexed);
     void DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
@@ -155,6 +156,20 @@ private:
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
+
+    /// A stretch of a draw whose vertices all carry the same texture handle.
+    struct AttributeHandleRun {
+        u32 first;
+        u32 count;
+        u32 handle;
+    };
+
+    /// Splits the current draw wherever the texture handle carried in the vertex data changes.
+    void CollectAttributeHandleRuns(bool is_indexed);
+
+    std::vector<AttributeHandleRun> attribute_handle_runs;
+    GraphicsPipeline* attribute_handle_pipeline{};
+    bool split_attribute_handles{};
 
     void FlushWork();
 

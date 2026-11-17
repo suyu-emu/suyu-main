@@ -72,8 +72,12 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate() || Settings::IsGPUFenceBehaviorStrict();
         const bool should_flush = ShouldFlush();
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault()
+                                     ? (Settings::IsGPULevelHigh() || should_flush)
+                                     : Settings::IsGPUFenceBehaviorBalanced() ||
+                                           Settings::IsGPUFenceBehaviorAccurate() ||
+                                           Settings::IsGPUFenceBehaviorStrict();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }

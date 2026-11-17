@@ -1106,6 +1106,10 @@ void KernelCore::RunOnGuestCoreProcess(std::string&& process_name, std::function
 
     // Initialize the thread.
     KThread* thread = KThread::Create(*this);
+    // Running holds a reference of its own, which termination releases
+    SCOPE_EXIT {
+        thread->Close(*this);
+    };
     ASSERT(R_SUCCEEDED(KThread::InitializeServiceThread(
         System(), thread, std::move(func), ServiceThreadPriority, ServiceThreadCore, process)));
 

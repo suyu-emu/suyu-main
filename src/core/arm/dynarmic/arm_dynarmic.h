@@ -13,6 +13,7 @@
 namespace Core {
 
 constexpr Dynarmic::HaltReason StepThread = Dynarmic::HaltReason::Step;
+constexpr Dynarmic::HaltReason CacheInvalidation = Dynarmic::HaltReason::CacheInvalidation;
 constexpr Dynarmic::HaltReason DataAbort = Dynarmic::HaltReason::MemoryAbort;
 constexpr Dynarmic::HaltReason BreakLoop = Dynarmic::HaltReason::UserDefined2;
 constexpr Dynarmic::HaltReason SupervisorCall = Dynarmic::HaltReason::UserDefined3;
@@ -21,6 +22,7 @@ constexpr Dynarmic::HaltReason PrefetchAbort = Dynarmic::HaltReason::UserDefined
 
 constexpr HaltReason TranslateHaltReason(Dynarmic::HaltReason hr) {
     static_assert(u64(HaltReason::StepThread) == u64(StepThread));
+    static_assert(u64(HaltReason::CacheInvalidation) == u64(CacheInvalidation));
     static_assert(u64(HaltReason::DataAbort) == u64(DataAbort));
     static_assert(u64(HaltReason::BreakLoop) == u64(BreakLoop));
     static_assert(u64(HaltReason::SupervisorCall) == u64(SupervisorCall));

@@ -47,6 +47,7 @@ private:
     void SetWindowTitle(const Core::Frontend::ProfileSelectParameters& parameters);
     void SetDialogPurpose(const Core::Frontend::ProfileSelectParameters& parameters);
 
+    static constexpr int ProfileIndexRole = Qt::UserRole + 1;
     int user_index = 0;
 
     QVBoxLayout* layout;

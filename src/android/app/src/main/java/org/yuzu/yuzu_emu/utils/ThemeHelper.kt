@@ -86,21 +86,14 @@ object ThemeHelper {
         }
     }
 
+    /** The Suyu style is dark only, so the legacy "theme mode" setting no longer applies. */
     fun setThemeMode(activity: AppCompatActivity) {
-        val themeMode = IntSetting.THEME_MODE.getInt()
-        activity.delegate.localNightMode = themeMode
+        activity.delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_YES
         val windowController = WindowCompat.getInsetsController(
             activity.window,
             activity.window.decorView
         )
-        when (themeMode) {
-            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM -> when (isNightMode(activity)) {
-                false -> setLightModeSystemBars(windowController)
-                true -> setDarkModeSystemBars(windowController)
-            }
-            AppCompatDelegate.MODE_NIGHT_NO -> setLightModeSystemBars(windowController)
-            AppCompatDelegate.MODE_NIGHT_YES -> setDarkModeSystemBars(windowController)
-        }
+        setDarkModeSystemBars(windowController)
     }
 
     private fun isNightMode(activity: AppCompatActivity): Boolean {

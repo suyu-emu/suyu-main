@@ -168,7 +168,12 @@ else()
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-attributes>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-invalid-offsetof>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
-        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
+        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>
+        # Newer GCC releases add false positives to these; keep them as warnings.
+        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=maybe-uninitialized>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=dangling-reference>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=array-bounds>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-error=stringop-overflow>)
 
     if (CXX_CLANG OR CXX_ICC OR CXX_APPLE) # Clang, AppleClang, or Intel C++
         if (NOT MSVC)

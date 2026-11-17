@@ -22,8 +22,8 @@
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/guest_fp_env.h"
 #include "core/arm/recomp/recomp_gap_session.h"
-#include "core/arm/recomp/recomp_gaps.h"
 #include "core/arm/recomp/recomp_diagnostic_sampler.h"
+#include "core/arm/recomp/recomp_image_abi.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_thread.h"
@@ -117,6 +117,19 @@ struct RecompHostMem {
     u64 address_space_max;
     // Reserved for layout compatibility; ABI 5 never reads this slot.
     const u64* guard_generation;
+    // Page attribute tag layout and values, read out of Common::PageType rather
+    // than restated, so the generated C side cannot drift from this one. The
+    // inline fast path only fires on an exact page_type_memory match, so a
+    // stale tag would inline stores to pages the rasterizer has cached, which
+    // is a silent GPU read of stale memory.
+    u64 page_type_mask;
+    u64 page_type_memory;
+    u64 page_type_debug;
+    u64 page_type_rasterizer_cached;
+    // Guest-memory access counters (see RecompGuestMemCounter in the emitter).
+    // Bumped with relaxed atomics from guest threads, so these are atomic here
+    // too and are read only when the metrics snapshot is taken.
+    std::atomic<u64>* counters;
 };
 
 // This struct is duplicated by hand in the emitter (arm64_to_c.h, RuntimeH's
@@ -137,7 +150,12 @@ static_assert(offsetof(RecompHostMem, page_bits) == 88);
 static_assert(offsetof(RecompHostMem, pointer_mask) == 96);
 static_assert(offsetof(RecompHostMem, address_space_max) == 104);
 static_assert(offsetof(RecompHostMem, guard_generation) == 112);
-static_assert(sizeof(RecompHostMem) == 120);
+static_assert(offsetof(RecompHostMem, page_type_mask) == 120);
+static_assert(offsetof(RecompHostMem, page_type_memory) == 128);
+static_assert(offsetof(RecompHostMem, page_type_debug) == 136);
+static_assert(offsetof(RecompHostMem, page_type_rasterizer_cached) == 144);
+static_assert(offsetof(RecompHostMem, counters) == 152);
+static_assert(sizeof(RecompHostMem) == 160);
 
 // Nothing links these two builds together, so the shared layout is pinned on
 // both sides: the generated runtime asserts the same four offsets against its
@@ -415,11 +433,6 @@ constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 namespace {
 std::atomic<RecompLookupFn> g_recomp_lookup{nullptr};
 std::atomic<RecompBaseFn> g_recomp_base_setter{nullptr};
-std::atomic<RecompBindCheckFn> g_recomp_bind_check{nullptr};
-// The process whose bindings were checked (id | 1 << 63), and whether a strict
-// run refused it because an image never got its module's base.
-std::atomic<u64> g_bind_checked_process{0};
-std::atomic<bool> g_bind_refused{false};
 std::mutex g_process_init_lock;
 std::atomic<RecompPrepareFn> g_recomp_prepare{nullptr};
 
@@ -479,6 +492,27 @@ struct RecompCounters {
 };
 
 RecompCounters g_counters;
+
+/// Guest memory accesses resolved by the generated code's page-table fast path,
+/// in GuestMemCounter order.
+///
+/// One contiguous run rather than four named members, because the generated C
+/// reaches them through a bare `uint64_t*`. A struct gives no guarantee its
+/// members are adjacent, so handing one over would interleave the C side's
+/// writes with padding.
+struct GuestMemCounters {
+    std::atomic<u64> slots[suyu::recomp::kRecompGuestMemCounterCount]{
+        std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}, std::atomic<u64>{0}};
+
+    static_assert(sizeof(slots) / sizeof(slots[0]) ==
+                  static_cast<std::size_t>(suyu::recomp::kRecompGuestMemCounterCount));
+    static_assert(std::atomic<u64>::is_always_lock_free,
+                  "guest-memory counters are bumped without a lock from guest threads");
+
+    std::atomic<u64>* data() { return slots; }
+};
+
+GuestMemCounters g_guest_mem;
 std::array<std::atomic<u64>, 4> g_current_pcs{};
 std::atomic<int> g_live_instances{0};
 std::mutex g_snapshot_lock;
@@ -863,10 +897,6 @@ void SetRecompBaseSetter(RecompBaseFn setter) {
     g_recomp_base_setter.store(setter, std::memory_order_release);
 }
 
-void SetRecompBindCheck(RecompBindCheckFn check) {
-    g_recomp_bind_check.store(check, std::memory_order_release);
-}
-
 RecompLiveStats GetRecompLiveStats() {
     return RecompLiveStats{
         TotalStaticBlocks(),
@@ -881,6 +911,20 @@ RecompLiveStats GetRecompLiveStats() {
         true,
 #endif
         StrictNoFallback(),
+    };
+}
+
+RecompGuestMemStats GetRecompGuestMemStats() {
+    using namespace suyu::recomp;
+    return RecompGuestMemStats{
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::FastPathHits)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::GpuTracked)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::Debug)].load(
+            std::memory_order_relaxed),
+        g_guest_mem.slots[static_cast<std::size_t>(GuestMemCounter::Other)].load(
+            std::memory_order_relaxed),
     };
 }
 
@@ -914,6 +958,7 @@ struct ArmRecomp::Impl {
         // fields stay null and every access takes the callback path.
         bridge.page_entries = nullptr;
         bridge.guard_generation = nullptr;
+        bridge.counters = g_guest_mem.data();
         ctx.host_mem = &bridge;
     }
 
@@ -1012,6 +1057,16 @@ struct ArmRecomp::Impl {
         bridge.page_bits = view.page_bits;
         bridge.pointer_mask = view.pointer_mask;
         bridge.address_space_max = view.address_space_max;
+        // Derived from PageInfo itself rather than written as literals, for the
+        // reason given on the struct: the C fast path gates on an exact
+        // page_type_memory match, so a tag that drifted from the enum would
+        // stop invalidating rasterizer-cached pages.
+        bridge.page_type_mask =
+            static_cast<u64>((uintptr_t{1} << Common::PageTable::ATTRIBUTE_BITS) - 1);
+        bridge.page_type_memory = static_cast<u64>(Common::PageType::Memory);
+        bridge.page_type_debug = static_cast<u64>(Common::PageType::DebugMemory);
+        bridge.page_type_rasterizer_cached =
+            static_cast<u64>(Common::PageType::RasterizerCachedMemory);
         if (kSlowPathAbove != 0 && kSlowPathAbove < bridge.address_space_max &&
             TotalStaticBlocks() >= kSlowPathAfterBlocks) {
             bridge.address_space_max = kSlowPathAbove;
@@ -1174,29 +1229,20 @@ struct ArmRecomp::Impl {
 
     /// Base address of the module containing `pc`, so an address can be turned
     /// into the module-relative offset a recompiled image is keyed by. The
-    /// module list is fixed once the process is running, so it is read once:
-    /// the first guest entry comes after KProcess::Run, which the loader
-    /// precedes. The bind check in RunThread reports any image left unbound.
+    /// module list is fixed once the process is running, so it is read once.
     u64 ModuleBaseFor(Kernel::KThread* thread, u64 pc) {
         if (!modules_read) {
             modules_read = true;
             if (auto* process = thread->GetOwnerProcess()) {
                 modules = FindModules(process);
-                if (modules.empty()) {
-                    LOG_ERROR(Core_ARM, "recomp: no loaded module could be named; recompiled "
-                                        "images get no base");
-                }
                 g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
                 // where its own module went.
                 if (const auto setter = g_recomp_base_setter.load(std::memory_order_acquire)) {
                     // modules is keyed by base, so iteration is load order.
-                    // The build ID, as the loader noted it, is what identifies
-                    // the module to its image.
                     size_t index = 0;
                     for (const auto& [module_base, name] : modules) {
-                        const std::string build_id = RecompGaps::ModuleBuildId(module_base);
-                        setter(index++, name.c_str(), build_id.c_str(), module_base);
+                        setter(index++, name.c_str(), module_base);
                     }
                 }
             }
@@ -1273,10 +1319,13 @@ struct ArmRecomp::Impl {
         // MOD0 magic "MOD0" = 0x30444F4D. It sits at the start of rodata
         // (typically mod+0x2000 for rtld), but the actual location is pointed
         // to by a 4-byte offset at mod+4 (per NSO ABI). Scan the first few KB.
-        // Scanning only the first pages missed TOTK 1.4.3's main, subsdk0
-        // and sdk, whose MOD0 is megabytes in: they were never indexed, so
-        // rtld's imports of sdk's nn::init::Start found nothing and stayed 0.
-        const u64 mod0_va = RecompGaps::FindMod0(mod_base, read8);
+        u64 mod0_va = 0;
+        for (u64 off = 0; off < 0x4000; off += 4) {
+            if (mem.Read32(mod_base + off) == 0x30444F4Du) {
+                mod0_va = mod_base + off;
+                break;
+            }
+        }
         if (!mod0_va) return false;
 
         // MOD0 layout: magic(4), dyn_offset(4), bss_start(4), bss_end(4)
@@ -1321,12 +1370,34 @@ struct ArmRecomp::Impl {
         bool defined = false;
         bool weak = false;
     };
-    // st_shndx is the 2-byte field at +6; reading 4 bytes there once spilled
-    // into st_value and corrupted the defined check. An undefined weak symbol
-    // that no module exports resolves to 0 - see the fallthrough below.
     SymInfo ReadSymbol(const DynInfo& d, u32 index) {
-        auto s = RecompGaps::ReadDynSymbol(d.symtab_va, d.strtab_va, index, read8);
-        return SymInfo{std::move(s.name), s.value, s.defined, s.weak};
+        auto& mem = system.ApplicationMemory();
+        SymInfo s;
+        if (!d.symtab_va) return s;
+        const u64 sym_va = d.symtab_va + static_cast<u64>(index) * 24;
+        const u32 name_off = mem.Read32(sym_va);
+        // st_shndx is a 2-byte field at offset 6 (st_name(4) st_info(1)
+        // st_other(1) st_shndx(2) st_value(8) st_size(8)) - reading 4 bytes
+        // here previously spilled into st_value's low bytes, corrupting the
+        // defined/undefined check for essentially every symbol whose value
+        // had nonzero low 16 bits.
+        const u16 shndx = mem.Read16(sym_va + 6);
+        s.value = mem.Read64(sym_va + 8);
+        s.defined = shndx != 0; // SHN_UNDEF == 0
+        // st_info is the byte at +4; the binding is its high nibble.
+        // STB_WEAK == 2. An undefined weak symbol must resolve to 0, which is
+        // how the guest's own rtld leaves it - see the fallthrough below.
+        s.weak = (static_cast<u8>(mem.Read8(sym_va + 4)) >> 4) == 2;
+        if (d.strtab_va) {
+            std::string name;
+            for (u64 i = 0; i < 512; ++i) {
+                const u8 c = static_cast<u8>(mem.Read8(d.strtab_va + name_off + i));
+                if (!c) break;
+                name.push_back(static_cast<char>(c));
+            }
+            s.name = std::move(name);
+        }
+        return s;
     }
 
     // Every module's exported (defined) symbols, keyed by name, so
@@ -1336,6 +1407,7 @@ struct ArmRecomp::Impl {
     // actually writes anything - a relocation processed before its target
     // module's exports are indexed would silently resolve to nothing.
     void IndexExports(const DynInfo& d, std::unordered_map<std::string, u64>& out) {
+        if (!d.symtab_va || !d.strtab_va) return;
         // No count is stored in .dynamic for a plain DT_SYMTAB (that's normally
         // DT_HASH/DT_GNU_HASH territory), but .dynsym and .dynstr are laid out
         // back to back in every Switch module observed so far, so the gap
@@ -1343,7 +1415,17 @@ struct ArmRecomp::Impl {
         // from name-offset values, which was cutting exports short before
         // rtld's own required symbols were reached (18 unresolved externals
         // for rtld itself were enough to trigger its self-abort).
-        RecompGaps::IndexModuleExports(d.mod_base, d.symtab_va, d.strtab_va, read8, out);
+        u32 max_index = 8192;
+        if (d.strtab_va > d.symtab_va) {
+            const u64 span = d.strtab_va - d.symtab_va;
+            max_index = static_cast<u32>(std::min<u64>(span / 24, 65536));
+        }
+        for (u32 i = 1; i < max_index; ++i) { // index 0 is always the null symbol
+            const auto sym = ReadSymbol(d, i);
+            if (sym.defined && !sym.name.empty()) {
+                out.emplace(sym.name, d.mod_base + sym.value);
+            }
+        }
     }
 
     void ApplyRelocTable(const DynInfo& d, u64 table_va, u64 table_sz, u64 entry_sz,
@@ -1452,8 +1534,8 @@ struct ArmRecomp::Impl {
                     // sites on its allocator path, so every allocation took the
                     // hook branch and got nothing back.
                     // Strong symbols keep the trap sentinel.
-                    const u64 stub = RecompGaps::UndefinedImportValue(
-                        sym.weak, d.trap_va ? d.trap_va : kUnresolvedImportTrap);
+                    const u64 stub =
+                        sym.weak ? 0 : (d.trap_va ? d.trap_va : kUnresolvedImportTrap);
                     mem.Write64(d.mod_base + r_offset, stub);
                     // The trap counter cannot report this case - it is only
                     // written when a thread actually reaches kUnresolvedImportTrap,
@@ -1587,9 +1669,6 @@ struct ArmRecomp::Impl {
 
     RecompDiagnosticSampler diagnostics;
     System& system;
-    // Byte reads of this process's memory for the RecompGaps module parsers.
-    const RecompGaps::GuestRead8 read8{
-        [this](u64 va) -> std::uint8_t { return system.ApplicationMemory().Read8(va); }};
     RecompLookupFn lookup{};
     GuestContextView ctx{};
     RecompHostMem bridge{};
@@ -1849,33 +1928,6 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
             impl->ModuleBaseFor(thread, impl->ctx.pc);
             impl->ApplyAllRelocations(impl->modules);
             impl->rela_applied = true;
-        }
-    }
-
-    // Once per process, before its first block: every image that should have
-    // been given a base has one, or the run says so instead of faulting on a
-    // module-relative address used as absolute.
-    if (auto* process = thread->GetOwnerProcess()) {
-        const u64 key = process->GetProcessId() | (u64{1} << 63);
-        if (g_bind_checked_process.load(std::memory_order_acquire) != key) {
-            std::scoped_lock lock{g_process_init_lock};
-            if (g_bind_checked_process.load(std::memory_order_relaxed) != key) {
-                const auto check = g_recomp_bind_check.load(std::memory_order_acquire);
-                const size_t unbound = check ? check() : 0;
-                const bool refused = unbound != 0 && StrictNoFallback();
-                if (refused) {
-                    LOG_CRITICAL(Core_ARM,
-                                 "recomp: strict mode - {} recompiled image(s) were never bound "
-                                 "to their loaded module; refusing to run",
-                                 unbound);
-                    RecompGaps::Flush(true, true);
-                }
-                g_bind_refused.store(refused, std::memory_order_relaxed);
-                g_bind_checked_process.store(key, std::memory_order_release);
-            }
-        }
-        if (g_bind_refused.load(std::memory_order_relaxed)) {
-            return HaltReason::PrefetchAbort;
         }
     }
 
@@ -2213,14 +2265,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
                 LOG_ERROR(Core_ARM, "recomp mem @x{} ({:#x}) [-0x20..+0x30): {}", r, p, dump);
             }
             {
-                // The module containing the PC: greatest base not above it
-                // (the first module when the PC is below all of them).
-                u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
-                for (const auto& [module_base, name] : impl->modules) {
-                    if (module_base <= impl->ctx.pc) {
-                        mbase = module_base;
-                    }
-                }
+                const u64 mbase = impl->modules.empty() ? 0 : impl->modules.begin()->first;
                 // A wide window through .rodata, to diff against the exporter's
                 // extracted copy: if the two disagree, the recompiled code is
                 // computing correct addresses into memory that holds something

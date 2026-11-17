@@ -1,6 +1,6 @@
 # suyu libretro core
 
-The current libretro video path supports Vulkan. Core options are read when
+The current libretro video path supports Vulkan. Where RetroArch runs its Vulkan video driver (context negotiation v2), the frames are drawn in RetroArch's own Vulkan context and handed over as images; otherwise they are read back to host memory first, which costs a copy and a wait for the GPU on every frame. Core options are read when
 content loads; close and reopen content after changing an option. The exception
 is **Show Game Performance** (on by default), which applies immediately: once a
 second it shows the game's own frame rate and the average frame time, or the number
@@ -9,6 +9,14 @@ RetroArch's FPS counter counts every frame it presents, including repeats while
 the game has not drawn a new one, so it can read far higher. RetroArch's
 **Restart** command invokes `retro_reset`, which is not implemented by this
 core. Close and reopen content to restart it. Save states are unsupported.
+
+Up to four players, one per RetroArch port, each a Pro Controller. The core
+names every input with the Switch's own labels (A, B, ZL, +, ...), so Quick
+Menu > Controls lists and remaps them. Player 1 is always connected; players
+2-4 are connected when their port is first used (a button, or a stick pushed
+well off centre), as plugging a controller in, so games do not see controllers
+nobody holds. Setting a port's device to None takes its input away, and for
+players 2-4 also disconnects their controller.
 
 To load a base XCI/NSP with a separate update, set
 `SUYU_LIBRETRO_UPDATE_PATH` to the update NSP/XCI before starting RetroArch and

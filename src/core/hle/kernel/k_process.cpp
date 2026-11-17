@@ -1316,23 +1316,24 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
     // still goes through ArmInterface, so the kernel, the services and the GPU
     // above this point are unchanged and the recompiled code gets the real HLE
     // stack instead of the generated runtime's stub SVC handler.
-    // Only the application runs on a recompiled image. A registered lookup is
-    // global, so without this guard every system/HLE process created after it
-    // - the service modules that come up during boot - would also be handed
-    // ArmRecomp and the game's image, which is not their code at all. They come
-    // up before the application starts, so wedging them there is why boot never
-    // reaches the application's own thread.
-    if (const auto recomp_lookup = this->IsApplication() ? Core::GetRecompLookup() : nullptr) {
+    // Only a 64-bit application runs on a recompiled image. A registered lookup
+    // is global, so without the application guard every system/HLE process
+    // created after it would also be handed the title's image. ArmRecomp's ABI
+    // and its JIT fallback are both AArch64, so a 32-bit application must keep
+    // using the normal ArmDynarmic32 backend as well.
+    if (const auto recomp_lookup =
+            this->IsApplication() && this->Is64Bit() ? Core::GetRecompLookup() : nullptr) {
         LOG_INFO(Kernel, "Using ArmRecomp for process '{}' (is_app={})", this->GetName(),
                  this->IsApplication());
+        m_arm_recomp_state = Core::CreateArmRecompProcessState();
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             // The exclusive monitor and process are handed over so ArmRecomp can
             // build a dynarmic fallback on demand: statically recompiled images
             // never cover every indirect call target, and without a fallback the
             // first uncovered PC hangs the thread for good.
             m_arm_interfaces[i] = std::make_unique<Core::ArmRecomp>(
-                kernel.System(), kernel.IsMulticore(), recomp_lookup, this,
-                m_exclusive_monitor.get(), i);
+                kernel.System(), kernel.IsMulticore(), recomp_lookup, m_arm_recomp_state, this,
+                &static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
         }
         return;
     }

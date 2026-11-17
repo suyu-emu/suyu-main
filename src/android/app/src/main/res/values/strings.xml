@@ -1819,4 +1819,36 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
     <string name="add_folders">Add Folder</string>
     <string name="percent">%1$d%%</string>
 
+
+    <!-- Compose library -->
+    <string name="nav_library">Library</string>
+    <string name="nav_drivers">Drivers</string>
+    <string name="filter_all">All</string>
+    <string name="filter_favorites">Favorites</string>
+    <string name="recently_played_hero">Recently played</string>
+    <string name="games_count">%1$d titles</string>
+    <string name="toggle_favorite">Toggle favorite</string>
+    <string name="compat_perfect">Perfect</string>
+    <string name="compat_great">Great</string>
+    <string name="compat_playable">Playable</string>
+    <string name="clear_search">Clear search</string>
+    <string name="add_games_folder">Add games folder</string>
+
+    <string name="settings_group_general">General</string>
+    <string name="settings_group_graphics">Graphics</string>
+    <string name="settings_group_online">Online and tools</string>
+    <string name="settings_group_data">Data</string>
+    <string name="settings_group_support">Support</string>
+    <string name="settings_ready">Ready to play</string>
+    <string name="settings_ready_detail">Firmware %1$s · Keys verified</string>
+    <string name="settings_no_firmware">No firmware installed</string>
+    <string name="firmware_description_short">Some games need firmware to run</string>
+
+    <string name="detail_properties">Properties</string>
+    <string name="detail_stat_fps">Avg FPS</string>
+    <string name="detail_stat_played">Played</string>
+    <string name="detail_stat_size">Size</string>
+    <string name="detail_stat_shaders">Shaders</string>
+    <string name="detail_action_import">Import</string>
+    <string name="detail_action_export">Export</string>
 </resources>

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -15,6 +16,13 @@
 #include "core/memory.h"
 #include "video_core/host1x/ffmpeg.h"
 #include "video_core/memory_manager.h"
+
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/videodev2.h>
+#endif
 
 extern "C" {
 #ifdef LIBVA_FOUND
@@ -82,13 +90,65 @@ AVPixelFormat GetGpuFormat(AVCodecContext* codec_context, const AVPixelFormat* p
     return codec_context->pix_fmt;
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+// Whether a V4L2 mem2mem device takes this codec's bitstream, as FFmpeg's v4l2m2m wrapper
+// looks for one: a /dev/video node with the M2M capability and the codec among the formats
+// of its output (bitstream) queue
+bool HasV4L2M2MDecoder(AVCodecID codec) {
+    const u32 fourcc = [codec]() -> u32 {
+        switch (codec) {
+        case AV_CODEC_ID_H264:
+            return V4L2_PIX_FMT_H264;
+        case AV_CODEC_ID_VP8:
+            return V4L2_PIX_FMT_VP8;
+        case AV_CODEC_ID_VP9:
+            return V4L2_PIX_FMT_VP9;
+        default:
+            return 0;
+        }
+    }();
+    if (fourcc == 0) {
+        return false;
+    }
+    for (int node = 0; node < 64; ++node) {
+        const std::string path = fmt::format("/dev/video{}", node);
+        const int fd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        SCOPE_EXIT {
+            close(fd);
+        };
+        v4l2_capability cap{};
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+            continue;
+        }
+        const u32 caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+        const bool mplane = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) != 0;
+        if (!mplane && !(caps & V4L2_CAP_VIDEO_M2M)) {
+            continue;
+        }
+        v4l2_fmtdesc desc{};
+        desc.type = mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        for (desc.index = 0; ioctl(fd, VIDIOC_ENUM_FMT, &desc) == 0; ++desc.index) {
+            if (desc.pixelformat == fourcc) {
+                LOG_INFO(HW_GPU, "V4L2 mem2mem decoder for {}: {} ({})", avcodec_get_name(codec),
+                         path, reinterpret_cast<const char*>(cap.card));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 std::string AVError(int errnum) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE] = {};
     av_make_error_string(errbuf, sizeof(errbuf) - 1, errnum);
     return errbuf;
 }
 
-#if defined(__ANDROID__)
+#if defined(__linux__)
 size_t FindNalStartCode(std::span<const u8> data, size_t i) {
     const size_t n = data.size();
     if (i + 3 < n && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
@@ -154,7 +214,7 @@ Frame::~Frame() {
     av_frame_free(&m_frame);
 }
 
-Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
+Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec, std::string_view wrapper) {
     const AVCodecID av_codec = [&] {
         switch (codec) {
         case Tegra::Host1x::NvdecCommon::VideoCodec::H264:
@@ -169,6 +229,11 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
         }
     }();
 
+    // A codec wrapper around a platform decoder (h264_v4l2m2m), when asked for
+    if (!wrapper.empty() && av_codec != AV_CODEC_ID_NONE) {
+        const std::string name = fmt::format("{}_{}", avcodec_get_name(av_codec), wrapper);
+        m_codec = avcodec_find_decoder_by_name(name.c_str());
+    }
 #if defined(__ANDROID__)
     if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
         const char* mc_name = nullptr;
@@ -285,6 +350,13 @@ DecoderContext::DecoderContext(const Decoder& decoder) : m_decoder{decoder} {
     m_codec_context->flags |= AV_CODEC_FLAG_LOW_DELAY;
     m_codec_context->flags2 |= AV_CODEC_FLAG2_FAST;
 #endif
+    // A V4L2 mem2mem decoder hands out frames in its own capture buffers, and the frame
+    // queue keeps a few of them for VIC: more buffers than its default, so it never waits
+    // for one to come back
+    m_v4l2_m2m = std::string_view{m_decoder.GetCodec()->name}.ends_with("_v4l2m2m");
+    if (m_v4l2_m2m) {
+        av_opt_set_int(m_codec_context->priv_data, "num_capture_buffers", 32, 0);
+    }
 }
 
 DecoderContext::~DecoderContext() {
@@ -351,6 +423,25 @@ std::shared_ptr<Frame> DecoderContext::ReceiveFrame() {
             LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
             return {};
         }
+    } else if (m_v4l2_m2m) {
+        // A V4L2 mem2mem frame lives in one of the decoder's capture buffers, which it
+        // gets back only when the frame is freed; the frame queue keeps frames for VIC
+        // for a while, and the decoder stalled waiting for buffers. A copy gives it back
+        // at once.
+        AVFrame* const source = intermediate_frame->GetFrame();
+        AVFrame* const copy = m_final_frame->GetFrame();
+        copy->format = source->format;
+        copy->width = source->width;
+        copy->height = source->height;
+        if (const int ret = av_frame_get_buffer(copy, 0); ret < 0) {
+            LOG_ERROR(HW_GPU, "av_frame_get_buffer error: {}", AVError(ret));
+            return {};
+        }
+        if (const int ret = av_frame_copy(copy, source); ret < 0) {
+            LOG_ERROR(HW_GPU, "av_frame_copy error: {}", AVError(ret));
+            return {};
+        }
+        av_frame_copy_props(copy, source);
     } else {
         m_final_frame = std::move(intermediate_frame);
     }
@@ -363,6 +454,7 @@ void DecodeApi::Reset() {
     m_decoder_context.reset();
     m_decoder.reset();
     m_opened = false;
+    m_v4l2_m2m = false;
     m_defer_android_mediacodec_open = false;
     m_needs_h264_extradata = false;
     m_next_pts = 0;
@@ -373,6 +465,7 @@ void DecodeApi::Reset() {
 
 bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     this->Reset();
+    m_codec = codec;
     m_decoder.emplace(codec);
     m_decoder_context.emplace(*m_decoder);
 
@@ -387,8 +480,28 @@ bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     // Enable GPU decoding if requested.
     if (!is_mediacodec &&
         Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
-        m_hardware_context.emplace();
-        m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder);
+#if defined(__linux__) && !defined(__ANDROID__)
+        // The SoC's own decoder through V4L2 mem2mem where there is one (Qualcomm Venus,
+        // Rockchip, Raspberry Pi, MediaTek): a phone-class CPU decoding a 1080p movie in
+        // software slows the game itself down, and FFmpeg's Vulkan hwaccel, which such a
+        // GPU's driver may offer, can end in software decoding all the same
+        if (HasV4L2M2MDecoder(m_decoder->GetCodec()->id)) {
+            m_decoder_context.reset();
+            m_decoder.emplace(codec, "v4l2m2m");
+            m_decoder_context.emplace(*m_decoder);
+            m_v4l2_m2m = std::string_view{m_decoder->GetCodec()->name}.ends_with("_v4l2m2m");
+        }
+#endif
+        if (!m_v4l2_m2m) {
+            m_hardware_context.emplace();
+            m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder);
+        }
+    }
+
+    // Opened at the first packet, with the frame's size and the stream's parameter sets
+    if (m_v4l2_m2m) {
+        m_needs_h264_extradata = codec == Tegra::Host1x::NvdecCommon::VideoCodec::H264;
+        return true;
     }
 
 #if defined(__ANDROID__)
@@ -411,6 +524,9 @@ bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
 
 bool DecodeApi::SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
                            std::optional<FrameDimensions> dimensions) {
+    if (!m_opened && m_v4l2_m2m) {
+        return this->OpenV4L2M2M(packet_data, offsets, dimensions);
+    }
     if (!m_opened) {
         std::vector<u8> extradata;
 #if defined(__ANDROID__)
@@ -447,6 +563,41 @@ bool DecodeApi::SendPacket(std::span<const u8> packet_data, const FrameOffsets& 
     packet.GetPacket()->dts = m_next_pts;
     ++m_next_pts;
     return m_decoder_context->SendPacket(packet);
+}
+
+bool DecodeApi::OpenV4L2M2M(std::span<const u8> packet_data, const FrameOffsets& offsets,
+                            std::optional<FrameDimensions> dimensions) {
+    if (!dimensions) {
+        return true;
+    }
+    std::vector<u8> extradata;
+#if defined(__linux__)
+    if (m_needs_h264_extradata) {
+        extradata = ExtractH264ParameterSetExtradata(packet_data);
+        if (extradata.empty()) {
+            return true;
+        }
+    }
+#endif
+    auto* ctx = m_decoder_context->GetCodecContext();
+    ctx->width = dimensions->width;
+    ctx->height = dimensions->height;
+    ctx->coded_width = dimensions->width;
+    ctx->coded_height = dimensions->height;
+    if (!m_decoder_context->OpenContext(*m_decoder, extradata)) {
+        // No such device, or it cannot take this stream: decode in software instead
+        LOG_INFO(HW_GPU, "V4L2 mem2mem decoder unavailable, decoding on the CPU");
+        m_v4l2_m2m = false;
+        m_decoder_context.reset();
+        m_decoder.emplace(m_codec);
+        m_decoder_context.emplace(*m_decoder);
+        if (!m_decoder_context->OpenContext(*m_decoder)) {
+            this->Reset();
+            return false;
+        }
+    }
+    m_opened = true;
+    return this->SendPacket(packet_data, offsets, dimensions);
 }
 
 std::optional<DecodeApi::DecodedFrame> DecodeApi::ReceiveFrame() {

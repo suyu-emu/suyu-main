@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 
 #include "common/common_types.h"
@@ -268,7 +269,17 @@ constexpr Table MakeNonNativeBgrCopyTable() {
     EnableRange(copy, VIEW_CLASS_32_BITS);
     return copy;
 }
+
+std::atomic_bool separate_atomic_view_formats{false};
+
+constexpr bool AllowsAtomics(PixelFormat format) {
+    return format == PixelFormat::R32_UINT || format == PixelFormat::R32_SINT;
+}
 } // Anonymous namespace
+
+void SeparateAtomicViewFormats(bool separate) {
+    separate_atomic_view_formats = separate;
+}
 
 bool IsViewCompatible(PixelFormat format_a, PixelFormat format_b, bool broken_views,
                       bool native_bgr) {
@@ -278,6 +289,9 @@ bool IsViewCompatible(PixelFormat format_a, PixelFormat format_b, bool broken_vi
     if (broken_views) {
         // If format views are broken, only accept formats that are identical.
         return format_a == format_b;
+    }
+    if (separate_atomic_view_formats && AllowsAtomics(format_a) != AllowsAtomics(format_b)) {
+        return false;
     }
     static constexpr Table BGR_TABLE = MakeNativeBgrViewTable();
     static constexpr Table NO_BGR_TABLE = MakeNonNativeBgrViewTable();

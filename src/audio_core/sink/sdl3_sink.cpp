@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -86,6 +88,20 @@ public:
         if (stream == nullptr) {
             LOG_WARNING(Audio_Sink, "SDL audio device unavailable ({}); using silent output",
                         SDL_GetError());
+            // Silent, but played at the device's pace all the same: the audio
+            // out service releases a game's buffers by the samples its stream
+            // has played, so a stream that never plays any keeps them forever,
+            // and a game waiting on them (a movie player, for one) stops
+            if (type != StreamType::In) {
+                silent_thread = std::jthread([this](std::stop_token stop_token) {
+                    constexpr std::size_t frames = TargetSampleRate / 200; // 5 ms
+                    std::vector<s16> discard(frames * GetDeviceChannels());
+                    while (!stop_token.stop_requested()) {
+                        ProcessAudioOutAndRender(discard, frames);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                });
+            }
             return;
         }
 
@@ -109,11 +125,7 @@ public:
     }
 
     void AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) override {
-        // If SDL could not open a device, no callback will drain the queue.
-        // Discard audio as the null sink does so the ADSP cannot block forever.
-        if (stream == nullptr) {
-            return;
-        }
+        // Without a device the silent thread drains the queue in its place
         SinkStream::AppendBuffer(buffer, samples);
     }
 
@@ -122,6 +134,10 @@ public:
      */
     void Finalize() override {
         if (stream == nullptr) {
+            if (silent_thread.joinable()) {
+                silent_thread.request_stop();
+                silent_thread.join();
+            }
             return;
         }
 
@@ -211,6 +227,8 @@ private:
 
     /// SDL stream attached to an opened input/output device
     SDL_AudioStream* stream{};
+    /// Plays a stream without a device in silence, at the device's pace
+    std::jthread silent_thread;
 };
 
 SDLSink::SDLSink(std::string_view target_device_name) {

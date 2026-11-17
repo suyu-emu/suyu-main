@@ -729,6 +729,12 @@ static Settings GetSettings() {
     // Settings
     ret["settings_debug"]["is_debug_mode_enabled"] = ToBytes(bool{false});
 
+    // System configuration
+    ret["systemconfig"]["field_testing"] = ToBytes(bool{false});
+
+    // System update (1.0.0 default)
+    ret["systemupdate"]["enable_network_service"] = ToBytes(bool{false});
+
     // Error
     ret["err"]["applet_auto_close"] = ToBytes(bool{false});
 

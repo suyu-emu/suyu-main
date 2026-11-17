@@ -31,15 +31,15 @@ class System;
  * ahead-of-time (AOT) static recompilation.
  *
  * Pipeline:
- *   1. Extract ExeFS/RomFS from the ROM container (NSP/XCI/NCA)
- *   2. Translate ARM64 code blocks into Dynarmic IR compiler artifacts
- *   3. Package IR dumps, guest code slices, block maps, and game data
- *   4. Generate a platform-specific export bundle for a future custom runtime
+ *   1. Extract and validate the title's ExeFS/RomFS.
+ *   2. Translate discovered AArch64 basic blocks into portable C projects.
+ *   3. Optionally compile those projects and link their AOT blocks into a
+ *      title-specialized suyu runtime.
+ *   4. Package the local title data, runtime, configuration, and build manifest.
  *
- * Dynarmic does not expose a stable block-serialization API for ready-made
- * host machine code export, so suyu serializes a frontend boundary instead:
- * translated IR dumps plus guest code slices and metadata. These artifacts are
- * the input for a future minimal runtime/codegen stage.
+ * Unsupported instructions, uncovered indirect targets, and dynamic code are
+ * deliberately handled by Dynarmic at run time. An export is therefore a
+ * static-first hybrid, not a claim that every possible instruction was lifted.
  */
 class GameExportDialog : public QDialog {
     Q_OBJECT
@@ -106,9 +106,9 @@ public:
     /// The Coverage row's text: recorded gaps and Hybrid runs for the selected game.
     QString CoverageStatusForTesting() const;
 
-    /// Every standalone recompiled executable that has already been built for
-    /// this game, one per recompiled module, newest-looking first. Empty when
-    /// the game was never exported, or was exported but never compiled.
+    /// Every built title launcher or per-module AOT test executable found for
+    /// this game, newest-looking first. Empty when the game was never exported,
+    /// or was exported but never compiled.
     ///
     /// @param game_name  Library title of the game.
     /// @param rom_path   ROM path; its base name is what the exporter actually
@@ -135,12 +135,6 @@ public:
         Windows,
         Linux,
         MacOS,
-    };
-
-    enum class RecompileBackend {
-        SuyuStatic, ///< In-tree AArch64-to-C ahead-of-time recompiler
-        Hybrid,     ///< Static AOT with Dynarmic fallback for uncovered code
-        Dynarmic,   ///< JIT baseline for comparison
     };
 
 signals:
@@ -245,10 +239,10 @@ private:
     /// compiled. Written to the export log, aot_manifest.json and the README.
     QString last_recomp_compiler;
 
-    /// AOT export: scan ARM code and serialize translated compiler artifacts.
+    /// AOT export: scan AArch64 code and emit portable C projects.
     /// Returns path to the generated cache directory, or empty string on failure.
     QString RunAotPrecompile(const QString& exefs_dir, const QString& cache_dir,
-                             RecompileBackend backend, const QString& game_name);
+                             const QString& game_name);
 
     /// Package the translated output into a platform-specific export bundle rooted at
     /// @p package_root, the staging folder that becomes the package once validated.
@@ -259,14 +253,13 @@ private:
     QLineEdit* rom_path_edit{};
     QLineEdit* output_path_edit{};
     QComboBox* platform_combo{};
-    QComboBox* backend_combo{};
     QCheckBox* include_save_data_checkbox{};
     QCheckBox* include_shader_cache_checkbox{};
     QCheckBox* include_custom_config_checkbox{};
     QCheckBox* aot_full_scan_checkbox{};
     /// When checked and a module fails to recompile, emit a stub that falls back
-    /// to the dynarmic interpreter for that module instead of aborting the export.
-    QCheckBox* fallback_to_interpreter_checkbox{};
+    /// to the Dynarmic JIT for that module instead of aborting the export.
+    QCheckBox* fallback_to_jit_checkbox{};
     QCheckBox* steam_shortcut_checkbox{};
     QCheckBox* steam_replace_rom_checkbox{};
     QCheckBox* steam_wikipedia_checkbox{};

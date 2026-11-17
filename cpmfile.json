@@ -7,7 +7,7 @@
     },
     "boost": {
         "artifact": "%VERSION%-cmake.tar.xz",
-        "find_args": "CONFIG OPTIONAL_COMPONENTS headers context system fiber filesystem",
+        "find_args": "CONFIG COMPONENTS regex OPTIONAL_COMPONENTS headers context system fiber filesystem",
         "hash": "6ae6e94664fe7f2fb01976b59b276ac5df8085c7503fa829d810fbfe495960cfec44fa2c36e2cb23480bc19c956ed199d4952b02639a00a6c07625d4e7130c2d",
         "min_version": "1.57",
         "package": "Boost",
@@ -73,9 +73,9 @@
         "version": "v1.3.18"
     },
     "ffmpeg": {
-        "hash": "ed177621176b3961bdcaa339187d3a7688c1c8b060b79c4bb0257cbc67ad7021ae5d5adca5303b45625abbbe3d9aafdd87ce777b8690ac295290d744c875489a",
+        "hash": "628c254843a6793a73cc4a98a55ed65a9a32a73138942c94dbe0b682b7268c2694344bd3871317957664cc7d580f05c2b8378af7696b0800c653728bcdebfd95",
         "repo": "FFmpeg/FFmpeg",
-        "version": "c7b5f1537d"
+        "version": "bf1b838f2ab8"
     },
     "ffmpeg-ci": {
         "ci": true,
@@ -87,7 +87,7 @@
     },
     "fmt": {
         "hash": "f0da82c545b01692e9fd30fdfb613dbb8dd9716983dcd0ff19ac2a8d36f74beb5540ef38072fdecc1e34191b3682a8542ecbf3a61ef287dbba0a2679d4e023f2",
-        "min_version": "10",
+        "min_version": "8",
         "repo": "fmtlib/fmt",
         "version": "12.1.0"
     },

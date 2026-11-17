@@ -183,7 +183,8 @@ struct GPU::Impl {
         u64 gpu_tick = system.CoreTiming().GetGPUTicks();
         Settings::GpuOverclock overclock = Settings::values.fast_gpu_time.GetValue();
 
-        if (overclock != Settings::GpuOverclock::Normal) {
+        if (Settings::values.use_fast_gpu_time.GetValue() &&
+            overclock != Settings::GpuOverclock::Normal) {
             gpu_tick /= 256 * u64(overclock);
         }
 

@@ -57,6 +57,7 @@ private:
     Result SetIdleTimeDetectionExtension(IdleTimeDetectionExtension idle_time_detection_extension);
     Result GetIdleTimeDetectionExtension(
         Out<IdleTimeDetectionExtension> out_idle_time_detection_extension);
+    Result SetInputDetectionSourceSet(u32 input_detection_source_set);
     Result ReportUserIsActive();
     Result SetAutoSleepDisabled(bool is_auto_sleep_disabled);
     Result IsAutoSleepDisabled(Out<bool> out_is_auto_sleep_disabled);

@@ -6,8 +6,13 @@
 
 #pragma once
 
+#include <array>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <variant>
 
 #include "common/dynamic_library.h"
@@ -57,7 +62,10 @@ public:
     }
 
     bool IsHeadless() const override { return is_headless; }
-    const std::vector<u8>& GetLastRenderedFrame() const override { return headless_frame_data; }
+    std::span<const u8> GetLastRenderedFrame() const override { return headless_frame; }
+    std::unique_lock<std::mutex> LockLastRenderedFrame() override {
+        return std::unique_lock{headless_frame_mutex};
+    }
     u32 GetHeadlessWidth() const override { return headless_width; }
     u32 GetHeadlessHeight() const override { return headless_height; }
 
@@ -65,6 +73,21 @@ public:
     void InitializePlatformSpecific();
 
 private:
+    /// A headless frame being drawn, copied back, or held for the frontend to read
+    struct HeadlessSlot {
+        Frame frame{};
+        vk::Buffer buffer;
+        VkDeviceSize buffer_size{};
+        u32 width{};
+        u32 height{};
+        u64 tick{};
+        bool busy{};
+    };
+    static constexpr size_t NUM_HEADLESS_SLOTS = 4;
+
+    void CompositeHeadless(std::span<const Tegra::FramebufferConfig> framebuffers);
+    void HeadlessReadbackLoop(std::stop_token stop_token);
+
     void InterpolateFrames(Frame* prev_frame, Frame* curr_frame);
     Frame* previous_frame = nullptr;  // Store the previous frame for interpolation
     VkCommandBuffer BeginSingleTimeCommands();
@@ -75,6 +98,9 @@ private:
                               const Layout::FramebufferLayout& layout, VkFormat format,
                               VkDeviceSize buffer_size);
     void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
+    /// Headless inside a frontend's Vulkan context (External::IsActive()): the frame drawn
+    /// into an image of a small ring and handed over as it is, nothing read back.
+    void PresentExternal(std::span<const Tegra::FramebufferConfig> framebuffers);
     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -105,9 +131,20 @@ private:
     Frame applet_frame;
 
     bool is_headless{false};
-    std::vector<u8> headless_frame_data;
+    std::vector<Frame> external_frames;
+    /// The newest finished frame, in its slot's mapped buffer
+    std::span<const u8> headless_frame;
+    size_t headless_frame_slot{NUM_HEADLESS_SLOTS};
     u32 headless_width{1280};
     u32 headless_height{720};
+    std::mutex headless_frame_mutex;
+
+    std::array<HeadlessSlot, NUM_HEADLESS_SLOTS> headless_slots;
+    size_t headless_slot_index{};
+    std::mutex headless_slot_mutex;
+    std::condition_variable_any headless_slot_cv;
+    std::deque<size_t> headless_readback_queue;
+    std::jthread headless_readback_thread;
 };
 
 } // namespace Vulkan

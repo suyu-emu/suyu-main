@@ -204,6 +204,8 @@ public:
     }
 
     void Free(T* obj) {
+        // Allocate constructed it, and its members may own host memory
+        std::destroy_at(obj);
         BaseHeap::Free(obj);
     }
 

@@ -41,18 +41,29 @@ jobs:
         run: python3 -m unittest discover -s tests/package_policy -v
       - name: Export build kit packaging tests
         run: python3 tests/export_build_kit/test_package.py
+      - name: AppImage packaging tests
+        run: python3 -m unittest discover -s tests/appimage -v
 
   build-linux:
     if: github.event.deleted != true
     name: Linux (${{ matrix.variant }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - variant: standard
+            os: ubuntu-24.04
             no_jit: 'OFF'
             archive: suyu-linux-x86_64.tar.gz
+            appimage: true
+          # The same for ARM64 Linux, built natively on GitHub's ARM64 runner.
+          # No AppImage: its pinned type-2 runtime is an x86_64 one.
+          - variant: arm64
+            os: ubuntu-24.04-arm
+            no_jit: 'OFF'
+            archive: suyu-linux-arm64.tar.gz
+            appimage: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,37 +72,44 @@ jobs:
           fetch-depth: 0
       - name: Install dependencies
         run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        shell: bash
+        run: |
+          sudo tee /etc/apt/sources.list.d/suyu-appimage-sources.sources > /dev/null <<'EOF'
+          Types: deb-src
+          URIs: http://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb-src
+          URIs: http://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
           sudo apt-get update
-          # X11/Wayland headers are not optional: SDL3 aborts configure without
-          # one of them. glslang-tools supplies glslangValidator, which the host
-          # shader step requires by name.
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ninja-build nasm autoconf \
-            qt6-base-dev qt6-base-private-dev libqt6svg6-dev libqt6charts6-dev \
-            qt6-multimedia-dev libqt6opengl6-dev glslang-tools \
-            libboost-dev libboost-filesystem-dev libboost-context-dev \
-            libusb-1.0-0-dev libssl-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
-            libswscale-dev libswresample-dev \
-            libzstd-dev liblz4-dev libgl1-mesa-dev \
-            libasound2-dev libpulse-dev \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libxkbcommon-dev libxss-dev libxtst-dev \
-            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
-            libegl-dev libdrm-dev libgbm-dev libvulkan-dev
+          # Hosted images can retain library revisions retired from current
+          # signed Sources indices. Refresh them before compiling/deploying so
+          # exact installed-version corresponding sources remain available.
+          sudo apt-get upgrade -y
       - name: Install CMake 3.31
         # CMakeModules/CPMUtil.cmake requires 3.31; ubuntu-24.04 ships 3.28.
         run: |
           V=3.31.6
           curl -fsSL -o /tmp/cmake.tar.gz \
-            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-x86_64.tar.gz"
+            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-$(uname -m).tar.gz"
           sudo mkdir -p /opt/cmake
           sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
           echo /opt/cmake/bin >> "$GITHUB_PATH"
       - name: Test static recompiler
         run: python tests/recompiler_smoke/run.py
       - name: Test Hybrid module selection
-        run: python tests/export_regression/test_module_selection.py
+        run: |
+          python tests/export_regression/test_module_selection.py
+          python tests/export_regression/test_aggregate_project.py
+          python tests/build_version/test_version.py
       - name: Test bounded source partitioning
         run: python tests/recompiler_partition/run.py --build build-partition-test
       - name: Configure
@@ -105,21 +123,58 @@ jobs:
             -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
             -DSUYU_NO_JIT=${{ matrix.no_jit }} \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON \
             -Dfmt_FORCE_BUNDLED=ON
       - name: Build
-        run: cmake --build build --target suyu suyu-cmd
+        run: cmake --build build --target suyu suyu-cmd --parallel 2
       - name: Package
         run: |
+          ldd build/bin/suyu build/bin/suyu-cmd > linux-linked-libraries.txt
+          if grep -E 'libSDL3[^ ]*\.so|not found' linux-linked-libraries.txt; then
+            echo 'Unexpected untracked shared SDL3 dependency' >&2
+            exit 1
+          fi
           mkdir -p _pkg
           cp build/bin/suyu build/bin/suyu-cmd _pkg/
           python3 tools/package_policy/third_party_notices.py --package-dir _pkg
           tar -czf '${{ matrix.archive }}' -C _pkg .
       - name: Validate package policy
         run: python3 tools/package_policy/scan_release.py --kind linux '${{ matrix.archive }}'
+      - name: Build pinned AppImage runtime and portable package
+        if: matrix.appimage
+        id: appimage_build
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python3 tools/appimage/runtime.py --work-dir _appimage-runtime
+          python3 tools/appimage/build.py \
+            --package-dir _pkg --work-dir _appimage \
+            --runtime-dir _appimage-runtime \
+            --source-revision "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-name "$GITHUB_REF_NAME" --qmake qmake6
+      - name: Validate final AppImage and corresponding sources
+        if: matrix.appimage
+        run: |
+          read -r runtime_sha runtime_size < <(python3 -c 'import json; p=json.load(open("tools/appimage/runtime.lock.json")); print(p["sha256"], p["size"])')
+          python3 tools/package_policy/scan_release.py --kind linux-appimage \
+            --appimage-runtime-sha256 "$runtime_sha" --appimage-runtime-size "$runtime_size" \
+            --appimage-source-revision "$GITHUB_SHA" --appimage-repository "$GITHUB_REPOSITORY" \
+            _appimage/suyu-linux-x86_64.AppImage
+          sources=(_appimage/suyu-*-appimage-sources.tar.gz)
+          test "${#sources[@]}" -eq 1
+          python3 tools/package_policy/scan_release.py --kind dependency-sources "${sources[0]}"
+      - name: Test AppImage without FUSE
+        # Diagnostic startup still runs after a failed source scan; that failure
+        # continues to block artifact upload and the publish gate.
+        if: ${{ matrix.appimage && always() && !cancelled() && steps.appimage_build.outcome == 'success' }}
+        run: python3 tests/appimage/smoke.py _appimage/suyu-linux-x86_64.AppImage --report _appimage/smoke-report.json
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.variant }}
-          path: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            _appimage/suyu-linux-x86_64.AppImage
+            _appimage/suyu-*-appimage-sources.tar.gz
           if-no-files-found: error
 
   build-windows:
@@ -168,8 +223,14 @@ jobs:
         run: |
           python tests/export_regression/test_module_selection.py
           if ($LASTEXITCODE -ne 0) { throw 'Module selection tests failed' }
+          python tests/export_regression/test_aggregate_project.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source project tests failed' }
+          python tests/build_version/test_version.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build version tests failed' }
           python tests/export_build_kit/test_package.py
           if ($LASTEXITCODE -ne 0) { throw 'Build kit relocation tests failed' }
+          python tests/appimage/test_source_delivery.py
+          if ($LASTEXITCODE -ne 0) { throw 'Source delivery projection tests failed' }
           python tests/appdata_path/run.py
           if ($LASTEXITCODE -ne 0) { throw 'APPDATA path tests failed' }
           python tests/recompiler_partition/run.py --build build-partition-test
@@ -180,21 +241,22 @@ jobs:
           MSYS_NO_PATHCONV: '1'
         run: |
           cmake --version
-          cmake -B build -GNinja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
-            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
-            -DSUYU_NO_JIT=${{ matrix.no_jit }} \
-            -DSUYU_EXPORT_BUILD_KIT=ON \
-            '-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.linker_flags }}'
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja 2>&1 | tee cmake_configure.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-windows
+          path: cmake_configure.log
       - name: Build
-        shell: bash
-        run: cmake --build build --target suyu suyu-cmd export-build-kit
-      - name: Verify production export build kit
+        run: cmake --build build --target suyu suyu-cmd tests suyu_recomp arm64_to_c_tests -j4
+      - name: Test integrated regressions
         shell: pwsh
         run: |
-          python tests/export_build_kit/test_release_kit.py --kit build/bin/export-build-kit --output build-release-kit-check
-          if ($LASTEXITCODE -ne 0) { throw 'Production build kit link check failed' }
+          & build/bin/tests.exe '[main-integration]'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build --output-on-failure -R '^static_recompiler_(arm64_to_c|smoke)$'
       - name: Package
         shell: pwsh
         run: |
@@ -216,9 +278,109 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Package-policy validation failed for the Windows archive' }
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ matrix.variant }}
-          path: ${{ matrix.archive }}
-          if-no-files-found: error
+          name: windows
+          path: suyu-windows-x64.zip
+
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools \
+            qt6-base-dev qt6-base-private-dev \
+            qt6-multimedia-dev qt6-tools-dev qt6-svg-dev qt6-webengine-dev \
+            qt6-charts-dev \
+            libssl-dev libusb-1.0-0-dev libpulse-dev \
+            libvulkan-dev gamemode-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxkbcommon-dev libxtst-dev \
+            libwayland-dev libwayland-egl1 wayland-protocols libdecor-0-dev \
+            libegl-dev libdrm-dev libgbm-dev \
+            nasm autoconf pkg-config libva-dev libvdpau-dev \
+            libboost-all-dev file
+      - name: Configure
+        run: |
+          cmake --version
+          set -o pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja -DOPENSSL_ROOT_DIR=/usr 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-linux
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu suyu-cmd tests suyu_recomp arm64_to_c_tests -j4
+      - name: Test integrated regressions
+        run: |
+          ./build/bin/tests '[main-integration]'
+          ctest --test-dir build --output-on-failure -R '^static_recompiler_(arm64_to_c|smoke)$'
+      - name: Package
+        run: |
+          # Flat AppDir layout (binary/desktop-file/icon all next to each other) rather than
+          # a usr/bin,usr/share tree: linuxdeployqt auto-switches to a stricter "FHS-like" mode
+          # for the latter that expects a real system root and silently exits otherwise.
+          rm -rf _pkg && mkdir -p _pkg
+          cp build/bin/suyu _pkg/
+          cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
+          cp dist/dev.suyu_emu.suyu.desktop _pkg/
+          cp dist/qt_themes/default/icons/256x256/suyu.png _pkg/dev.suyu_emu.suyu.png
+
+          # Bundle Qt (and its own risky transitive deps like ICU/glib/pcre, whose sonames are
+          # just as version-locked as FFmpeg's/Boost's) next to the binary with linuxdeployqt,
+          # instead of relying on the target distro's system Qt6: Ubuntu's Qt6 packages and
+          # Fedora's can differ enough in practice that we'd rather ship a known-good Qt than
+          # assume compatibility. It patches RUNPATH to $ORIGIN-relative paths and writes a
+          # qt.conf, so _pkg/suyu keeps working when the tarball is extracted anywhere and run
+          # directly (no AppImage runtime/FUSE needed for this, and no system Qt needed either).
+          #
+          # linuxdeployqt also unconditionally collects each bundled library's copyright file
+          # starting from usr/share/doc/libc6/copyright *relative to the AppDir*, and silently
+          # exits(1) with no error message if that doesn't exist - create it as a marker first.
+          mkdir -p _pkg/usr/share/doc/libc6
+          cp /usr/share/doc/libc6/copyright _pkg/usr/share/doc/libc6/copyright
+
+          # Pinned to release 11 (not the "continuous" tag) for reproducibility.
+          wget -q https://github.com/probonopd/linuxdeployqt/releases/download/11/linuxdeployqt-continuous-x86_64.AppImage -O linuxdeployqt.AppImage
+          chmod +x linuxdeployqt.AppImage
+          ./linuxdeployqt.AppImage --appimage-extract
+          ./squashfs-root/AppRun _pkg/dev.suyu_emu.suyu.desktop \
+            -qmake=/usr/bin/qmake6 \
+            -executable=_pkg/suyu-cmd \
+            -bundle-non-qt-libs -no-translations -unsupported-allow-new-glibc -verbose=2
+
+          tar -czf suyu-linux-x64.tar.gz -C _pkg .
+
+          # Also package the same AppDir as a single-file AppImage for convenience. Running an
+          # AppImage directly needs FUSE (libfuse2), which some distros - Fedora among them -
+          # don't ship by default; the tarball above stays as a guaranteed-to-work fallback for
+          # that case (or use `./suyu-linux-x64.AppImage --appimage-extract-and-run`, which
+          # doesn't need FUSE either).
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          rm -rf squashfs-root
+          ./appimagetool.AppImage --appimage-extract
+          # Pre-fetch the runtime instead of letting appimagetool download it mid-build.
+          wget -q https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 -O runtime-x86_64
+          ARCH=x86_64 ./squashfs-root/AppRun --runtime-file runtime-x86_64 _pkg suyu-linux-x64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            suyu-linux-x64.tar.gz
+            suyu-linux-x64.AppImage
 
   build-macos:
     if: github.event.deleted != true
@@ -235,12 +397,15 @@ jobs:
           fetch-depth: 0
       - name: Install dependencies
         run: |
-          brew update
-          brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm qt
-      - name: Test static recompiler
-        run: python3 tests/recompiler_smoke/run.py
-      - name: Test bounded source partitioning
-        run: python3 tests/recompiler_partition/run.py --build build-partition-test
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - name: Install deps
+        run: brew install ninja qt@6 openssl ffmpeg glslang molten-vk boost
       - name: Configure
         run: |
           cmake --version
@@ -301,8 +466,73 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: out/suyu-macos-arm64.zip
-          if-no-files-found: error
+          path: suyu-macos-arm64.tar.gz
+
+  build-freebsd:
+    name: FreeBSD
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y cmake ninja qt6-base qt6-multimedia openssl pulseaudio vulkan-headers pkgconf libX11 libXext libXrandr wayland wayland-protocols libdecor mesa-libs evdev-proto glslang ffmpeg boost-all
+          run: |
+            f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+            if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+              printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+            fi
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja
+            cmake --build build --target suyu suyu-cmd -j4
+            rm -rf _pkg && mkdir _pkg
+            cp build/bin/suyu _pkg/
+            cp build/bin/suyu-cmd _pkg/ 2>/dev/null || true
+            tar -czf suyu-freebsd-x64.tar.gz -C _pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd
+          path: suyu-freebsd-x64.tar.gz
+
+  build-android:
+    name: Android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '17'
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+      - name: Build APKs
+        working-directory: src/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleLegacyRelease assembleMainlineRelease assembleChromeOSRelease assembleGenshinSpoofRelease --stacktrace
+      - name: Collect APKs
+        run: |
+          rm -rf _pkg && mkdir _pkg
+          find src/android -name '*.apk' -exec cp {} _pkg/ \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: _pkg/*.apk
 
   build-libretro:
     if: github.event.deleted != true
@@ -316,12 +546,21 @@ jobs:
           - platform: linux
             os: ubuntu-24.04
             archive: suyu-libretro-linux-x86_64.tar.gz
+            kind: libretro-linux
+          # The same core for ARM64 Linux (Raspberry Pi 5, Snapdragon and other
+          # ARM64 laptops and handhelds), built natively on GitHub's ARM64 runner
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            archive: suyu-libretro-linux-arm64.tar.gz
+            kind: libretro-linux
           - platform: windows
             os: windows-2022
             archive: suyu-libretro-windows-x86_64.zip
+            kind: libretro-windows
           - platform: macos
             os: macos-15
             archive: suyu-libretro-macos-arm64.zip
+            kind: libretro-macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -330,7 +569,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - name: Install dependencies (Linux)
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -347,7 +586,7 @@ jobs:
             libegl-dev libdrm-dev libgbm-dev libvulkan-dev
           V=3.31.6
           curl -fsSL -o /tmp/cmake.tar.gz \
-            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-x86_64.tar.gz"
+            "https://github.com/Kitware/CMake/releases/download/v${V}/cmake-${V}-linux-$(uname -m).tar.gz"
           sudo mkdir -p /opt/cmake
           sudo tar xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
           echo /opt/cmake/bin >> "$GITHUB_PATH"
@@ -376,7 +615,7 @@ jobs:
         run: |
           extra=()
           case '${{ matrix.platform }}' in
-            linux) extra+=(-Dfmt_FORCE_BUNDLED=ON) ;;
+            linux*) extra+=(-Dfmt_FORCE_BUNDLED=ON) ;;
             macos) extra+=(-Dfmt_FORCE_BUNDLED=ON -DVulkanHeaders_FORCE_BUNDLED=ON
                            "-DCMAKE_PREFIX_PATH=$(brew --prefix)") ;;
           esac
@@ -389,7 +628,7 @@ jobs:
         shell: bash
         run: cmake --build build --target suyu_libretro
       - name: Package (Linux)
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         run: |
           mkdir -p _pkg
           cp "$(find build -name suyu_libretro.so -print -quit)" _pkg/
@@ -429,12 +668,12 @@ jobs:
           (cd _pkg && zip -qry "../${{ matrix.archive }}" .)
       - name: Validate package policy (Linux, macOS)
         if: matrix.platform != 'windows'
-        run: python3 tools/package_policy/scan_release.py --kind 'libretro-${{ matrix.platform }}' '${{ matrix.archive }}'
+        run: python3 tools/package_policy/scan_release.py --kind '${{ matrix.kind }}' '${{ matrix.archive }}'
       - name: Validate package policy (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          python tools/package_policy/scan_release.py --kind 'libretro-${{ matrix.platform }}' '${{ matrix.archive }}'
+          python tools/package_policy/scan_release.py --kind '${{ matrix.kind }}' '${{ matrix.archive }}'
           if ($LASTEXITCODE -ne 0) { throw 'Package-policy validation failed for the libretro archive' }
       - uses: actions/upload-artifact@v4
         with:
@@ -442,80 +681,108 @@ jobs:
           path: ${{ matrix.archive }}
           if-no-files-found: error
 
-  build-android:
-    if: github.event.deleted != true
-    name: Android (arm64)
+  build-libretro-android:
+    name: Libretro Android
     runs-on: ubuntu-24.04
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
-          fetch-depth: 0
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: Install Android SDK packages
+      - name: Init submodules
         run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" "platforms;android-36" "ndk;28.2.13676358" "cmake;3.31.6"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools nasm
-      - name: Build APK
-        # Signed with the release key when the ANDROID_KEYSTORE_* secrets are
-        # set; otherwise with the public test key in the repository.
-        env:
-          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          GIT_TAG_NAME: ${{ github.ref_name }}
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
         run: |
-          if [ -z "$ANDROID_KEYSTORE_B64" ]; then
-            unset ANDROID_KEYSTORE_B64 ANDROID_KEYSTORE_PASS ANDROID_KEY_ALIAS
-            echo "::warning::No release keystore secret; the APK is signed with the public test key."
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
           fi
-          sh .ci/android/build.sh -t standard -b Release
-          mkdir -p out
-          cp artifacts/app-mainline-release.apk out/suyu-android-arm64.apk
-      - name: Build libretro core
-        # Reuses the NDK configuration Gradle generated for the APK, switched to
-        # the libretro core (no app JNI glue, OpenSSL built with no-asm).
+      - name: Install native deps
         run: |
-          cache="$(find src/android/app/.cxx -path '*arm64-v8a/CMakeCache.txt' -print -quit)"
-          test -n "$cache"
-          dir="$(dirname "$cache")"
-          CMAKE="$ANDROID_HOME/cmake/3.31.6/bin/cmake"
-          "$CMAKE" -S . -B "$dir" \
-            -DSUYU_BUILD_LIBRETRO_CORE=ON -DSUYU_ANDROID_LIBRETRO=ON \
-            -DYUZU_USE_BUNDLED_OPENSSL=OFF
-          "$CMAKE" --build "$dir" --target suyu_libretro
-          core="$(find src/android/app -name suyu_libretro.so -path '*arm64-v8a*' -print -quit)"
-          test -n "$core"
-          mkdir -p _pkg
-          "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-            --strip-debug -o _pkg/suyu_libretro_android.so "$core"
-          # The APK itself is left unchanged: it does not carry the license
-          # notices; the release ships THIRD-PARTY-NOTICES.txt in the other
-          # packages and the dependency-sources asset.
-          python3 tools/package_policy/third_party_notices.py --package-dir _pkg
-          (cd _pkg && zip -qr ../out/suyu-libretro-android-arm64.zip .)
-      - name: Validate package policy
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools
+      - name: Install Android NDK
         run: |
-          python3 tools/package_policy/scan_release.py --kind android-apk out/suyu-android-arm64.apk
-          python3 tools/package_policy/scan_release.py --kind libretro-android out/suyu-libretro-android-arm64.zip
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-libretro-android
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu_libretro -j4
+      - name: Package
+        run: |
+          rm -rf _pkg && mkdir _pkg
+          find build -name '*suyu_libretro*.so' -exec cp {} _pkg/suyu_libretro_android_arm64-v8a.so \;
+          tar -czf suyu-libretro-core-android-arm64.tar.gz -C _pkg .
       - uses: actions/upload-artifact@v4
         with:
-          name: android
-          path: |
-            out/suyu-android-arm64.apk
-            out/suyu-libretro-android-arm64.zip
-          if-no-files-found: error
+          name: libretro
+          path: suyu-libretro-core-linux-x64.tar.gz
 
-  source:
-    if: github.event.deleted != true
-    name: Source archive
+  build-libretro-windows:
+    name: Libretro Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init submodules
+        run: |
+          git -c submodule."externals/nxdumptool".update=none -c submodule."externals/nxapi".update=none -c submodule."externals/nx-optimizer".update=none submodule update --init --recursive --depth=1
+      - name: Fix submodule headers
+        shell: bash
+        run: |
+          f="externals/dynarmic/externals/mcl/include/boost/variant.hpp"
+          if [ -f "$f" ] && grep -q 'C:/Users' "$f"; then
+            printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
+          fi
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk -y --no-progress
+          $sdkDir = Get-ChildItem C:\VulkanSDK -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          echo "VULKAN_SDK=$($sdkDir.FullName)" >> $env:GITHUB_ENV
+          echo "$($sdkDir.FullName)\Bin" >> $env:GITHUB_PATH
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSUYU_BUILD_LIBRETRO_CORE=ON -DENABLE_QT=OFF -GNinja 2>&1 | tee cmake_configure.log
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload cmake log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-log-libretro-windows
+          path: cmake_configure.log
+      - name: Build
+        run: cmake --build build --target suyu_libretro -j4
+      - name: Package
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force _pkg -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory _pkg | Out-Null
+          Get-ChildItem build -Recurse -Filter suyu_libretro.dll | ForEach-Object { Copy-Item $_.FullName _pkg/ }
+          Compress-Archive -Path _pkg/* -DestinationPath suyu-libretro-core-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libretro-windows
+          path: suyu-libretro-core-windows-x64.zip
+
+  release:
+    name: Publish Release
+    if: always()
+    needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -644,18 +911,22 @@ jobs:
       - name: Collect
         run: |
           mkdir -p out
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar' -o -name '*.zip' -o -name '*.apk' \) -exec mv {} out/ \;
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar' -o -name '*.zip' -o -name '*.apk' -o -name '*.AppImage' \) -exec mv {} out/ \;
           for asset in \
             suyu-linux-x86_64.tar.gz \
+            suyu-linux-arm64.tar.gz \
+            suyu-linux-x86_64.AppImage \
             suyu-windows-x86_64.zip \
             suyu-macos-arm64.zip \
             suyu-android-arm64.apk \
             suyu-libretro-linux-x86_64.tar.gz \
+            suyu-libretro-linux-arm64.tar.gz \
             suyu-libretro-windows-x86_64.zip \
             suyu-libretro-macos-arm64.zip \
             suyu-libretro-android-arm64.zip \
             "suyu-${GITHUB_REF_NAME}-source.tar.gz" \
-            "suyu-${GITHUB_REF_NAME}-dependency-sources.tar"; do
+            "suyu-${GITHUB_REF_NAME}-dependency-sources.tar" \
+            "suyu-${GITHUB_REF_NAME}-appimage-sources.tar.gz"; do
             test -s "out/$asset"
           done
           test -s "docs/releases/${GITHUB_REF_NAME}.md"
@@ -664,26 +935,39 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools
           shopt -s nullglob
+          read -r runtime_sha runtime_size < <(python3 -c 'import json; p=json.load(open("tools/appimage/runtime.lock.json")); print(p["sha256"], p["size"])')
           count=0
           for asset in out/*; do
             case "${asset##*/}" in
               suyu-linux-x86_64.tar.gz) kind=linux ;;
+              suyu-linux-arm64.tar.gz) kind=linux ;;
+              suyu-linux-x86_64.AppImage) kind=linux-appimage ;;
               suyu-windows-x86_64.zip) kind=windows ;;
               suyu-macos-arm64.zip) kind=macos ;;
               suyu-android-arm64.apk) kind=android-apk ;;
               suyu-libretro-linux-x86_64.tar.gz) kind=libretro-linux ;;
+              suyu-libretro-linux-arm64.tar.gz) kind=libretro-linux ;;
               suyu-libretro-windows-x86_64.zip) kind=libretro-windows ;;
               suyu-libretro-macos-arm64.zip) kind=libretro-macos ;;
               suyu-libretro-android-arm64.zip) kind=libretro-android ;;
               "suyu-${GITHUB_REF_NAME}-source.tar.gz") kind=source ;;
               "suyu-${GITHUB_REF_NAME}-dependency-sources.tar") kind=dependency-sources ;;
+              "suyu-${GITHUB_REF_NAME}-appimage-sources.tar.gz") kind=dependency-sources ;;
               *) echo "Unexpected release asset: $asset" >&2; exit 1 ;;
             esac
-            python3 tools/package_policy/scan_release.py --kind "$kind" "$asset"
+            if [ "$kind" = linux-appimage ]; then
+              python3 tools/package_policy/scan_release.py --kind "$kind" \
+                --appimage-runtime-sha256 "$runtime_sha" --appimage-runtime-size "$runtime_size" \
+                --appimage-source-revision "$GITHUB_SHA" --appimage-repository "$GITHUB_REPOSITORY" "$asset"
+            else
+              python3 tools/package_policy/scan_release.py --kind "$kind" "$asset"
+            fi
             count=$((count + 1))
           done
-          test "$count" -eq 10
+          test "$count" -eq 12
       - name: Publish release
         if: steps.gate.outputs.publish == 'true'
         env:

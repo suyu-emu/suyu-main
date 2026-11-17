@@ -38,6 +38,10 @@ enum class TextureType : u32 {
 };
 constexpr u32 NUM_TEXTURE_TYPES = 9;
 
+/// Constant buffer index marking a texture handle that the shader receives as a vertex attribute
+/// instead of reading it from a constant buffer. The host supplies the handle of each draw run.
+constexpr u32 ATTRIBUTE_HANDLE_CBUF_INDEX = 0xFFFF;
+
 enum class TexturePixelFormat {
     A8B8G8R8_UNORM,
     A8B8G8R8_SNORM,

@@ -21,14 +21,14 @@ no-fallback change (`ee164653`). The companion `dougchansan/mk8-recomp` pipeline
 and Lattice's documented separation of interpreter/private-AOT lanes informed
 the design. No private Lattice implementation was copied here.
 
-| Piece | Status at this checkpoint |
-| --- | --- |
-| Three-module static link, lookup, ADD/SVC boundary, failure guards | Tested on Linux with an original ABI-mirror fixture |
-| Index-symbol collision mitigation | Reproduced in the fixture; target-scoped fix tested |
-| Actual current exporter integration test | Script provided; not executed in the original Linux sandbox |
-| UIKit diagnostic app / Xcode generation | Source provided; Apple SDK build not yet verified |
-| Suyu `ArmRecomp` adapter | Uses real API names; not compiled against the full core here |
-| Full Suyu iOS core, renderer, audio, input, game boot | Not implemented/validated by this checkpoint |
+|                               Piece                                |                  Status at this checkpoint                   |
+|--------------------------------------------------------------------|--------------------------------------------------------------|
+| Three-module static link, lookup, ADD/SVC boundary, failure guards | Tested on Linux with an original ABI-mirror fixture          |
+| Index-symbol collision mitigation                                  | Reproduced in the fixture; target-scoped fix tested          |
+| Actual current exporter integration test                           | Script provided; not executed in the original Linux sandbox  |
+| UIKit diagnostic app / Xcode generation                            | Source provided; Apple SDK build not yet verified            |
+| Suyu `ArmRecomp` adapter                                           | Uses real API names; not compiled against the full core here |
+| Full Suyu iOS core, renderer, audio, input, game boot              | Not implemented/validated by this checkpoint                 |
 
 Read [TEST_REPORT.md](TEST_REPORT.md) for the exact evidence, and
 [HANDOFF.md](HANDOFF.md) before extending this branch.
