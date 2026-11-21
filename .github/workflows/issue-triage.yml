@@ -1,0 +1,57 @@
+name: Issue Triage
+
+on:
+  issues:
+    types: [opened, reopened, labeled]
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  triage:
+    name: Auto-triage issues
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label and assign issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = issue.number;
+            const title = (issue.title || '').toLowerCase();
+            const body = (issue.body || '').toLowerCase();
+
+            // Determine label based on issue content
+            let labels = [];
+            if (title.includes('bug') || body.includes('crash') || body.includes('error') || body.includes('fail')) {
+              labels.push('bug');
+            } else {
+              labels.push('enhancement');
+            }
+
+            // Add labels
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: issueNumber, labels });
+            }
+
+            // Assign reviewers
+            const assignees = ['DougChanSan', 'GrouganDev'];
+            try {
+              await github.rest.issues.addAssignees({ owner, repo, issue_number: issueNumber, assignees });
+            } catch (e) {
+              core.warning('Could not assign: ' + e.message);
+            }
+
+            // Add to project #1
+            try {
+              await github.rest.projects.addCardToColumn({
+                column_id: 1,
+                content_id: issue.id,
+                content_type: 'Issue',
+              });
+            } catch (e) {
+              core.warning('Could not add to project: ' + e.message);
+            }
