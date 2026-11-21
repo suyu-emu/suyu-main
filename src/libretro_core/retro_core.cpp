@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <charconv>
 #include <chrono>
+#include <thread>
 #include <stop_token>
 #include <cmath>
 #include <fstream>
@@ -64,6 +65,7 @@
 #include "core/frontend/framebuffer_layout.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/vi/conductor.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "hid_core/frontend/emulated_controller.h"
@@ -485,6 +487,7 @@ RETRO_API void retro_init() {
     g_input_subsystem = std::make_shared<InputCommon::InputSubsystem>();
     g_input_subsystem->Initialize();
 
+    Service::VI::Conductor::SetFrontendDriven(true);
     g_system->Initialize();
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     // Audio output path. Default is "host": suyu opens its own audio device
@@ -1075,6 +1078,19 @@ RETRO_API void retro_run() {
     // in both places would just race for no benefit.
     if (!g_audio_callback_registered) {
         DeliverPendingAudio();
+    }
+
+    if (g_video_cb && g_system && g_game_loaded && g_emu_window) {
+        // Compose the guest's next frame for this call and wait for it, so each call shows the
+        // frame made for it; a guest still drawing past the wait shows its last one
+        const u64 before = g_emu_window->FramesDisplayed();
+        if (Service::VI::Conductor::FrontendFrame()) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{8};
+            while (g_emu_window->FramesDisplayed() == before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::microseconds{200});
+            }
+        }
     }
 
     if (g_video_cb && g_system && g_game_loaded && Vulkan::External::IsActive()) {

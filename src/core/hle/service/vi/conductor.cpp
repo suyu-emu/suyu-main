@@ -12,9 +12,18 @@
 #include "core/hle/service/vi/display_list.h"
 #include "core/hle/service/vi/vsync_manager.h"
 
+#include <algorithm>
+#include <mutex>
+
 constexpr auto FrameNs = std::chrono::nanoseconds{1000000000 / 60};
 
 namespace Service::VI {
+
+namespace {
+std::atomic<bool> g_frontend_driven{false};
+std::mutex g_frontend_mutex;
+Conductor* g_frontend_conductor = nullptr;
+} // namespace
 
 Conductor::Conductor(Core::System& system, Container& container, DisplayList& displays)
     : m_system(system), m_container(container) {
@@ -31,7 +40,12 @@ Conductor::Conductor(Core::System& system, Container& container, DisplayList& di
                 return std::chrono::nanoseconds(this->GetNextTicks());
             });
 
-        system.CoreTiming().ScheduleLoopingEvent(FrameNs, FrameNs, m_event);
+        if (g_frontend_driven) {
+            std::scoped_lock lock{g_frontend_mutex};
+            g_frontend_conductor = this;
+        } else {
+            system.CoreTiming().ScheduleLoopingEvent(FrameNs, FrameNs, m_event);
+        }
         m_thread = std::jthread([this](std::stop_token token) { this->VsyncThread(token); });
     } else {
         m_event = Core::Timing::CreateEvent(
@@ -47,6 +61,13 @@ Conductor::Conductor(Core::System& system, Container& container, DisplayList& di
 }
 
 Conductor::~Conductor() {
+    {
+        std::scoped_lock lock{g_frontend_mutex};
+        if (g_frontend_conductor == this) {
+            g_frontend_conductor = nullptr;
+        }
+    }
+
     m_system.CoreTiming().UnscheduleEvent(m_event);
 
     if (m_system.IsMulticore()) {
@@ -72,6 +93,26 @@ void Conductor::ProcessVsync() {
         m_container.ComposeOnDisplay(&m_swap_interval, &m_compose_speed_scale, display_id);
         manager.SignalVsync(m_system.Kernel());
     }
+    m_frontend_swap_interval.store(m_swap_interval, std::memory_order_relaxed);
+}
+
+void Conductor::SetFrontendDriven(bool driven) {
+    g_frontend_driven = driven;
+}
+
+bool Conductor::FrontendFrame() {
+    std::scoped_lock lock{g_frontend_mutex};
+    return g_frontend_conductor && g_frontend_conductor->OnFrontendFrame();
+}
+
+bool Conductor::OnFrontendFrame() {
+    if (++m_frontend_frames <
+        std::max(1, m_frontend_swap_interval.load(std::memory_order_relaxed))) {
+        return false;
+    }
+    m_frontend_frames = 0;
+    m_signal.Set();
+    return true;
 }
 
 void Conductor::VsyncThread(std::stop_token token) {
