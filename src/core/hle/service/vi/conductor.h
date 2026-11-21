@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <ankerl/unordered_dense.h>
 
@@ -37,6 +38,12 @@ public:
     explicit Conductor(Core::System& system, Container& container, DisplayList& displays);
     ~Conductor();
 
+    //! A frontend that shows frames on its own display clock drives the guest's vsync instead of
+    //! the 60 Hz timer. Set before the game loads; multicore only.
+    static void SetFrontendDriven(bool driven);
+    //! One frontend frame. True if it started a composition (the guest's swap interval skips some).
+    static bool FrontendFrame();
+
     void LinkVsyncEvent(u64 display_id, Event* event);
     void UnlinkVsyncEvent(u64 display_id, Event* event);
 
@@ -44,6 +51,7 @@ private:
     void ProcessVsync();
     void VsyncThread(std::stop_token token);
     s64 GetNextTicks() const;
+    bool OnFrontendFrame();
 
 private:
     Core::System& m_system;
@@ -56,6 +64,8 @@ private:
 private:
     s32 m_swap_interval = 1;
     f32 m_compose_speed_scale = 1.0f;
+    std::atomic<s32> m_frontend_swap_interval{1};
+    s32 m_frontend_frames = 0;
 };
 
 } // namespace Service::VI
