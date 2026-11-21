@@ -1,0 +1,82 @@
+# mode: auto
+# Verwaltet von forksync.py - manuelle Aenderungen werden beim Update ueberschrieben.
+name: Upstream sync
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 'mk8-recomp'
+          fetch-depth: 0
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: 'auto'
+          BRANCH: 'mk8-recomp'
+          UPSTREAM: 'suyu-emu/suyu-main'
+          UPSTREAM_BRANCH: 'mk8-recomp'
+        run: |
+          set -e
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          UP="upstream/$UPSTREAM_BRANCH"
+
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "Schon aktuell"; exit 0
+          fi
+
+          if git merge-base --is-ancestor HEAD "$UP"; then
+            if git push origin "$UP:refs/heads/$BRANCH"; then
+              echo "Fast-Forward durchgefuehrt"; exit 0
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/merge-upstream" -X POST -f branch="$BRANCH" > /dev/null; then
+              echo "Fast-Forward durchgefuehrt (GitHub-Sync-API)"; exit 0
+            fi
+            echo "::error::Push abgelehnt (z. B. aendert das Original .github/workflows). In der App 'Syncen' nutzen."
+            exit 1
+          fi
+
+          if [ "$MODE" = "ff" ]; then
+            echo "::warning::Fork hat eigene Commits, Fast-Forward nicht moeglich (Modus ff). Nichts geaendert."
+            exit 0
+          fi
+
+          if [ "$MODE" = "auto" ]; then
+            git config user.name "forksync"
+            git config user.email "forksync@users.noreply.github.com"
+            if git merge --no-edit "$UP"; then
+              if git push origin "HEAD:refs/heads/$BRANCH"; then
+                echo "Original eingemergt, eigene Commits bleiben erhalten"; exit 0
+              fi
+              git reset --hard "origin/$BRANCH"
+              if gh api "repos/$GITHUB_REPOSITORY/merge-upstream" -X POST -f branch="$BRANCH" > /dev/null 2>&1; then
+                echo "Original eingemergt (GitHub-Sync-API), eigene Commits bleiben erhalten"; exit 0
+              fi
+              echo "::error::Merge sauber, aber Push abgelehnt (z. B. aendert das Original .github/workflows). In der App 'Syncen' nutzen."
+              exit 1
+            fi
+            git merge --abort 2>/dev/null || true
+            git reset --hard "origin/$BRANCH"
+            if gh api "repos/$GITHUB_REPOSITORY/merge-upstream" -X POST -f branch="$BRANCH" > /dev/null 2>&1; then
+              echo "Original eingemergt (GitHub-Sync-API), eigene Commits bleiben erhalten"; exit 0
+            fi
+            echo "::warning::Automatischer Merge nicht moeglich (Konflikt), Pull Request wird erstellt."
+          fi
+
+          if ! git push --force origin "$UP:refs/heads/upstream-sync"; then
+            echo "::error::Push abgelehnt (z. B. aendert das Original .github/workflows). In der App 'Syncen' nutzen."
+            exit 1
+          fi
+          if [ -z "$(gh pr list --repo "$GITHUB_REPOSITORY" --head upstream-sync --state open --json number -q '.[].number')" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$BRANCH" --head upstream-sync \
+              --title "Sync with upstream" \
+              --body "Automatisch erstellt von forksync: neue Aenderungen aus $UPSTREAM."
+          fi
