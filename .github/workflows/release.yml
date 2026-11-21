@@ -241,7 +241,7 @@ jobs:
           MSYS_NO_PATHCONV: '1'
         run: |
           cmake --version
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja 2>&1 | tee cmake_configure.log
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DENABLE_QT_TRANSLATION=ON -DYUZU_USE_BUNDLED_QT=OFF -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DSUYU_RECOMPILER_CLI=ON -GNinja 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -281,7 +281,7 @@ jobs:
           name: windows
           path: suyu-windows-x64.zip
 
-  build-linux:
+  build-linux-legacy:
     name: Linux
     runs-on: ubuntu-24.04
     steps:
@@ -779,8 +779,8 @@ jobs:
           name: libretro-windows
           path: suyu-libretro-core-windows-x64.zip
 
-  release:
-    name: Publish Release
+  source:
+    name: Archive source
     if: always()
     needs: [build-windows, build-linux, build-macos, build-freebsd, build-android, build-libretro, build-libretro-windows, build-libretro-android]
     runs-on: ubuntu-latest
