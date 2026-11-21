@@ -133,6 +133,7 @@
     ],
     "macos": [
       "suyu\\.app/.+",
+      "FIRST-RUN\\.md",
       "LICENSE\\.txt",
       "LICENSES/[^/]+\\.txt",
       "THIRD-PARTY-NOTICES\\.txt",

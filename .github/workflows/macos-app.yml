@@ -1,0 +1,62 @@
+name: Apple Silicon application
+
+# A manual, macOS-only build. Produces artifacts; never publishes a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Confirm native Apple Silicon host
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+      - name: Install build-host dependencies
+        run: |
+          brew update
+          brew install cmake ninja pkgconf boost ffmpeg sdl3 libusb enet glslang nasm qt
+      - name: Configure Vulkan/MoltenVK app
+        run: |
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_TESTS=OFF -DENABLE_WEB_SERVICE=OFF \
+            -DSUYU_NO_JIT=OFF -DENABLE_OPENGL=OFF \
+            -DYUZU_USE_BUNDLED_MOLTENVK=ON \
+            -Dfmt_FORCE_BUNDLED=ON -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+      - name: Compile app
+        run: cmake --build build --target suyu suyu-cmd --parallel 2
+      - name: Package and verify real startup
+        run: bash tools/macos/package.sh build out "$(brew --prefix qt)/bin/macdeployqt"
+      - name: Retain audit and startup evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-verification
+          path: |
+            out/bundle-audit.json
+            out/startup-evidence/
+            out/build-record.json
+          if-no-files-found: warn
+      - name: Upload application only after all checks pass
+        uses: actions/upload-artifact@v4
+        with:
+          name: suyu-apple-silicon
+          path: |
+            out/suyu-macos-arm64.zip
+            out/SHA256SUMS.txt
+          if-no-files-found: error
