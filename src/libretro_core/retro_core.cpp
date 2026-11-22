@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <charconv>
@@ -120,6 +121,8 @@ std::unique_ptr<LibretroCore::RetroEmuWindow> g_emu_window;
 std::shared_ptr<InputCommon::InputSubsystem> g_input_subsystem;
 std::string g_game_path;
 bool g_game_loaded = false;
+// The program of the loaded file that ExecuteProgram asked to run next, or -1
+std::atomic<s32> g_requested_program{-1};
 bool g_tas_playback = false;
 bool g_previous_tas_enable = false;
 bool g_previous_tas_loop = false;
@@ -697,7 +700,8 @@ bool g_vulkan_present = false;     // the frontend took the HW render request
 bool g_start_deferred = false;     // retro_load_game left the start to create_device2
 retro_hw_render_interface_vulkan* g_vulkan = nullptr;
 std::array<retro_vulkan_image, 8> g_vulkan_images{};  // per slot; the frontend keeps the pointer
-bool StartLoadedGame();
+bool StartLoadedGame(s32 program_index = 0, Service::AM::LaunchType launch_type =
+                                                Service::AM::LaunchType::FrontendInitiated);
 
 retro_hw_render_interface_vulkan* CurrentVulkanInterface() {
     // Asked every frame: RetroArch rebuilds its video driver behind the core's back
@@ -926,9 +930,46 @@ void RETRO_CALLCONV FrontendAudioSetState(bool enabled) {
     }
 }
 
+// Ends the running program; the loaded file stays
+void EndProgram() {
+    g_sample_perf = false;
+    g_have_presented = false;
+    if (g_vulkan) {
+        // The frontend repeats the last image; take it back and let the frontend finish with
+        // it before the renderer that owns it goes
+        g_vulkan->set_image(g_vulkan->handle, nullptr, 0, nullptr, g_vulkan->queue_index);
+        g_vulkan->wait_sync_index(g_vulkan->handle);
+    }
+    if (g_system && g_game_loaded) {
+        AudioCore::Sink::LibretroSink::Detach();
+        g_system->ShutdownMainProcess();
+    }
+    g_game_loaded = false;
+}
+
+// Collections such as Super Mario 3D All-Stars start each game as another program of their
+// file. As in the Qt frontend, the running program ends and the file boots at that one.
+void SwitchProgram(s32 program_index) {
+    if (g_vulkan_present) {
+        // The renderer can only make its device through the frontend in create_device2
+        LOG_ERROR(Frontend, "libretro core: can't start program {} on the frontend's Vulkan device",
+                  program_index);
+        return;
+    }
+    LOG_INFO(Frontend, "libretro core: switching to program {}", program_index);
+    EndProgram();
+    if (!StartLoadedGame(program_index, Service::AM::LaunchType::ApplicationInitiated)) {
+        g_environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, nullptr);
+    }
+}
+
 } // namespace
 
 RETRO_API void retro_run() {
+    if (const s32 program = g_requested_program.exchange(-1); program >= 0 && g_game_loaded) {
+        SwitchProgram(program);
+    }
+
     // This frontend is the sole periodic consumer of the destructive stats read.
     // Sample guest rendering/timing, independently of retro_run's frontend FPS.
     if (g_system && g_game_loaded) {
@@ -1463,9 +1504,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
 }
 
 namespace {
-bool StartLoadedGame() {
+bool StartLoadedGame(s32 program_index, Service::AM::LaunchType launch_type) {
     Service::AM::FrontendAppletParameters load_parameters{};
     load_parameters.applet_id = Service::AM::AppletId::Application;
+    load_parameters.program_index = program_index;
+    load_parameters.launch_type = launch_type;
 
     const Core::SystemResultStatus result =
         g_system->Load(*g_emu_window, g_game_path, load_parameters);
@@ -1477,6 +1520,8 @@ bool StartLoadedGame() {
         retro_unload_game();
         return false;
     }
+    // A program that ended set this; as in the Qt frontend, clear it once the next one loads
+    g_system->SetShuttingDown(false);
 
     // The GUI's EmuThread does these steps between Load and Run; otherwise the GPU thread
     // never starts and the CPU manager doesn't know the GPU is ready, causing the game to stall
@@ -1518,8 +1563,14 @@ bool StartLoadedGame() {
     g_perf_unique_frames = 0;
     (void)g_system->GetAndResetPerfStats();
     g_perf_start = g_perf_last_sample = std::chrono::steady_clock::now();
+    g_system->RegisterExecuteProgramCallback(
+        [](std::size_t index) { g_requested_program = static_cast<s32>(index); });
     g_system->Run();
     g_game_loaded = true;
+    if (launch_type == Service::AM::LaunchType::ApplicationInitiated) {
+        // The audio callback registered for the first program stays
+        return true;
+    }
 
     // Register for the frontend's audio-pause notification (see
     // FrontendAudioSetState's comment) so opening the RetroArch menu, or
@@ -1549,21 +1600,13 @@ RETRO_API bool retro_load_game_special(unsigned /*game_type*/, const struct retr
 }
 
 RETRO_API void retro_unload_game() {
-    g_sample_perf = false;
-    g_have_presented = false;
     g_start_deferred = false;
-    if (g_vulkan) {
-        // The frontend repeats the last image; take it back and let the frontend finish with
-        // it before the renderer that owns it goes
-        g_vulkan->set_image(g_vulkan->handle, nullptr, 0, nullptr, g_vulkan->queue_index);
-        g_vulkan->wait_sync_index(g_vulkan->handle);
-    }
     if (g_system && g_game_loaded) {
         g_output_scale = 1;
         g_geometry_dirty = false;
-        AudioCore::Sink::LibretroSink::Detach();
-        g_system->ShutdownMainProcess();
     }
+    EndProgram();
+    g_requested_program = -1;
     if (g_emu_window) {
         g_emu_window->SetTasPlayback(nullptr);
     }
@@ -1575,7 +1618,6 @@ RETRO_API void retro_unload_game() {
         g_previous_tas_directory.clear();
     }
     g_tas_playback = false;
-    g_game_loaded = false;
     // The next title starts with only player 1, and every button up
     std::fill(std::begin(g_player_connected), std::end(g_player_connected), false);
     for (auto& buttons : g_prev_buttons) {
