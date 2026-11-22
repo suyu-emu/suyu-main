@@ -318,7 +318,10 @@ void WebBrowser::Execute() {
         return;
     }
 
-    if (Settings::values.disable_web_applet) {
+    // ExecuteOffline leaves a hidden WebSession open, which Super Mario 3D All-Stars relies on
+    if (Settings::values.disable_web_applet &&
+        !(web_arg_header.shim_kind == ShimKind::Offline &&
+          applet_mode == LibraryAppletMode::AllForegroundInitiallyHidden)) {
         LOG_WARNING(Service_AM, "(STUBBED) called, Web Browser Applet is disabled. shim_kind={}",
                     web_arg_header.shim_kind);
         WebBrowserExit(WebExitReason::EndButtonPressed);
@@ -474,6 +477,10 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
 
 Result WebBrowser::RequestExit() {
     frontend.Close();
+    // The frontend never showed a hidden WebSession, so it ends here when asked to
+    if (applet_mode == LibraryAppletMode::AllForegroundInitiallyHidden) {
+        WebBrowserExit(WebExitReason::ExitRequested);
+    }
     R_SUCCEED();
 }
 
