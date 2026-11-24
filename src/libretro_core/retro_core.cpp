@@ -479,6 +479,9 @@ RETRO_API void retro_init() {
     // onto the old %APPDATA%/portable paths.
     RedirectSuyuPathsToFrontend();
   
+    // Read once, when the logger starts
+    Settings::values.log_filter.SetValue(
+        "*:Info Service.VI:Debug Service.AM:Debug Service.Nvnflinger:Debug");
     Common::Log::Initialize();
     Common::Log::Start();
 
@@ -508,7 +511,6 @@ RETRO_API void retro_init() {
     Settings::values.cpuopt_fastmem.SetValue(true);
     Settings::values.cpuopt_fastmem_exclusives.SetValue(true);
     Settings::values.log_flush_line.SetValue(true);
-    Settings::values.log_filter.SetValue("*:Info Service.VI:Debug Service.AM:Debug Service.Nvnflinger:Debug");
     g_system->ApplySettings();
     g_system->SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     g_system->SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
