@@ -943,6 +943,18 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     }
 
     if (valid_image_ids.size() > 0) [[unlikely]] {
+        // A render target drawn at its surface clip's size can share its address with an image
+        // of the declared surface size, so prefer the images of the framebuffer's own size
+        const auto is_framebuffer_size = [&](ImageId id) {
+            const auto& size = slot_images[id].info.size;
+            return size.width == config.width && size.height == config.height;
+        };
+        if (std::ranges::any_of(valid_image_ids, is_framebuffer_size)) {
+            valid_image_ids.erase(
+                std::remove_if(valid_image_ids.begin(), valid_image_ids.end(),
+                               [&](ImageId id) { return !is_framebuffer_size(id); }),
+                valid_image_ids.end());
+        }
         auto most_recent = std::ranges::max_element(valid_image_ids, [&](auto a, auto b) {
             return slot_images[a].modification_tick < slot_images[b].modification_tick;
         });
