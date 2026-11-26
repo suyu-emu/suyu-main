@@ -159,6 +159,9 @@ retro_audio_sample_t g_audio_sample_cb;
 retro_audio_sample_batch_t g_audio_batch_cb;
 retro_input_poll_t g_input_poll_cb;
 retro_input_state_t g_input_state_cb;
+// The frontend's motion sensors, for each player's gyroscope and accelerometer
+retro_sensor_interface g_sensor{};
+std::array<std::chrono::steady_clock::time_point, 4> g_last_motion{};
 
 constexpr unsigned kFrameWidth = 1280;
 constexpr unsigned kFrameHeight = 720;
@@ -967,6 +970,35 @@ void SwitchProgram(s32 program_index) {
 
 } // namespace
 
+namespace {
+// libretro's axes are a device's at rest on a table in front of you: Y away from you, Z up. suyu's
+// are the same with the accelerometer the other way round, and the gyroscope in turns a second
+void UpdateMotion(InputCommon::VirtualGamepad& vgp, unsigned port) {
+    if (!g_sensor.get_sensor_input || port >= g_last_motion.size()) {
+        return;
+    }
+    const auto sensor = [port](unsigned id) { return g_sensor.get_sensor_input(port, id); };
+    const float ax = sensor(RETRO_SENSOR_ACCELEROMETER_X);
+    const float ay = sensor(RETRO_SENSOR_ACCELEROMETER_Y);
+    const float az = sensor(RETRO_SENSOR_ACCELEROMETER_Z);
+    const auto now = std::chrono::steady_clock::now();
+    // All zero: the controller has no motion sensor, so suyu keeps its resting pad
+    if (ax != 0.0f || ay != 0.0f || az != 0.0f) {
+        constexpr float kRadiansPerTurn = 6.28318531f;
+        u64 delta_us = 16667;
+        if (g_last_motion[port] != std::chrono::steady_clock::time_point{}) {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(now - g_last_motion[port]);
+            delta_us = static_cast<u64>(std::clamp<long long>(elapsed.count(), 1000, 100000));
+        }
+        vgp.SetMotionState(port, delta_us, sensor(RETRO_SENSOR_GYROSCOPE_X) / kRadiansPerTurn,
+                           sensor(RETRO_SENSOR_GYROSCOPE_Y) / kRadiansPerTurn,
+                           sensor(RETRO_SENSOR_GYROSCOPE_Z) / kRadiansPerTurn, -ax, -ay, -az);
+    }
+    g_last_motion[port] = now;
+}
+} // namespace
+
 RETRO_API void retro_run() {
     if (const s32 program = g_requested_program.exchange(-1); program >= 0 && g_game_loaded) {
         SwitchProgram(program);
@@ -1102,6 +1134,7 @@ RETRO_API void retro_run() {
                 }
                 vgp->SetStickPosition(port, VS::Left, lx, ly);
                 vgp->SetStickPosition(port, VS::Right, rx, ry);
+                UpdateMotion(*vgp, port);
             }
         }
     }
@@ -1222,6 +1255,21 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     SetInputDescriptors();
 
     g_game_path = game->path;
+
+    // A frontend may only say a port has a sensor once its controller has sent
+    // a reading, so they are read every frame whatever enabling answers
+    g_sensor = {};
+    g_last_motion = {};
+    if (g_environ_cb(RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE, &g_sensor) &&
+        g_sensor.set_sensor_state && g_sensor.get_sensor_input) {
+        for (unsigned port = 0; port < g_last_motion.size(); ++port) {
+            g_sensor.set_sensor_state(port, RETRO_SENSOR_ACCELEROMETER_ENABLE, 60);
+            g_sensor.set_sensor_state(port, RETRO_SENSOR_GYROSCOPE_ENABLE, 60);
+        }
+    } else {
+        g_sensor = {};
+    }
+
     // need_fullpath makes content availability the core's responsibility. Avoid
     // initializing guest kernel state for a path the frontend cannot open.
     std::error_code path_error;
